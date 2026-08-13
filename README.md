@@ -170,9 +170,9 @@ http://localhost:8050
 | 裸模型名（旧行为）→ express 端点 `https://aiplatform.googleapis.com/v1/publishers/google/models/{model}:generateContent` | **404** `projects/…/locations/asia-southeast1/…was not found` | 区域由后端路由，落到没有该模型的区域 |
 | `projects/{project}/locations/global/publishers/google/models/{model}` | **200 正常出文** | 区域由我们钉定 ✅ |
 
-**默认已经是 `global`**（多数 Gemini 模型只在 global 提供）。控制台「标准模式 location」下拉里除 `global` 外还列出了 Agent Platform 提供 Gemini 的各区域（美国 / 欧洲 / 亚太 / 其它，共 30 项）可按需切换；选「默认（后端自选）」＝回到旧行为。
+**默认已经是 `global`**（多数 Gemini 模型只在 global 提供）。控制台「模型参数 → 通道行为 → 标准模式 location」下拉里除 `global` 外还列出了 Agent Platform 提供 Gemini 的各区域（美国 / 欧洲 / 亚太 / 其它，共 30 项）可按需切换；选「默认（后端自选）」＝回到旧行为。
 
-钉定需要项目 ID：「标准模式 Project ID」留空则沿用 Cookie 模式那个 / `GOOGLE_PROJECT_ID`；一个都没有时自动退回裸模型名（不会拼出半截路径）。
+**项目 ID 不需要单独配**：自动用「通道与凭证」页填的那个（或环境变量 `GOOGLE_PROJECT_ID`）——一个人通常只有一个 Express 项目。两者都没有时自动退回裸模型名（不会拼出半截路径）。
 
 **钉定失败会自动兜底**：若钉定路径返回"模型不存在 / 需要计费"，代理会**自动退回裸模型名重试一次**（＝旧行为）并在日志说明怎么修。实机验证：故意把 Project ID 换成一个未开计费的项目，非流式与流式都仍能正常出文。所以把默认值设成 `global` 不会让任何既有配置变糟。
 

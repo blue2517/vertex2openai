@@ -152,7 +152,8 @@ def resolve_express_model_path(base_model_name: str, settings: dict) -> str:
       google-genai 的 t_model() 对以 "projects/" 开头的 model 原样透传，
       因此不需要（也不能）给 Client 传 location —— api_key 与 project/location 互斥。
 
-    项目 ID 取 express_project_id，留空则回退 GOOGLE_PROJECT_ID / 控制台保存的 Project ID。
+    项目 ID 直接取「通道与凭证」页填的那个（或环境变量 GOOGLE_PROJECT_ID）——
+    一个人通常只有一个 Express 项目，不再单独配一份。
     拿不到项目 ID 就退回裸模型名（并提示），绝不拼出半截路径。
     """
     if base_model_name.startswith(("projects/", "publishers/", "models/")):
@@ -162,12 +163,11 @@ def resolve_express_model_path(base_model_name: str, settings: dict) -> str:
     if not location:
         return base_model_name
 
-    project = str(settings.get("express_project_id", "") or "").strip()
+    project = (app_config.GOOGLE_PROJECT_ID or app_state.get_project_id() or "").strip()
     if not project:
-        project = (app_config.GOOGLE_PROJECT_ID or app_state.get_project_id() or "").strip()
-    if not project:
-        print("⚠️ [上游端点] 已选择钉定 location，但没有可用的 Project ID（控制台"
-              "「标准模式 location」旁填写，或设 GOOGLE_PROJECT_ID），本次退回默认路由。")
+        print("⚠️ [上游端点] 已选择钉定 location，但没有可用的 Project ID"
+              "（请在控制台「通道与凭证」页填写 Project ID，或设环境变量 GOOGLE_PROJECT_ID），"
+              "本次退回默认路由。")
         return base_model_name
 
     return f"projects/{project}/locations/{location}/publishers/google/models/{base_model_name}"

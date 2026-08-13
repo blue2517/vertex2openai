@@ -14,7 +14,7 @@ class AppSettings(BaseSettings):
     SSL_CERT_FILE: Optional[str] = None
     # 标准（Express）模式的上游 base_url 覆盖。留空 = 用 SDK 默认（全局端点）。
     # 仅在确有需要时使用；要钉住 location 请用控制台的
-    # express_location / express_project_id（见 DEFAULT_SETTINGS），不要动这个。
+    # express_location（见 DEFAULT_SETTINGS）+「通道与凭证」里的 Project ID，不要动这个。
     VERTEX_BASE_URL: Optional[str] = None
 
     # Cookie direct mode settings (Recommended for cloud deployments like Render)
@@ -146,7 +146,8 @@ DEFAULT_SETTINGS = {
     # 改发带项目与区域的完整资源路径后同一模型 200 正常：
     #   projects/{project}/locations/{location}/publishers/google/models/{model}
     # express_location 留空 = 保持旧行为（裸模型名）；填 global（推荐）或某区域即启用钉定。
-    # 启用时需要项目 ID：express_project_id 留空则回退用 GOOGLE_PROJECT_ID / 控制台里的 Project ID。
+    # 项目 ID 直接取「通道与凭证」里填的那个（或环境变量 GOOGLE_PROJECT_ID）——
+    # 一个人通常只有一个 Express 项目，没必要再单独配一份。
     # ⚠️ 项目必须是该 API Key 有权且已开启计费的项目，否则 403（实测换成别的项目会
     #    "requires billing to be enabled"）。
     # 默认 global：多数 Gemini 模型只在 global 提供（如 gemini-2.5-pro），
@@ -154,7 +155,6 @@ DEFAULT_SETTINGS = {
     # 钉定失败（项目不匹配/该区域无此模型）会自动退回裸模型名重试一次，见
     # api_helpers.is_location_pin_failure —— 所以这个默认值不会把任何人变糟。
     "express_location": "global",
-    "express_project_id": "",
     # Cookie(Studio) 通道遇到工具流量时怎么办：
     #   degrade（默认）= 自动降级：丢掉无法表达的函数声明、照常回复；声明里的搜索类
     #     工具映射为 Studio 内建 googleSearch；历史里的调用往返渲染成可读文本。

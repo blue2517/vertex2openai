@@ -21,20 +21,21 @@ def test_empty_location_keeps_bare_model():
     assert resolve_express_model_path("gemini-2.5-pro", {"express_location": ""}) == "gemini-2.5-pro"
 
 
-def test_location_pinned_builds_full_path():
-    got = resolve_express_model_path("gemini-2.5-pro", {
-        "express_location": "global", "express_project_id": "proj-a"})
+def test_location_pinned_builds_full_path(monkeypatch):
+    monkeypatch.setattr(app_config, "GOOGLE_PROJECT_ID", "proj-a", raising=False)
+    got = resolve_express_model_path("gemini-2.5-pro", {"express_location": "global"})
     assert got == "projects/proj-a/locations/global/publishers/google/models/gemini-2.5-pro"
 
 
-def test_region_location_supported():
-    got = resolve_express_model_path("gemini-3.7-flash", {
-        "express_location": "us-central1", "express_project_id": "proj-a"})
+def test_region_location_supported(monkeypatch):
+    monkeypatch.setattr(app_config, "GOOGLE_PROJECT_ID", "proj-a", raising=False)
+    got = resolve_express_model_path("gemini-3.7-flash", {"express_location": "us-central1"})
     assert got == "projects/proj-a/locations/us-central1/publishers/google/models/gemini-3.7-flash"
 
 
-def test_project_id_falls_back_to_cookie_mode_project():
-    """express_project_id 留空 → 回退用 Cookie 模式那个 Project ID。"""
+def test_project_id_comes_from_credentials_page(monkeypatch):
+    """项目 ID 只取「通道与凭证」页保存的那个（不再单独配一份）。"""
+    monkeypatch.setattr(app_config, "GOOGLE_PROJECT_ID", None, raising=False)
     app_state.set_project_id("proj-from-state")
     got = resolve_express_model_path("gemini-2.5-pro", {"express_location": "global"})
     assert got == "projects/proj-from-state/locations/global/publishers/google/models/gemini-2.5-pro"
@@ -56,11 +57,9 @@ def test_no_project_id_degrades_safely(monkeypatch, capsys):
 
 def test_client_supplied_full_path_respected():
     full = "projects/x/locations/global/publishers/google/models/gemini-3.7-flash"
-    assert resolve_express_model_path(full, {"express_location": "us-central1",
-                                            "express_project_id": "y"}) == full
-    assert resolve_express_model_path("publishers/google/models/m", {"express_location": "global",
-                                                                    "express_project_id": "y"}) \
-        == "publishers/google/models/m"
+    assert resolve_express_model_path(full, {"express_location": "us-central1"}) == full
+    assert resolve_express_model_path("publishers/google/models/m",
+                                      {"express_location": "global"}) == "publishers/google/models/m"
 
 
 # ---------- 项目级错误 vs Cookie 失效 ----------
@@ -93,6 +92,12 @@ def test_retryable_not_confused_with_project():
 def test_default_is_global():
     """默认 global：多数模型只在 global 提供，让后端自选会偶发 404。"""
     assert app_config.DEFAULT_SETTINGS["express_location"] == "global"
+
+
+def test_no_separate_project_id_setting():
+    """项目 ID 不再有独立设置项——统一用「通道与凭证」里的那个。"""
+    assert "express_project_id" not in app_config.DEFAULT_SETTINGS
+    assert "express_project_id" not in app_config.PER_MODEL_KEYS
 
 
 def test_default_settings_pin_when_project_available(monkeypatch):

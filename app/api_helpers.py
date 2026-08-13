@@ -914,8 +914,8 @@ async def execute_gemini_call(
                                 and not has_yielded and is_location_pin_failure(e_stream_call)):
                             print(f"↩️ [上游端点] 钉定路径调用失败（{str(e_stream_call)[:80]}），"
                                   f"已退回默认路由 {fallback_model} 重试一次。"
-                                  "如持续出现，请把控制台「标准模式 Project ID」改成该 API Key 所属项目，"
-                                  "或把「标准模式 location」设为默认。")
+                                  "如持续出现，请确认「通道与凭证」里的 Project ID 属于该 API Key 且已开启计费，"
+                                  "或把「标准模式 location」设为“默认（后端自选）”。")
                             model_to_call = fallback_model
                             continue
 
@@ -983,8 +983,8 @@ async def execute_gemini_call(
                         and is_location_pin_failure(e_call)):
                     print(f"↩️ [上游端点] 钉定路径调用失败（{str(e_call)[:80]}），"
                           f"已退回默认路由 {fallback_model} 重试一次。"
-                          "如持续出现，请把控制台「标准模式 Project ID」改成该 API Key 所属项目，"
-                          "或把「标准模式 location」设为默认。")
+                          "如持续出现，请确认「通道与凭证」里的 Project ID 属于该 API Key 且已开启计费，"
+                          "或把「标准模式 location」设为“默认（后端自选）”。")
                     model_to_call = fallback_model
                     continue
                 if is_retryable_exception(e_call) and attempt < max_retries:
