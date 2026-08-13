@@ -267,6 +267,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .helpbox { display:none; margin-top:7px; padding:9px 11px; border-radius:9px; background:#f7f7fa;
              border:1px solid #ececf1; font-size:12px; line-height:1.75; color:#52525b; }
   .helpbox.show { display:block; }
+  /* 手机端：帮助文字里的长标识符（模型资源路径、URL）必须能断行，否则会把整张卡片撑破 */
+  .helpbox, .helpbox code { overflow-wrap:anywhere; word-break:break-word; }
+  .helpbox code { display:inline; white-space:normal; }
   .helpbox b { color:var(--fg); }
   .helpbox code { background:#e9e9ef; padding:1px 4px; border-radius:4px; font-size:11px; }
 </style>
@@ -403,7 +406,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <option value="off">关闭原生思考（角色扮演推荐）</option>
             <option value="console">强制用上方档位（忽略前端）</option>
           </select>
-          <p class="text-xs text-neutral-500 mt-2 leading-relaxed">🎭 <b>酒馆预设"卡原生思维链"选“关闭原生思考”即可（可用“保存为该模型专属”只对 3.6-flash 生效）。</b><br>• <b>跟随请求</b>：用前端发来的 <code>reasoning_effort</code>；SillyTavern 常发 <code>xhigh</code> → 高强度原生思考。<br>• <b>关闭原生思考</b>：忽略前端参数，把档位压到该模型最低（3.x=minimal、2.5-flash 预算 0），并<b>不返回思考</b>。⚠️ 实测 Studio(batchGraphql) 会忽略 includeThoughts，故本项会在<b>压到 minimal</b> 的同时于响应侧<b>剥离思考块</b>——这也是重预设下 3.6-flash 能出正文（不被思考阶段截断）的关键。<br>• <b>强制用上方档位</b>：忽略前端，用你在上面选的档位（返回思考）。<br>（预填充预设另见"开关 &amp; 预填充"卡片的压制开关。）</p>
+          <p class="text-xs text-neutral-500 mt-2 leading-relaxed">🎭 <b>跑角色扮演预设、想让预设自带的思维链接管时，选“关闭原生思考”。</b>只想对某个模型这么设，就用上方的“保存为该模型专属”。<br>• <b>跟随请求</b>：用前端发来的 <code>reasoning_effort</code>；SillyTavern 等常发 <code>xhigh</code> → 高强度原生思考。<br>• <b>关闭原生思考</b>：忽略前端参数，把档位压到<span id="ntm-floor">该模型最低档</span>，并<b>不返回思考</b>。⚠️ 实测 Studio(batchGraphql) 会忽略 includeThoughts，故本项在压档位的同时于响应侧<b>剥离思考块</b>——重预设下这是避免“只有思考、没有正文”的关键。<br>• <b>强制用上方档位</b>：忽略前端，用你在上面选的档位（返回思考）。<br>（预填充预设另见“开关 &amp; 预填充”卡片的压制开关。）</p>
         </div>
       </div>
 
@@ -435,20 +438,101 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <!-- 采样默认 -->
       <div class="card p-5">
         <div class="text-sm font-semibold mb-3">采样默认值 <span class="text-xs font-normal text-neutral-400">（留空=不注入，交给模型默认）</span></div>
-        <div class="grid grid-cols-3 gap-3">
-          <div><div class="lbl mb-1">temperature</div><input id="default_temperature" type="number" step="0.1" class="inp" placeholder="—"></div>
-          <div><div class="lbl mb-1">top_p</div><input id="default_top_p" type="number" step="0.05" class="inp" placeholder="—"></div>
-          <div><div class="lbl mb-1">max_tokens</div><input id="default_max_tokens" type="number" class="inp" placeholder="—"></div>
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div><div class="lbl mb-1.5">temperature</div><input id="default_temperature" type="number" step="0.1" class="inp" placeholder="—"></div>
+          <div><div class="lbl mb-1.5">top_p</div><input id="default_top_p" type="number" step="0.05" class="inp" placeholder="—"></div>
+          <div><div class="lbl mb-1.5">max_tokens</div><input id="default_max_tokens" type="number" class="inp" placeholder="—"></div>
         </div>
-        <div class="flex items-center justify-between gap-3 mt-3 pt-3 border-t border-neutral-100">
+        <div class="flex items-center justify-between gap-3 mt-5 pt-4 border-t border-neutral-100">
           <span class="text-sm">采样参数处理<span class="helpq" onclick="hlp(this,'h_sp')">?</span></span>
-          <select id="sampling_policy" class="inp" style="width:150px"><option value="auto">自动判定</option><option value="deprecated">强制剥离</option><option value="allowed">强制保留</option></select>
+          <select id="sampling_policy" class="inp" style="max-width:170px"><option value="auto">自动判定</option><option value="deprecated">强制剥离</option><option value="allowed">强制保留</option></select>
         </div>
         <div id="h_sp" class="helpbox">决定是否把 <code>temperature / top_p / top_k</code> 发给模型。<br>
           <b>自动判定</b>（默认）：按版本号推断——3.6 起、3.5 Flash-Lite、以及 4.x 及以后一律剥离。<br>
           <b>什么时候需要手动改</b>：版本号表达不了“号更小但发布更晚”。比如日后出一个 <code>gemini-3.5-pro</code>，官方按“更新模型”废弃了采样，自动判定却会因为 3.5 &lt; 3.6 而放行——此时给它选<b>强制剥离</b>即可，不必改代码。反过来官方澄清某模型仍可调，就选<b>强制保留</b>。<br>
           可按模型专属保存。生图模型不受此开关影响（本来就剥离全部采样）；<code>candidate_count</code> 是 3.x 的硬限制，也不归它管。</div>
         <p id="sampling-note" class="text-xs text-neutral-500 mt-2"></p>
+      </div>
+
+      <!-- 通道行为（全局，不按模型区分） -->
+      <div class="card p-5">
+        <div class="text-sm font-semibold mb-1">通道行为 <span class="text-xs font-normal text-neutral-400">（全局设置）</span></div>
+        <div class="space-y-4 mt-4">
+
+          <div>
+            <div class="flex items-center justify-between gap-3">
+              <span class="text-sm">Cookie 通道工具策略<span class="helpq" onclick="hlp(this,'h_ctp')">?</span></span>
+              <select id="cookie_tool_policy" class="inp" style="max-width:170px"><option value="degrade">自动降级（默认）</option><option value="reject">严格拒绝</option></select>
+            </div>
+            <div id="h_ctp" class="helpbox">
+              Cookie 直连通道<b>无法真正执行函数调用</b>（不能下发 functionDeclarations，也无法表达 functionCall / functionResponse）。这里决定遇到工具流量时怎么办。<br><br>
+              <b>自动降级（默认）</b><br>
+              • 只是<b>声明</b>了工具、本轮没有调用需求 → 丢掉声明，<b>照常正常回复</b>。<br>
+              • 声明里有<b>搜索类</b>工具 → 映射为本通道支持的<b>内建 Google 搜索</b>。<br>
+              • 历史里<b>真有</b>调用往返 → 渲染成可读文本发送，保住对话连贯（语义有损，日志会提示）。<br>
+              • 前端强制指定了工具 → 无法满足，忽略并提示。<br><br>
+              <b>为什么默认降级</b>：RikkaHub 等前端只要模型卡勾了“工具”，<b>每一条</b>请求都会带上声明，哪怕这轮用不到。严格拒绝会让 Studio 通道在这些前端下完全没法用。<br><br>
+              <b>严格拒绝</b>：恢复旧行为，直接报错并提示改用标准模式。需要函数调用<b>必须真实可用</b>时选它。
+            </div>
+          </div>
+
+          <div class="pt-4 border-t border-neutral-100">
+            <div class="flex items-center justify-between gap-3">
+              <span class="text-sm">标准模式 location<span class="helpq" onclick="hlp(this,'h_loc')">?</span></span>
+              <select id="express_location" class="inp" style="max-width:180px">
+            <option value="global">global（默认·推荐）</option>
+            <option value="">默认（后端自选·旧行为）</option>
+            <optgroup label="美国">
+              <option value="us-central1">us-central1（爱荷华）</option>
+              <option value="us-east1">us-east1（南卡）</option>
+              <option value="us-east4">us-east4（北弗吉尼亚）</option>
+              <option value="us-east5">us-east5（哥伦布）</option>
+              <option value="us-south1">us-south1（达拉斯）</option>
+              <option value="us-west1">us-west1（俄勒冈）</option>
+              <option value="us-west4">us-west4（拉斯维加斯）</option>
+            </optgroup>
+            <optgroup label="欧洲">
+              <option value="europe-west1">europe-west1（比利时）</option>
+              <option value="europe-west2">europe-west2（伦敦）</option>
+              <option value="europe-west3">europe-west3（法兰克福）</option>
+              <option value="europe-west4">europe-west4（荷兰）</option>
+              <option value="europe-west8">europe-west8（米兰）</option>
+              <option value="europe-west9">europe-west9（巴黎）</option>
+              <option value="europe-southwest1">europe-southwest1（马德里）</option>
+              <option value="europe-central2">europe-central2（华沙）</option>
+              <option value="europe-north1">europe-north1（芬兰）</option>
+            </optgroup>
+            <optgroup label="亚太">
+              <option value="asia-east1">asia-east1（台湾）</option>
+              <option value="asia-east2">asia-east2（香港）</option>
+              <option value="asia-northeast1">asia-northeast1（东京）</option>
+              <option value="asia-northeast2">asia-northeast2（大阪）</option>
+              <option value="asia-northeast3">asia-northeast3（首尔）</option>
+              <option value="asia-south1">asia-south1（孟买）</option>
+              <option value="asia-southeast1">asia-southeast1（新加坡）</option>
+              <option value="asia-southeast2">asia-southeast2（雅加达）</option>
+              <option value="australia-southeast1">australia-southeast1（悉尼）</option>
+            </optgroup>
+            <optgroup label="其它">
+              <option value="northamerica-northeast1">northamerica-northeast1（蒙特利尔）</option>
+              <option value="southamerica-east1">southamerica-east1（圣保罗）</option>
+              <option value="me-central1">me-central1（多哈）</option>
+              <option value="me-west1">me-west1（特拉维夫）</option>
+            </optgroup>
+          </select>
+            </div>
+            <div id="h_loc" class="helpbox">
+              <b>作用</b>：决定标准（Express）模式请求发到哪个区域，解决“偶发 404、报错里出现没见过的区域”。<br><br>
+              <b>为什么会 404</b>：不指定时由 Google 后端自己挑区域，可能挑到<b>不提供该模型</b>的区域。<br>
+              实测同一个 Key、同一个模型：<code>gemini-2.5-pro</code> 不指定 → 被路由到新加坡区域报 404；选 <code>global</code> → <b>正常出文</b>。<br><br>
+              <b>默认 global</b>：多数 Gemini 模型只在 global 提供，选具体区域反而可能 404，按需再换。<br><br>
+              <b>用哪个项目</b>：自动使用「通道与凭证」里填的 Project ID（或环境变量 <code>GOOGLE_PROJECT_ID</code>）。两者都没有时自动退回不指定区域的旧方式。<br><br>
+              <b>注意</b>：该项目必须是这个 API Key <b>有权、且已开启计费</b>的项目。<br><br>
+              <b>失败会自动兜底</b>：若上游回“模型不存在 / 需要计费”，代理会<b>自动改回不指定区域重试一次</b>，并在运行日志说明怎么修——所以这个设置不会让原本能用的配置变得不能用。
+            </div>
+          </div>
+
+        </div>
       </div>
 
       <!-- 控制台注入（可按模型覆盖） -->
@@ -534,6 +618,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div class="pt-1 border-t border-neutral-100"></div>
           <div class="text-xs font-semibold text-neutral-500 pt-1">预填充</div>
 
+          <div class="flex items-center justify-between gap-3"><span class="text-sm">思维链守卫<span class="helpq" onclick="hlp(this,'h_cotg')">?</span></span><label class="switch"><input type="checkbox" id="prefill_cot_guard"><span class="slider"></span></label></div>
+          <div id="h_cotg" class="helpbox">
+            解决<b>“预设思维链经常不写、直接出正文”</b>：预填充只是把话头停在 <code>&lt;思维链标签&gt;</code> 上，<b>没有任何一句话告诉模型必须先完成思考</b>，模型于是常常跳过思考直接写正文，前端正则就抓不到思维链。<br>
+            打开后，代理会自动识别预填充里<b>未闭合的开标签</b>，在续写指令末尾追加一条硬性要求：先逐条写完该标签内的思考、用对应闭合标签收尾，然后才写正文。<br>
+            没检测到未闭合标签时（例如预填充只是普通句子）本项不做任何事；生图模型不适用。<br>
+            <b>仍不稳定时</b>：把「原生思考控制」从“关闭原生思考”改为“强制用上方档位 + low”再对比——压到 minimal 会让模型倾向“直接给答案”，可能连带跳过预设要求的长思考。
+          </div>
           <div>
             <div class="flex items-center justify-between gap-3"><span class="text-sm">预填充兼容模式<span class="helpq" onclick="hlp(this,'h_pfm')">?</span></span>
               <select id="prefill_mode" class="inp" style="width:150px"><option value="smart">智能（默认）</option><option value="keep_turn">保留模型轮次</option><option value="minimal">最小</option><option value="off">关闭</option></select>
@@ -580,7 +671,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let CAPS = {}, chart = null, curAR = "";
 let GLOBAL_SETTINGS = {}, OVERRIDES = {};
-const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction','image_system_instruction','inject_prefill_for_image','sampling_policy'];
+const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction','image_system_instruction','inject_prefill_for_image','sampling_policy','prefill_cot_guard'];
 const COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
 
 function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1800); }
@@ -660,8 +751,8 @@ async function loadParams(){
     const s=await (await fetch('/api/settings')).json();
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
-    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy'].forEach(k=>setV(k,s[k]));
-    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image'].forEach(k=>setV(k,s[k]));
+    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','cookie_tool_policy','express_location'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard'].forEach(k=>setV(k,s[k]));
     // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
       if(s.hide_thoughts) setV('native_thinking_mode','off');
@@ -714,6 +805,7 @@ async function saveModelOverride(){
     image_system_instruction:$('image_system_instruction').checked,
     inject_prefill_for_image:$('inject_prefill_for_image').checked,
     sampling_policy:$('sampling_policy').value,
+    prefill_cot_guard:$('prefill_cot_guard').checked,
   };
   if(m==='__global__'){
     // 全局默认作用域：写进全局设置，而不是任何模型的专属值
@@ -831,6 +923,8 @@ async function saveSettings(){
     cookie_debug:$('cookie_debug').checked,
     debug_outbound:$('debug_outbound').checked,
     prefill_mode:$('prefill_mode').value,
+    cookie_tool_policy:$('cookie_tool_policy').value,
+    express_location:$('express_location').value,
     prefill_suppress_thinking:$('prefill_suppress_thinking').checked,
   };
   // 7 个可覆盖参数：仅当所选模型“没有专属配置”时，才作为全局默认保存，

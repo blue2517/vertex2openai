@@ -1,6 +1,8 @@
 import re
 from functools import partial
 
+from typing import Any
+
 import google.genai
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -104,6 +106,73 @@ def _prefill_log(mode: str, prefill_text: str) -> str:
             "若预填充停在半截词/半截标签且模型接不上，可试试「保留模型轮次」。")
 
 
+_ENDPOINT_LOGGED = False
+
+
+def _log_resolved_endpoint(client: Any) -> None:
+    """把 SDK 实际解析出的上游端点打进日志（每进程一次）。
+
+    为什么需要它：Express（api_key）模式下**无法**指定 location——SDK 里
+    project/location 与 api_key 互斥，硬传会 `ValueError: Project/location and
+    API key are mutually exclusive`。SDK 解析出的 base_url 就是**全局端点**
+    https://aiplatform.googleapis.com/ ，project/location 均为 None，请求 URL 里
+    根本没有 location 段。因此报错信息里出现的 `locations/xxx` 区域是 **Google 后端
+    为该 Key 自行路由**的结果，不是本代理选的，客户端侧无从指定。
+    打印出来便于随时核实（尤其怀疑"被路由到冷门区域"时）。
+    """
+    global _ENDPOINT_LOGGED
+    if _ENDPOINT_LOGGED:
+        return
+    _ENDPOINT_LOGGED = True
+    try:
+        api = client._api_client
+        base_url = getattr(api._http_options, "base_url", None)
+        api_version = getattr(api._http_options, "api_version", None)
+        scope = "全局端点（URL 无 location 段）" if base_url == "https://aiplatform.googleapis.com/" \
+            else "自定义/区域端点"
+        print(f"🌐 [上游端点] 标准模式解析结果：base_url={base_url} api_version={api_version} "
+              f"project={api.project} location={api.location} → {scope}。"
+              "Express Key 模式下具体区域由 Google 后端路由，无法在客户端指定"
+              "（如需强制指向某端点，可设环境变量 VERTEX_BASE_URL）。")
+    except Exception as e:
+        print(f"⚠️ [上游端点] 读取端点解析结果失败（不影响调用）：{e}")
+
+
+def resolve_express_model_path(base_model_name: str, settings: dict) -> str:
+    """把模型名解析成实际下发给 SDK 的 model 值。
+
+    留空 express_location → 返回裸模型名，走 express 端点格式：
+        https://aiplatform.googleapis.com/v1/publishers/google/models/{model}:generateContent
+      此时 location 由 Google 后端自行路由，**可能落到该模型不提供服务的区域并 404**
+      （实测：gemini-2.5-pro 被路由到 asia-southeast1 → 404 not found，
+       同一 Key 换成下面的完整路径即 200）。
+
+    填了 express_location → 返回完整资源路径，让区域由我们钉定：
+        projects/{project}/locations/{location}/publishers/google/models/{model}
+      google-genai 的 t_model() 对以 "projects/" 开头的 model 原样透传，
+      因此不需要（也不能）给 Client 传 location —— api_key 与 project/location 互斥。
+
+    项目 ID 直接取「通道与凭证」页填的那个（或环境变量 GOOGLE_PROJECT_ID）——
+    一个人通常只有一个 Express 项目，不再单独配一份。
+    拿不到项目 ID 就退回裸模型名（并提示），绝不拼出半截路径。
+    """
+    if base_model_name.startswith(("projects/", "publishers/", "models/")):
+        return base_model_name          # 客户端已自带完整路径，尊重它
+
+    location = str(settings.get("express_location", "") or "").strip()
+    if not location:
+        return base_model_name
+
+    project = (app_config.GOOGLE_PROJECT_ID or app_state.get_project_id() or "").strip()
+    if not project:
+        print("⚠️ [上游端点] 已选择钉定 location，但没有可用的 Project ID"
+              "（请在控制台「通道与凭证」页填写 Project ID，或设环境变量 GOOGLE_PROJECT_ID），"
+              "本次退回默认路由。")
+        return base_model_name
+
+    return f"projects/{project}/locations/{location}/publishers/google/models/{base_model_name}"
+
+
 class ExpressSDKUpstream(BaseUpstream):
     """
     官方 API Key Express Mode 渠道处理器
@@ -143,6 +212,7 @@ class ExpressSDKUpstream(BaseUpstream):
             api_key=express_api_key,
             http_options=get_http_options(),
         )
+        _log_resolved_endpoint(client_to_use)
         print(f"🌐 [上游端点] 使用官方 Gemini Express Mode SDK 调用模型 {base_model_name}。")
 
         profile = mc.get_profile(base_model_name)
@@ -176,6 +246,7 @@ class ExpressSDKUpstream(BaseUpstream):
                 request_obj.messages, _prefill_mode,
                 allow_model_last=not profile["requires_user_last_turn"],
                 instruction_template=_prefill_tpl(_inj_settings.get("prefill_instruction", ""), is_image_model),
+                cot_guard=bool(_inj_settings.get("prefill_cot_guard", True)) and not is_image_model,
             )
             if new_msgs is not request_obj.messages:
                 request_obj = request_obj.model_copy(update={"messages": new_msgs})
@@ -216,7 +287,15 @@ class ExpressSDKUpstream(BaseUpstream):
                              "response_modalities", "image_config")}
             print(f"🔎 [出站调试] Express 通道 生成参数={_dbg}")
 
+        # location 钉定：按控制台设置决定是发裸模型名（后端自行路由）还是完整资源路径
+        model_to_call = resolve_express_model_path(base_model_name, _inj_settings)
+        if model_to_call != base_model_name:
+            print(f"🌐 [上游端点] 已钉定 location：{model_to_call}")
+
         return await execute_gemini_call(
-            client_to_use, base_model_name, prompt_func, gen_config_dict, request_obj,
+            client_to_use, model_to_call, prompt_func, gen_config_dict, request_obj,
             fastapi_request=fastapi_request, prefill_text=prefill_text,
+            # 钉定路径万一不对（Project ID 与 Key 不同项目、该区域没有此模型），
+            # 自动退回裸模型名重试一次 = 回到旧行为，不会比不钉定更糟。
+            fallback_model=(base_model_name if model_to_call != base_model_name else None),
         )

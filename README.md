@@ -80,6 +80,7 @@ http://localhost:8050
 | `SAFETY_SCORE` | 否 | `false` | 是否把 Gemini safety ratings 附加到输出。可在控制台热改。 |
 | `PROXY_URL` | 否 | 空 | 上游 HTTP/HTTPS/SOCKS 代理。 |
 | `SSL_CERT_FILE` | 否 | 空 | 自定义证书路径。 |
+| `VERTEX_BASE_URL` | 否 | 空 | **高级**：覆盖标准模式的上游 `base_url`，正常无需设置。要钉定区域请用控制台的「标准模式 location」（详见下方「标准模式的 location」）。 |
 | `GOOGLE_COOKIE` | 否 | 空 | Cookie 直连模式的 Google Cookie（初始值，后续可在控制台更新）。 |
 | `GOOGLE_PROJECT_ID` | 否 | 空 | Cookie 直连模式的 Project ID（初始值，后续可在控制台更新）。 |
 | `EXPERIMENT_FLAGS` | 否 | 空 | 可选：batchGraphql 的 `experimentFlagsBinary`，一般无需设置。 |
@@ -142,7 +143,8 @@ http://localhost:8050
 
 - **采样参数弃用**：自 **Gemini 3.6 Flash / 3.5 Flash-Lite 起（及所有更新/未来模型）**，`temperature`/`top_p`/`top_k` 已废弃（现被忽略、未来返回 400），代理会**自动移除**；更早的 3.x（如 3.0–3.5 非 lite）仍可用，但官方建议保持默认。
 - **`candidate_count`**：所有 Gemini 3.x 不支持，自动移除。
-- **思考**：Gemini 3.x 用 `thinking_level`（`minimal`/`low`/`medium`/`high`，不可完全关闭；各模型默认不同，如 3.6-flash=medium、pro=high、flash-lite=minimal）；Gemini 2.5 用 `thinking_budget`（`-1` 动态；2.5-flash 可设 `0` 关闭，2.5-pro 最低 128）。
+- **思考**：Gemini 3.x 用 `thinking_level`（`minimal`/`low`/`medium`/`high`，不可完全关闭；各模型默认不同，如 3.6-flash=medium、pro=high、flash-lite=minimal）；
+  - **`gemini-3.7-flash`（2026-08 新增）**：官方默认档位 **`medium`**（取代旧 3.x 的 `high`），档位表只提供 **`low`/`medium`/`high`——没有 `minimal`**（出处：`intro_gemini_3_7_flash.ipynb`）。因此在 3.7 上选「关闭原生思考」会压到 `low`（就近合法档），而不是发一个不支持的枚举去冒 400 风险。同理，**3.7 及更新/未知型号一律不提供 `minimal`**，等真机验证后再逐个放开；`thinking_level` 与旧的 `thinking_budget` **不可同时出现**（官方明确会 400），本代理只会二选一。Gemini 2.5 用 `thinking_budget`（`-1` 动态；2.5-flash 可设 `0` 关闭，2.5-pro 最低 128）。
   - **原生思考控制（`native_thinking_mode`）**——控制台"思考强度"卡片的下拉，支持"保存为该模型专属"：
     - **跟随请求（默认）**：用前端发来的 `reasoning_effort`。⚠️ SillyTavern 等前端常在**每次请求都发 `reasoning_effort`（如 `xhigh`）**，会覆盖你在控制台设的档位。
     - **关闭原生思考（角色扮演推荐）**：忽略前端 effort，把档位压到该模型最低（3.x=`minimal`、2.5-flash 预算 `0`、2.5-pro `128`），并**不返回思考**。
@@ -156,6 +158,81 @@ http://localhost:8050
   - **预填充时压制原生思考（"卡思维链"，默认开启）**：酒馆预设通常自带思维链，靠预填充卡掉模型原生思考、让预设的思维链接管。开启后，检测到预填充即把思考压到该模型最低并**不回传思考**：3.x 压到 `minimal`（`pro` 无 minimal 则 `low`，官方规定 3.x 无法完全关闭思考）；2.5-flash 预算设 `0` **完全关闭**、2.5-pro 降到最低 `128`。**单次请求显式传 `reasoning_effort` / `thinking_budget` 时不压制**（请求优先）。可在控制台关闭此开关恢复模型原生思考。
   - **与模型名无关，新模型自动生效**。
 - **新增/未来模型**：按家族/版本模式自动归类；未知/未来型号按"最新代"前向安全处理（自动移除已废弃采样参数、走预填充兼容）。
+
+---
+
+## 标准模式的 location（能指定，且能修好"偶发 404 / 随机区域"）
+
+**实测结论（2026-08-14，真机验证）**：留空时 location 由 Google 后端自选，**可能落到该模型不提供服务的区域直接 404**；显式钉定后同一个 Key、同一个模型即正常。
+
+| 请求形态 | `gemini-2.5-pro` | 说明 |
+|---|---|---|
+| 裸模型名（旧行为）→ express 端点 `https://aiplatform.googleapis.com/v1/publishers/google/models/{model}:generateContent` | **404** `projects/…/locations/asia-southeast1/…was not found` | 区域由后端路由，落到没有该模型的区域 |
+| `projects/{project}/locations/global/publishers/google/models/{model}` | **200 正常出文** | 区域由我们钉定 ✅ |
+
+**默认已经是 `global`**（多数 Gemini 模型只在 global 提供）。控制台「模型参数 → 通道行为 → 标准模式 location」下拉里除 `global` 外还列出了 Agent Platform 提供 Gemini 的各区域（美国 / 欧洲 / 亚太 / 其它，共 30 项）可按需切换；选「默认（后端自选）」＝回到旧行为。
+
+**项目 ID 不需要单独配**：自动用「通道与凭证」页填的那个（或环境变量 `GOOGLE_PROJECT_ID`）——一个人通常只有一个 Express 项目。两者都没有时自动退回裸模型名（不会拼出半截路径）。
+
+**钉定失败会自动兜底**：若钉定路径返回"模型不存在 / 需要计费"，代理会**自动退回裸模型名重试一次**（＝旧行为）并在日志说明怎么修。实机验证：故意把 Project ID 换成一个未开计费的项目，非流式与流式都仍能正常出文。所以把默认值设成 `global` 不会让任何既有配置变糟。
+
+几个必须知道的边界（都是实测）：
+
+- **项目必须是该 API Key 有权、且已开启计费的项目**。换成别的项目会 `403 requires billing to be enabled`。
+- **区域端点主机不通**：`https://{location}-aiplatform.googleapis.com/...` 配 Express Key 会 404（该模型在那个区域没有）。因此钉定走的是**全局主机 + 路径里带 location**，不是换主机。
+- **有的模型只在 `global` 提供**（如 `gemini-2.5-pro`），所以推荐 `global`。
+- SDK 层面**不能**给 `Client` 传 `location`：`api_key` 与 `project/location` 互斥，硬传会 `ValueError`。钉定是靠**模型资源路径**实现的（`google-genai` 的 `t_model()` 对 `projects/` 开头的 model 原样透传）。
+- 启动后第一次调用会打印一行端点解析结果，便于核对；钉定生效时另有一行 `🌐 [上游端点] 已钉定 location: projects/...`。
+
+> 📌 **勘误**：本文件上一版写的"Express 模式无法指定 location、报错里的区域无从干预"**是错的**——那个结论只验证了"不能给 Client 传 location"，漏了"可以用完整资源路径钉定"这条路。已按真机结果更正。
+
+---
+
+## Studio(Cookie) 通道：免登录 与 非 Express 项目
+
+两种设想都做了真机验证（2026-08-14）：
+
+| 场景 | 结果 |
+|---|---|
+| **不带 Cookie（免登录）** + Express 项目 | ❌ `Permission 'aiplatform.endpoints.predict' denied` |
+| **不带 Cookie（免登录）** + 非 Express 项目 | ❌ `requires billing to be enabled` |
+| 不带 Cookie + 空项目 | ❌ `Request contains an invalid argument` |
+| 带 Cookie + Express 项目 | ✅ 正常出文 |
+| 带 Cookie + 非 Express 项目（未开计费） | ❌ `requires billing to be enabled` |
+
+结论与代码现状：
+
+- **本通道用的 `batchGraphql` 控制台接口不接受匿名调用**，必须有登录态（SAPISIDHASH）。浏览器里"不登录也能用 Studio"走的是**另一条**面向未登录用户的接口/额度，本项目当前不支持。若你能抓到那条请求（F12 → Network → 复制 URL、请求头与 payload），加一条上游并不难。
+- **代理里并没有"检测是不是 Express 项目就拒绝"的逻辑**——能不能用只取决于：① 有登录态 Cookie；② Project ID 填的项目**该账号有权限且已开启计费**。是否 Express 项目本身不是门槛。
+- 但旧版有个**误导人的 bug**：`Permission ... denied on resource //…/projects/xxx` 这类**项目级**错误会命中"Cookie 过期"关键词，于是提示你反复重取 Cookie，怎么弄都好不了。现在已按错误内容分流：点名了具体项目/计费的错误会给**项目层面**的排查指引（检查 Project ID / 开启计费 / 账号权限），只有纯会话失效才提示重取 Cookie。
+
+---
+
+## Cookie(Studio) 通道的工具策略（`cookie_tool_policy`）
+
+Cookie 直连通道不能下发 `functionDeclarations`，也无法表达 `functionCall`/`functionResponse`。但**「不能真的调用工具」不该等于「整单拒绝」**：RikkaHub 这类前端只要在模型卡里勾了工具能力，**每条**请求都会带上 `tools` 声明，哪怕本轮毫无调用需求——旧版据此直接 400，等于 Studio 通道在这些前端下完全不可用。
+
+现在默认 **自动降级（`degrade`）**：
+
+| 情况 | 行为 |
+|---|---|
+| 只带了 `tools` 声明，历史无调用往返 | **丢掉声明，照常正常回复**（最常见：前端模型卡开了工具） |
+| 声明里含搜索类工具（`google_search` / `web_search` 等） | **映射为 Studio 内建 `googleSearch`**（这个通道本来就支持） |
+| 历史里有真实 `functionCall` / `functionResponse` | 渲染成可读文本（`[请求调用工具 · x]` / `[工具执行结果 · x]`）后发送，保住对话连贯；语义有损，日志会警告 |
+| `tool_choice` 强制指定函数 | 无法满足，忽略并警告（按你的要求：调不了就正常回复） |
+
+需要函数调用**必须真实可用**时，把控制台的「Cookie 通道工具策略」改为 **严格拒绝（`reject`）**，恢复旧的明确 400 提示。
+
+---
+
+## 思维链守卫（`prefill_cot_guard`，默认开）
+
+针对「**预填充确实卡掉了原生思维链，但预设自己的思维链也经常不写、直接出正文**」：
+
+- **成因**：预填充只是把话头停在你预设自己的**未闭合思维链开标签**上，请求里**没有任何一句话**告诉模型"接下来必须先完成思考再写正文"。模型于是常常跨过思考直接写正文，输出里只剩一个孤立开标签，前端正则自然抓不到思维链。
+- **做法**：自动识别预填充里未闭合的标签名（**不预设任何具体标签**，只按"开了没闭合"这一形状匹配，`<thinking>`、`<CoT>`、`<plan_1>`、`<分析~>` 之类自定义标签都能识别），在续写指令**末尾**（即模型最后读到的位置）追加一条硬性要求：先逐条写完该标签内的思考 → 用对应闭合标签收尾 → 然后才写正文，且不允许空标签。`smart` 与 `keep_turn` 两种模式都生效。
+- **无副作用**：预填充里没有未闭合标签时（普通句子），本项什么都不做；生图模型不适用；可按模型单独开关。
+- **仍不稳定时的对照实验**：把「原生思考控制」从 **关闭原生思考** 改成 **强制用上方档位 + `low`** 再测一轮。把档位压到 `minimal` 会把模型推向"直接给答案"的行为，**有可能连带跳过预设要求的长思维链**；`low` 保留一点推理惯性、同时仍显著少于默认档。这一条是机理推断，请以你自己的 A/B 结果为准。
 
 ---
 
@@ -259,11 +336,17 @@ curl http://localhost:8050/v1/chat/completions \
 
 ## 模型列表配置
 
+> ⚠️ **先看这条**：模型列表**默认从远程拉取** —— `https://raw.githubusercontent.com/bad-woman/vertex2openai/main/vertexModels.json`，只有远程全部地址都不可用时才回退到镜像里的本地 `vertexModels.json`。
+> 所以**只改本地文件（或只更新镜像）通常看不到新模型**，必须二选一：
+> 1. 把更新后的 `vertexModels.json` 推到 GitHub `main`（推荐，改远程即可全部部署生效、无需重部署）；
+> 2. 或设环境变量 `MODELS_CONFIG_URL` 指向你自己维护的地址。
+
 默认模型列表在远程 `MODELS_CONFIG_URL` 或本地 `vertexModels.json`：
 
 ```json
 {
   "models": [
+    "gemini-3.7-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",

@@ -768,6 +768,25 @@ async def gemini_fake_stream_generator(
             yield "data: [DONE]\n\n"
         if is_auto_attempt: raise
             
+def is_location_pin_failure(err: Any) -> bool:
+    """错误是否像"钉定的 projects/locations 路径不对"（而非模型或网络本身的问题）。
+
+    典型两种：
+      404 `Publisher model projects/X/locations/Y/... was not found`  → 该项目/区域没有这个模型
+      403 `This API method requires billing to be enabled ... project #X` → 项目没开计费/无权
+    命中时可以把模型名退回**裸模型名**再试一次，让后端自行路由——
+    这样即使用户填的 Project ID 与 API Key 不属于同一项目，也只是回到旧行为，不会更糟。
+    """
+    e = str(err).lower()
+    if "requires billing" in e or "billing to be enabled" in e:
+        return True
+    if ("not found" in e or "404" in e) and "publisher model" in e:
+        return True
+    if "permission_denied" in e and "projects/" in e:
+        return True
+    return False
+
+
 async def execute_gemini_call(
     current_client: Any,
     model_to_call: str,
@@ -777,6 +796,7 @@ async def execute_gemini_call(
     is_auto_attempt: bool = False,
     fastapi_request: Optional[Any] = None,
     prefill_text: str = "",
+    fallback_model: Optional[str] = None,
 ):
     # P1-2：prompt 构建内部有远程图片下载与 PIL 压缩（同步阻塞），
     # 放到线程里执行，避免卡住整个事件循环。
@@ -808,6 +828,9 @@ async def execute_gemini_call(
         else: # True Streaming
             response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
             async def _gemini_real_stream_generator_inner():
+                # 钉定失败要在这里改写模型名，必须声明 nonlocal，
+                # 否则赋值会把 model_to_call 变成局部变量 → 前面的读取直接 UnboundLocalError。
+                nonlocal model_to_call
                 max_retries, backoff_sec = get_retry_settings()
                 has_yielded = False  # 是否已向客户端输出过内容
                 # 立即吐一个 SSE 心跳，尽快建立连接（429 重试期间也保活，防前端超时中断）
@@ -886,6 +909,16 @@ async def execute_gemini_call(
                             or "quota" in error_str or "resource exhausted" in error_str
                         )
 
+                        # location 钉定路径不对 → 退回裸模型名再试一次（仅在还没输出内容时）
+                        if (fallback_model and model_to_call != fallback_model
+                                and not has_yielded and is_location_pin_failure(e_stream_call)):
+                            print(f"↩️ [上游端点] 钉定路径调用失败（{str(e_stream_call)[:80]}），"
+                                  f"已退回默认路由 {fallback_model} 重试一次。"
+                                  "如持续出现，请确认「通道与凭证」里的 Project ID 属于该 API Key 且已开启计费，"
+                                  "或把「标准模式 location」设为“默认（后端自选）”。")
+                            model_to_call = fallback_model
+                            continue
+
                         # 关键修复：只有在“尚未向客户端输出任何内容”时才重试；
                         # 否则重试会导致整段答案重复输出（前半段 + 完整重发）。
                         if is_retryable and not has_yielded and attempt < max_retries:
@@ -946,6 +979,14 @@ async def execute_gemini_call(
                 print(f"ℹ️ [客户端断开] 非流式响应期间客户端已断开，模型 {model_to_call} 的请求已安全终止。")
                 raise
             except Exception as e_call:
+                if (fallback_model and model_to_call != fallback_model
+                        and is_location_pin_failure(e_call)):
+                    print(f"↩️ [上游端点] 钉定路径调用失败（{str(e_call)[:80]}），"
+                          f"已退回默认路由 {fallback_model} 重试一次。"
+                          "如持续出现，请确认「通道与凭证」里的 Project ID 属于该 API Key 且已开启计费，"
+                          "或把「标准模式 location」设为“默认（后端自选）”。")
+                    model_to_call = fallback_model
+                    continue
                 if is_retryable_exception(e_call) and attempt < max_retries:
                     stats.add_retry()
                     wait_time = backoff_sec   # F-5：同上，统一用控制台配置的退避
