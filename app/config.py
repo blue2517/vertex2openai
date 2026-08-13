@@ -12,6 +12,10 @@ class AppSettings(BaseSettings):
     SAFETY_SCORE: bool = False
     PROXY_URL: Optional[str] = None
     SSL_CERT_FILE: Optional[str] = None
+    # 标准（Express）模式的上游 base_url 覆盖。留空 = 用 SDK 默认（全局端点）。
+    # 仅在确有需要时使用；要钉住 location 请用控制台的
+    # express_location / express_project_id（见 DEFAULT_SETTINGS），不要动这个。
+    VERTEX_BASE_URL: Optional[str] = None
 
     # Cookie direct mode settings (Recommended for cloud deployments like Render)
     GOOGLE_COOKIE: Optional[str] = None         # Google Cookie string
@@ -38,6 +42,7 @@ ROUNDROBIN = _settings.ROUNDROBIN
 SAFETY_SCORE = _settings.SAFETY_SCORE
 PROXY_URL = _settings.PROXY_URL
 SSL_CERT_FILE = _settings.SSL_CERT_FILE
+VERTEX_BASE_URL = _settings.VERTEX_BASE_URL
 
 GOOGLE_COOKIE = _settings.GOOGLE_COOKIE
 GOOGLE_PROJECT_ID = _settings.GOOGLE_PROJECT_ID
@@ -80,8 +85,8 @@ DEFAULT_SETTINGS = {
     "roundrobin": ROUNDROBIN,
     "safety_score": SAFETY_SCORE,
     # 预填充兼容模式: smart|minimal|off
-    # 默认 smart。两种模式的优劣**取决于预填充的结尾形态**，用真实酒馆预设
-    # （Izumi，思维链标签 <konatan_planning~>，西语思考）实测 gemini-3.6-flash × 3：
+    # 默认 smart。两种模式的优劣**取决于预填充的结尾形态**，用某真实酒馆预设
+    # （预填充为一段完整句子 + 一个未闭合的思维链开标签）实测 gemini-3.6-flash × 3：
     #   smart      重复开标签 0/3，思考语言正确 3/3   ← 真实预设的常见形态
     #   keep_turn  重复开标签 3/3，思考语言正确 2/3
     # 真实预设的预填充多以完整句子收尾（"…¡Allá voy!"），keep_turn 追加的 user
@@ -127,6 +132,36 @@ DEFAULT_SETTINGS = {
     # 采样参数处理：auto=按版本自动判定 / deprecated=强制剥离 / allowed=强制保留。
     # 给"新出的模型版本号更小但已废弃采样"这类情况留的手动出口，免于改代码。
     "sampling_policy": "auto",
+    # 思维链守卫（默认开）：预填充停在未闭合的思维链开标签时（标签名由各人预设决定，
+    # 代理只按"未闭合"这一形状识别，不预设任何具体标签名），
+    # 在续写指令末尾追加一条硬性要求——先写完思维链再闭合标签、然后才写正文。
+    # 背景：预填充只把话头停在开标签上，没有任何一句话要求模型"必须先完成思考"，
+    # 实测模型经常跳过思考直接写正文，前端正则于是抓不到思维链（多数情况没有思维链）。
+    "prefill_cot_guard": True,
+    # ===== 标准（Express）模式的 location 钉定（实测有效，见 README“标准模式的 location”）=====
+    # 背景：只发裸模型名时，请求走 express 端点格式
+    #   https://aiplatform.googleapis.com/v1/publishers/google/models/{model}:generateContent
+    # location 由 Google 后端自行路由，可能落到该模型**不提供服务**的区域并 404
+    #   （实测 gemini-2.5-pro 被路由到 asia-southeast1 → 404 not found）。
+    # 改发带项目与区域的完整资源路径后同一模型 200 正常：
+    #   projects/{project}/locations/{location}/publishers/google/models/{model}
+    # express_location 留空 = 保持旧行为（裸模型名）；填 global（推荐）或某区域即启用钉定。
+    # 启用时需要项目 ID：express_project_id 留空则回退用 GOOGLE_PROJECT_ID / 控制台里的 Project ID。
+    # ⚠️ 项目必须是该 API Key 有权且已开启计费的项目，否则 403（实测换成别的项目会
+    #    "requires billing to be enabled"）。
+    # 默认 global：多数 Gemini 模型只在 global 提供（如 gemini-2.5-pro），
+    # 让后端自选区域会偶发 404。留空 = 回到"后端自选"的旧行为。
+    # 钉定失败（项目不匹配/该区域无此模型）会自动退回裸模型名重试一次，见
+    # api_helpers.is_location_pin_failure —— 所以这个默认值不会把任何人变糟。
+    "express_location": "global",
+    "express_project_id": "",
+    # Cookie(Studio) 通道遇到工具流量时怎么办：
+    #   degrade（默认）= 自动降级：丢掉无法表达的函数声明、照常回复；声明里的搜索类
+    #     工具映射为 Studio 内建 googleSearch；历史里的调用往返渲染成可读文本。
+    #     RikkaHub 这类前端只要模型卡勾了工具就每条请求都带 tools，严格拒绝会让
+    #     Studio 通道彻底不可用，所以默认降级。
+    #   reject = 旧行为，明确 400 并提示改用标准模式（要求函数调用必须真实可用时选它）。
+    "cookie_tool_policy": "degrade",
     # 按模型单独保存的参数覆盖：{ "模型ID": { 键: 值, ... } }
     # 仅覆盖“与模型相关”的参数（见 PER_MODEL_KEYS）；优先级 请求 > 模型专属 > 全局 > 内置。
     "model_overrides": {},
@@ -153,4 +188,6 @@ PER_MODEL_KEYS = [
     "image_system_instruction",
     "inject_prefill_for_image",
     "sampling_policy",
+    # 思维链守卫按模型分开很自然：只给跑角色扮演预设的模型开。
+    "prefill_cot_guard",
 ]

@@ -444,6 +444,64 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <span class="text-sm">采样参数处理<span class="helpq" onclick="hlp(this,'h_sp')">?</span></span>
           <select id="sampling_policy" class="inp" style="width:150px"><option value="auto">自动判定</option><option value="deprecated">强制剥离</option><option value="allowed">强制保留</option></select>
         </div>
+        <div class="flex items-center justify-between gap-3"><span class="text-sm">Cookie 通道工具策略<span class="helpq" onclick="hlp(this,'h_ctp')">?</span></span>
+          <select id="cookie_tool_policy" class="inp" style="width:150px"><option value="degrade">自动降级（默认）</option><option value="reject">严格拒绝</option></select>
+        </div>
+        <div class="flex items-center justify-between gap-3"><span class="text-sm">标准模式 location<span class="helpq" onclick="hlp(this,'h_loc')">?</span></span>
+          <select id="express_location" class="inp" style="width:170px">
+            <option value="global">global（默认·推荐）</option>
+            <option value="">默认（后端自选·旧行为）</option>
+            <optgroup label="美国">
+              <option value="us-central1">us-central1（爱荷华）</option>
+              <option value="us-east1">us-east1（南卡）</option>
+              <option value="us-east4">us-east4（北弗吉尼亚）</option>
+              <option value="us-east5">us-east5（哥伦布）</option>
+              <option value="us-south1">us-south1（达拉斯）</option>
+              <option value="us-west1">us-west1（俄勒冈）</option>
+              <option value="us-west4">us-west4（拉斯维加斯）</option>
+            </optgroup>
+            <optgroup label="欧洲">
+              <option value="europe-west1">europe-west1（比利时）</option>
+              <option value="europe-west2">europe-west2（伦敦）</option>
+              <option value="europe-west3">europe-west3（法兰克福）</option>
+              <option value="europe-west4">europe-west4（荷兰）</option>
+              <option value="europe-west8">europe-west8（米兰）</option>
+              <option value="europe-west9">europe-west9（巴黎）</option>
+              <option value="europe-southwest1">europe-southwest1（马德里）</option>
+              <option value="europe-central2">europe-central2（华沙）</option>
+              <option value="europe-north1">europe-north1（芬兰）</option>
+            </optgroup>
+            <optgroup label="亚太">
+              <option value="asia-east1">asia-east1（台湾）</option>
+              <option value="asia-east2">asia-east2（香港）</option>
+              <option value="asia-northeast1">asia-northeast1（东京）</option>
+              <option value="asia-northeast2">asia-northeast2（大阪）</option>
+              <option value="asia-northeast3">asia-northeast3（首尔）</option>
+              <option value="asia-south1">asia-south1（孟买）</option>
+              <option value="asia-southeast1">asia-southeast1（新加坡）</option>
+              <option value="asia-southeast2">asia-southeast2（雅加达）</option>
+              <option value="australia-southeast1">australia-southeast1（悉尼）</option>
+            </optgroup>
+            <optgroup label="其它">
+              <option value="northamerica-northeast1">northamerica-northeast1（蒙特利尔）</option>
+              <option value="southamerica-east1">southamerica-east1（圣保罗）</option>
+              <option value="me-central1">me-central1（多哈）</option>
+              <option value="me-west1">me-west1（特拉维夫）</option>
+            </optgroup>
+          </select>
+        </div>
+        <div>
+          <div class="lbl mb-1">标准模式 Project ID（钉定 location 时必填，留空则用 Cookie 模式那个）</div>
+          <input id="express_project_id" class="inp" placeholder="留空 = 沿用 GOOGLE_PROJECT_ID / Cookie 模式填的项目">
+        </div>
+        <div id="h_loc" class="helpbox">
+          <b>解决"标准模式偶发 404、报错里出现随机区域"</b>：留空时只发裸模型名，请求走 express 端点格式 <code>https://aiplatform.googleapis.com/v1/publishers/google/models/{model}:generateContent</code>，<b>location 由 Google 后端自行路由</b>——可能落到该模型不提供服务的区域直接 404。<br>
+          实测（同一个 Key、同一个模型）：<code>gemini-2.5-pro</code> 留空 → 被路由到 <code>asia-southeast1</code> 报 404；选 <code>global</code> → <b>正常出文</b>。<br>
+          选定后代理改发完整资源路径 <code>projects/{project}/locations/{location}/publishers/google/models/{model}</code>，区域由你钉定。<br>
+          <b>默认 <code>global</code></b>：多数 Gemini 模型只在 global 提供（<code>gemini-2.5-pro</code> 就是），选区域反而可能 404，所以区域列表按需再选。<br>
+          <b>注意</b>：项目必须是该 API Key <b>有权且已开启计费</b>的项目，否则 403（实测填别的项目会报 requires billing）。<br>
+          <b>失败会自动兜底</b>：钉定路径若返回"模型不存在/需要计费"，代理会自动退回裸模型名（＝旧行为）再试一次，并在日志提示怎么修——所以这个默认值不会把任何配置变得更糟。
+        </div>
         <div id="h_sp" class="helpbox">决定是否把 <code>temperature / top_p / top_k</code> 发给模型。<br>
           <b>自动判定</b>（默认）：按版本号推断——3.6 起、3.5 Flash-Lite、以及 4.x 及以后一律剥离。<br>
           <b>什么时候需要手动改</b>：版本号表达不了“号更小但发布更晚”。比如日后出一个 <code>gemini-3.5-pro</code>，官方按“更新模型”废弃了采样，自动判定却会因为 3.5 &lt; 3.6 而放行——此时给它选<b>强制剥离</b>即可，不必改代码。反过来官方澄清某模型仍可调，就选<b>强制保留</b>。<br>
@@ -534,6 +592,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div class="pt-1 border-t border-neutral-100"></div>
           <div class="text-xs font-semibold text-neutral-500 pt-1">预填充</div>
 
+          <div class="flex items-center justify-between gap-3"><span class="text-sm">思维链守卫<span class="helpq" onclick="hlp(this,'h_cotg')">?</span></span><label class="switch"><input type="checkbox" id="prefill_cot_guard"><span class="slider"></span></label></div>
+          <div id="h_cotg" class="helpbox">
+            解决<b>“预设思维链经常不写、直接出正文”</b>：预填充只是把话头停在 <code>&lt;思维链标签&gt;</code> 上，<b>没有任何一句话告诉模型必须先完成思考</b>，模型于是常常跳过思考直接写正文，前端正则就抓不到思维链。<br>
+            打开后，代理会自动识别预填充里<b>未闭合的开标签</b>，在续写指令末尾追加一条硬性要求：先逐条写完该标签内的思考、用对应闭合标签收尾，然后才写正文。<br>
+            没检测到未闭合标签时（例如预填充只是普通句子）本项不做任何事；生图模型不适用。<br>
+            <b>仍不稳定时</b>：把「原生思考控制」从“关闭原生思考”改为“强制用上方档位 + low”再对比——压到 minimal 会让模型倾向“直接给答案”，可能连带跳过预设要求的长思考。
+          </div>
           <div>
             <div class="flex items-center justify-between gap-3"><span class="text-sm">预填充兼容模式<span class="helpq" onclick="hlp(this,'h_pfm')">?</span></span>
               <select id="prefill_mode" class="inp" style="width:150px"><option value="smart">智能（默认）</option><option value="keep_turn">保留模型轮次</option><option value="minimal">最小</option><option value="off">关闭</option></select>
@@ -580,7 +645,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let CAPS = {}, chart = null, curAR = "";
 let GLOBAL_SETTINGS = {}, OVERRIDES = {};
-const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction','image_system_instruction','inject_prefill_for_image','sampling_policy'];
+const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction','image_system_instruction','inject_prefill_for_image','sampling_policy','prefill_cot_guard'];
 const COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
 
 function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1800); }
@@ -660,8 +725,8 @@ async function loadParams(){
     const s=await (await fetch('/api/settings')).json();
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
-    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy'].forEach(k=>setV(k,s[k]));
-    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image'].forEach(k=>setV(k,s[k]));
+    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','cookie_tool_policy','express_location','express_project_id'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard'].forEach(k=>setV(k,s[k]));
     // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
       if(s.hide_thoughts) setV('native_thinking_mode','off');
@@ -714,6 +779,7 @@ async function saveModelOverride(){
     image_system_instruction:$('image_system_instruction').checked,
     inject_prefill_for_image:$('inject_prefill_for_image').checked,
     sampling_policy:$('sampling_policy').value,
+    prefill_cot_guard:$('prefill_cot_guard').checked,
   };
   if(m==='__global__'){
     // 全局默认作用域：写进全局设置，而不是任何模型的专属值
@@ -831,6 +897,9 @@ async function saveSettings(){
     cookie_debug:$('cookie_debug').checked,
     debug_outbound:$('debug_outbound').checked,
     prefill_mode:$('prefill_mode').value,
+    cookie_tool_policy:$('cookie_tool_policy').value,
+    express_location:$('express_location').value,
+    express_project_id:$('express_project_id').value.trim(),
     prefill_suppress_thinking:$('prefill_suppress_thinking').checked,
   };
   // 7 个可覆盖参数：仅当所选模型“没有专属配置”时，才作为全局默认保存，
