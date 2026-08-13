@@ -348,11 +348,49 @@ def apply_console_injection(
     return new_msgs, notes
 
 
+# 预设思维链标签的宽松匹配：各人预设用的标签名完全不同，代理**不预设任何具体名字**，
+# 只按"开了但没闭合"这一形状识别；字符集放宽到字母数字与 _ - ~ . : 组合，
+# 以兼容 <thinking>、<CoT>、<plan_1>、<analysis~> 这类各式各样的自定义标签。
+_TAG_OPEN_RE = re.compile(r"<([A-Za-z][A-Za-z0-9_\-~.:]*)\s*>")
+
+
+def detect_unclosed_tag(text: str) -> Optional[str]:
+    """找出文本里"开了但没闭合"的最后一个标签名，没有则返回 None。
+
+    预填充卡思维链的典型形态就是停在一个**未闭合的开标签**上（标签名随预设而定）：
+    模型接着写的内容理应落在标签内部（即思维链），写完再闭合、然后写正文。
+    """
+    if not text:
+        return None
+    last: Optional[str] = None
+    for m in _TAG_OPEN_RE.finditer(text):
+        name = m.group(1)
+        if re.search(rf"</\s*{re.escape(name)}\s*>", text[m.end():]):
+            continue          # 这个标签在后面闭合了，不算
+        last = name
+    return last
+
+
+def build_cot_guard(tag: str) -> str:
+    """生成"必须先写完思维链再写正文"的强化要求（思维链守卫）。
+
+    为什么需要它：预填充只是把话头停在开标签上，**没有任何一句话告诉模型
+    "接下来必须先完成思维链"**。实测里模型经常直接跨过思考写正文，
+    结果输出里只有一个孤零零的开标签、没有思考内容也没有闭合标签，
+    前端按正则去抓思维链就抓不到（用户报告：多数情况没有思维链）。
+    这段守卫把隐含约定写成显式指令，并点名那个具体标签。
+    """
+    return (f"\n\n（格式硬性要求）你的这条回复当前停在 <{tag}> 内部：请**先**在 <{tag}> 里"
+            f"逐条写完该标签要求的全部思考内容，写完后用 </{tag}> 闭合，"
+            f"**然后才**开始写正文。不允许跳过思考直接写正文，也不允许只写一个空标签。")
+
+
 def apply_prefill_compat(
     messages: List[OpenAIMessage],
     mode: str = "smart",
     allow_model_last: bool = False,
     instruction_template: str = "",
+    cot_guard: bool = False,
 ) -> Tuple[List[OpenAIMessage], str, bool]:
     """
     预填充(prefill)兼容：Gemini 3.x 拒绝以 assistant/model 结尾的请求（400）。
@@ -411,6 +449,10 @@ def apply_prefill_compat(
         # 必须截到 idx+1：预填充后面可能还跟着空消息，带上它们会再次以非 user 结尾。
         new_msgs = list(messages[:idx + 1])
         nudge = (instruction_template or "").strip() or DEFAULT_KEEP_TURN_NUDGE
+        if cot_guard:
+            tag = detect_unclosed_tag(prefill)
+            if tag:
+                nudge += build_cot_guard(tag)
         new_msgs.append(OpenAIMessage(role="user", content=nudge))
         return new_msgs, prefill, True
 
@@ -418,6 +460,11 @@ def apply_prefill_compat(
     new_msgs = list(messages[:idx])
     intro = (instruction_template or "").strip() or DEFAULT_PREFILL_INSTRUCTION
     instruction = intro + "\n\n" + prefill
+    if cot_guard:
+        tag = detect_unclosed_tag(prefill)
+        if tag:
+            # 守卫放在预填充之后 = 模型最后读到的就是这条硬性要求
+            instruction += build_cot_guard(tag)
     if new_msgs and new_msgs[-1].role == "user" and isinstance(new_msgs[-1].content, str):
         merged = new_msgs[-1].content + "\n\n" + instruction
         new_msgs[-1] = OpenAIMessage(role="user", content=merged)
