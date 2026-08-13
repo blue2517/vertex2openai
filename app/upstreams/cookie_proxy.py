@@ -68,6 +68,38 @@ COOKIE_EXPIRED_KEYWORDS = [
     "invalid credentials",
 ]
 
+# **项目级**问题的关键词：错的不是 Cookie，是 Project ID / 计费 / 项目权限。
+# 必须比 COOKIE_EXPIRED_KEYWORDS 先判，否则 "Permission ... denied on resource
+# //aiplatform.googleapis.com/projects/xxx" 会被当成"Cookie 过期"，
+# 让人反复重取 Cookie 却永远好不了（实测踩过）。
+PROJECT_ERROR_KEYWORDS = [
+    "requires billing",
+    "billing to be enabled",
+    "billing account",
+    "has not been used in project",
+    "is not found and cannot be used",
+    "project not found",
+    "invalid argument",
+]
+
+PROJECT_ERROR_HINT = (
+    "\n\n💡 这看起来是**项目层面**的问题，不是 Cookie 失效，重取 Cookie 无用。请依次检查：\n"
+    "1) 控制台里的 Project ID 是否填对（要用你能在 Agent Platform Studio 里正常出文的那个项目）；\n"
+    "2) 该项目是否已**开启计费**（Google 对这条接口要求计费账号；未开启会报 requires billing）；\n"
+    "3) 当前登录的 Google 账号对该项目是否有权限（换项目或换账号试试）。"
+)
+
+
+def _is_project_error(error_msg: str) -> bool:
+    """是否为项目/计费/权限类错误（与 Cookie 失效区分开）。"""
+    lower = (error_msg or "").lower()
+    if any(kw in lower for kw in PROJECT_ERROR_KEYWORDS):
+        return True
+    # "Permission 'aiplatform.endpoints.predict' denied on resource ...projects/xxx"
+    # 这种同时命中 cookie 关键词，但既可能是 Cookie 没登录、也可能是项目没权限，
+    # 只要错误里点名了具体项目资源，就按项目问题给出更有用的指引。
+    return ("projects/" in lower or "project #" in lower) and "denied" in lower
+
 COOKIE_REFRESH_HINT = (
     "\n\n💡 Cookie 通常较为持久（只要不退出登录/改密码/被 Google 主动失效，可维持数周甚至更久）；"
     "仅当确实出现权限错误时才需更新。"
@@ -181,21 +213,72 @@ def _build_thinking_config(model_name: str, request: OpenAIRequest,
 
 # ========== OpenAI → batchGraphql 消息格式转换 ==========
 
-def has_tool_traffic(messages: list, tools: Any = None) -> bool:
-    """请求里是否含函数调用相关内容（P1-1）。
+# 可映射到 Studio 内建搜索的工具名（前端把“联网搜索”做成函数声明时用的常见命名）
+_BUILTIN_SEARCH_NAMES = {
+    "google_search", "googlesearch", "google_search_retrieval",
+    "web_search", "websearch", "search_web", "browse", "search",
+}
 
-    Cookie 通道不下发 functionDeclarations，也无法表达 functionCall/functionResponse。
-    旧实现把 role="tool" 一律折成 model 轮次、assistant.tool_calls 直接丢弃，
-    发出去的是一段语义错乱的历史——静默出错比明确报错糟糕得多。
+
+def classify_tool_traffic(messages: list, tools: Any = None) -> dict:
+    """区分「只是声明了工具」和「历史里真有函数调用往返」。
+
+    这个区分是必需的：RikkaHub 这类前端只要在模型卡里勾了工具能力，**每一条**
+    请求都会带上 `tools` 声明，哪怕本轮完全没有调用需求。旧实现只看 `tools`
+    是否为空就整单拒绝（400），等于让 Studio 通道在这些前端下彻底不可用。
+
+    - declared：本轮带了工具声明（可安全丢弃 → 正常对话）
+    - history：历史里有 assistant.tool_calls 或 role="tool"（真调用往返，
+      Cookie 通道无法用 functionCall/functionResponse 如实表达，只能降级成文本）
+    - builtin_search：声明里含可映射到 Studio 内建 googleSearch 的工具
+    - custom_names：其余自定义函数名（仅用于日志）
     """
-    if tools:
-        return True
+    declared = bool(tools)
+    builtin_search = False
+    custom_names: list = []
+    for t in (tools or []):
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else {}
+        name = str(fn.get("name") or t.get("name") or t.get("type") or "").strip()
+        if name.lower().replace("-", "_") in _BUILTIN_SEARCH_NAMES:
+            builtin_search = True
+        elif name:
+            custom_names.append(name)
+
+    history = False
     for m in messages or []:
-        if getattr(m, "role", None) == "tool":
-            return True
-        if getattr(m, "tool_calls", None):
-            return True
-    return False
+        if getattr(m, "role", None) == "tool" or getattr(m, "tool_calls", None):
+            history = True
+            break
+
+    return {"declared": declared, "history": history,
+            "builtin_search": builtin_search, "custom_names": custom_names}
+
+
+def has_tool_traffic(messages: list, tools: Any = None) -> bool:
+    """兼容旧签名：请求里是否含任何函数调用相关内容。"""
+    tt = classify_tool_traffic(messages, tools)
+    return bool(tt["declared"] or tt["history"])
+
+
+def _plain_text_of(content: Any) -> str:
+    """取消息的纯文本（用于把工具往返渲染成可读文本）。"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    out = []
+    for p in (content or []):
+        p = normalize_content_part(p)
+        if isinstance(p, dict) and p.get("type") == "text":
+            out.append(p.get("text", ""))
+    if out:
+        return "\n".join(out)
+    try:
+        return json.dumps(content, ensure_ascii=False)
+    except Exception:
+        return str(content)
 
 
 def _convert_messages_to_contents(messages: list) -> tuple:
@@ -223,7 +306,29 @@ def _convert_messages_to_contents(messages: list) -> tuple:
                         system_parts.append(p.get("text", ""))
             continue
 
-        # 已在入口用 has_tool_traffic() 拒绝了工具流量，这里只可能是 user / assistant
+        # 工具流量降级：本通道无法表达 functionCall / functionResponse，
+        # 但把它们**渲染成可读文本**至少能保住对话的连贯性（严格拒绝策略下
+        # 根本走不到这里；旧实现是直接丢弃 tool_calls、把 role="tool" 折成
+        # model 轮次，那才是语义错乱）。
+        if role == "tool":
+            name = getattr(msg, "name", None) or "tool"
+            body = _plain_text_of(content)
+            contents.append({"role": "user",
+                             "parts": [{"text": f"[工具执行结果 · {name}]\n{body}"}]})
+            continue
+
+        tool_calls = getattr(msg, "tool_calls", None)
+        if role == "assistant" and tool_calls:
+            lines = []
+            for tc in tool_calls:
+                fn = (tc or {}).get("function") or {}
+                lines.append(f"[请求调用工具 · {fn.get('name', 'unknown')}] 参数：{fn.get('arguments', '{}')}")
+            said = _plain_text_of(content)
+            if said:
+                lines.insert(0, said)
+            contents.append({"role": "model", "parts": [{"text": "\n".join(lines)}]})
+            continue
+
         gemini_role = "user" if role == "user" else "model"
         parts = openai_content_to_wire_parts(content)
 
@@ -246,10 +351,11 @@ def _convert_messages_to_contents(messages: list) -> tuple:
 
 async def build_batch_graphql_body_async(project_id: str, model_name: str,
                                          request: OpenAIRequest,
-                                         prefill_active: bool = False) -> dict:
+                                         prefill_active: bool = False,
+                                         force_search: bool = False) -> dict:
     """在线程里构建请求体：内部有远程图片下载与 PIL 压缩，不能阻塞事件循环（P1-2）。"""
     return await asyncio.to_thread(_build_batch_graphql_body, project_id, model_name,
-                                   request, prefill_active)
+                                   request, prefill_active, force_search)
 
 
 def _build_batch_graphql_body(
@@ -257,6 +363,7 @@ def _build_batch_graphql_body(
     model_name: str,
     request: OpenAIRequest,
     prefill_active: bool = False,
+    force_search: bool = False,
 ) -> dict:
     contents, system_text = _convert_messages_to_contents(request.messages)
     model_path = f"projects/{project_id}/locations/global/publishers/google/models/{model_name}"
@@ -330,7 +437,9 @@ def _build_batch_graphql_body(
     if request.stop and "stop_sequences" in allowed:
         gen_config["stopSequences"] = request.stop if isinstance(request.stop, list) else [request.stop]
 
-    if hasattr(request, 'model') and request.model.endswith("-search") and profile["supports_search"]:
+    # 内建搜索：模型名 -search 后缀，或前端把搜索做成函数声明后被降级映射（force_search）
+    _wants_search = force_search or (hasattr(request, 'model') and request.model.endswith("-search"))
+    if _wants_search and profile["supports_search"]:
         variables["tools"] = [{"googleSearch": {}}]
 
     return {
@@ -639,8 +748,10 @@ async def _execute_stream_request_generator(
                 error_text = await response.aread()
                 error_msg = error_text.decode('utf-8', errors='replace')[:1000]
 
-                if response.status_code in (401, 403) or _is_cookie_expired_error(error_msg):
-                    yield "cookie_error", error_msg + COOKIE_REFRESH_HINT
+                if response.status_code in (401, 403) or _is_cookie_expired_error(error_msg) \
+                        or _is_project_error(error_msg):
+                    hint = PROJECT_ERROR_HINT if _is_project_error(error_msg) else COOKIE_REFRESH_HINT
+                    yield "cookie_error", error_msg + hint
                     return
 
                 is_retryable = response.status_code in (429, 503, 500) or _is_retryable_error(error_msg)
@@ -663,8 +774,10 @@ async def _execute_stream_request_generator(
                         err_msg = data.get("message", str(data)) if isinstance(data, dict) else str(data)
 
                         # 在还没发送任何有效数据前遇到错误，尝试走顶层重试
-                        if _is_cookie_expired_error(err_msg) and not has_content:
-                            yield "cookie_error", err_msg + COOKIE_REFRESH_HINT
+                        if (_is_cookie_expired_error(err_msg) or _is_project_error(err_msg)) \
+                                and not has_content:
+                            hint = PROJECT_ERROR_HINT if _is_project_error(err_msg) else COOKIE_REFRESH_HINT
+                            yield "cookie_error", err_msg + hint
                             return
                         if _is_retryable_error(err_msg) and not has_content:
                             yield "retryable_error", err_msg
@@ -798,15 +911,39 @@ class CookieProxyUpstream(BaseUpstream):
                 "请确保 Cookie 来自已登录的 console.cloud.google.com 页面。"
             ), "type": "auth_error"}})
 
-        # ===== 2.5 拒绝该通道无法表达的工具流量（P1-1）=====
-        if has_tool_traffic(request_obj.messages, request_obj.tools):
-            print("⛔ [Studio] 请求含函数调用内容，Cookie 直连通道不支持，已明确拒绝。")
-            return JSONResponse(status_code=400, content={"error": {
-                "message": ("Cookie 直连通道暂不支持函数调用（不下发 functionDeclarations，"
-                            "也无法表达 functionCall / functionResponse）。\n"
-                            "请在控制台切换到「标准模式（Express API Key）」后重试。"),
-                "type": "unsupported_feature",
-            }})
+        # ===== 2.5 工具流量处理：默认自动降级，可在控制台改回严格拒绝 =====
+        # 关键区分（见 classify_tool_traffic）：
+        #   仅声明工具（RikkaHub 等前端每条请求都带）→ 丢掉声明，正常对话；
+        #   历史里真有调用往返        → 无法如实表达，降级成文本观测或拒绝。
+        _tool_info = classify_tool_traffic(request_obj.messages, request_obj.tools)
+        _tool_policy = str(app_state.get_setting("cookie_tool_policy", "degrade") or "degrade").lower()
+        force_builtin_search = False
+        if _tool_info["declared"] or _tool_info["history"]:
+            if _tool_policy == "reject":
+                print("⛔ [Studio] 请求含函数调用内容，按控制台策略（严格拒绝）已拒绝。")
+                return JSONResponse(status_code=400, content={"error": {
+                    "message": ("Cookie 直连通道暂不支持函数调用（不下发 functionDeclarations，"
+                                "也无法表达 functionCall / functionResponse）。\n"
+                                "请切换到「标准模式（Express API Key）」，"
+                                "或在控制台把「Cookie 通道工具策略」改为「自动降级」。"),
+                    "type": "unsupported_feature",
+                }})
+
+            # —— 自动降级 ——
+            if _tool_info["builtin_search"]:
+                force_builtin_search = True
+                print("🔎 [Studio] 请求声明了搜索类工具，已映射为 Studio 内建 googleSearch。")
+            if _tool_info["custom_names"]:
+                print(f"⚠️ [Studio] 已忽略本通道不支持的自定义函数声明："
+                      f"{'、'.join(_tool_info['custom_names'][:5])}"
+                      f"{' 等' if len(_tool_info['custom_names']) > 5 else ''}；本轮按普通对话回复。")
+            if _tool_info["history"]:
+                print("⚠️ [Studio] 历史含函数调用往返，已降级为文本观测发送"
+                      "（语义会有损；需要完整函数调用请切标准模式）。")
+            if request_obj.tool_choice not in (None, "none", "auto"):
+                print("⚠️ [Studio] 请求强制指定了工具调用（tool_choice），本通道无法满足，已忽略。")
+            # 丢掉声明：下游一律按普通对话构建载荷
+            request_obj = request_obj.model_copy(update={"tools": None, "tool_choice": None})
 
         # ===== 3. 解析模型名 =====
         model_display = request_obj.model
@@ -840,6 +977,7 @@ class CookieProxyUpstream(BaseUpstream):
                 request_obj.messages, _prefill_mode,
                 allow_model_last=not _profile["requires_user_last_turn"],
                 instruction_template=_prefill_tpl(_inj_settings.get("prefill_instruction", ""), _profile["is_image"]),
+                cot_guard=bool(_inj_settings.get("prefill_cot_guard", True)) and not _profile["is_image"],
             )
             if _new_msgs is not request_obj.messages:
                 request_obj = request_obj.model_copy(update={"messages": _new_msgs})
@@ -938,7 +1076,8 @@ class CookieProxyUpstream(BaseUpstream):
                         return
 
                     body = await build_batch_graphql_body_async(
-                        project_id, base_model_name, request_obj, prefill_active=prefill_active)
+                        project_id, base_model_name, request_obj, prefill_active=prefill_active,
+                        force_search=force_builtin_search)
                     req_headers = build_headers(_get_cookie_string()) or headers
                     if cookie_debug:
                         print(f"🔎 [Studio 调试] 出站 generationConfig: "
@@ -1106,7 +1245,8 @@ class CookieProxyUpstream(BaseUpstream):
                     })
                 try:
                     body = await build_batch_graphql_body_async(
-                        project_id, base_model_name, request_obj, prefill_active=prefill_active)
+                        project_id, base_model_name, request_obj, prefill_active=prefill_active,
+                        force_search=force_builtin_search)
                     req_headers = build_headers(_get_cookie_string()) or headers
                     if cookie_debug:
                         print(f"🔎 [Studio 调试] 出站 generationConfig: "
