@@ -46,6 +46,22 @@ _FLASH_IMAGE_ARS = _PRO_IMAGE_ARS | {"1:4", "4:1", "1:8", "8:1"}
 #   LOW / HIGH 所有 3.x 都有。
 _LEVEL_ORDER = ["minimal", "low", "medium", "high"]
 
+# MINIMAL 的可用性上界（含）：3.6 及更早的非 Pro 机型实测/文档支持 MINIMAL
+# （3.6-flash 已真机验证 MINIMAL 生效、思考归零）。
+# 出处：intro_gemini_3_7_flash.ipynb（核对于 2026-08-14）——3.7 Flash 的档位表
+#   只列出 LOW / MEDIUM / HIGH，未提及 MINIMAL，且默认档位为 medium
+#   （"replaced the high setting used in older Gemini 3 models"）。
+# 方向性：漏给 MINIMAL 只是少压一点思考（拿到 LOW，不报错）；多给不支持的枚举会 400。
+#   因此 3.7 及更新型号一律不提供 MINIMAL，等真机验证后再逐个放开。
+_MINIMAL_MAX_VERSION = (3, 6)
+
+
+def _supports_minimal(major: int, minor: int, is_pro: bool) -> bool:
+    """该型号是否提供 MINIMAL 思考档位。"""
+    if is_pro:
+        return False                                  # Pro 系最低 LOW（官方）
+    return (major, minor) <= _MINIMAL_MAX_VERSION
+
 
 def _clamp_level(level: str, levels: set) -> str:
     """把任意档位夹到该模型的合法档位集合内。
@@ -147,12 +163,16 @@ def get_profile(model_name: str) -> Dict[str, Any]:
         # Gemini 3.x：思考用 thinking_level（取代 thinking_budget），且不支持 candidate_count。
         # temperature/top_p/top_k：自 3.6 Flash / 3.5 Flash-Lite 起（及所有更新/未来模型）已废弃，
         # 官方要求从请求移除（现忽略、未来 400）；更早的 3.x 仍可用但建议保持默认。
-        levels = {"low", "medium", "high"} if is_pro else {"minimal", "low", "medium", "high"}
-        if "flash-lite" in name:
+        levels = {"low", "medium", "high"}
+        if _supports_minimal(major, minor, is_pro):
+            levels = levels | {"minimal"}
+        if "flash-lite" in name and "minimal" in levels:
             default_level = "minimal"
         elif is_pro:
             default_level = "high"
         else:
+            # 非 Pro 的 3.x 默认 medium。3.7 Flash 官方明确默认 medium
+            # （取代旧 3.x 的 high），与这里一致。
             default_level = "medium"
         allowed = set(SAMPLING_KEYS)
         allowed.discard("candidate_count")  # 所有 Gemini 3.x 不支持 candidate_count
