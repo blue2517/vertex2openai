@@ -797,7 +797,18 @@ async def execute_gemini_call(
     fastapi_request: Optional[Any] = None,
     prefill_text: str = "",
     fallback_model: Optional[str] = None,
+    fallback_client_factory: Optional[Callable[[], Any]] = None,
 ):
+    fallback_client = None
+
+    def _get_fallback_client():
+        nonlocal fallback_client
+        if fallback_client_factory is None:
+            return current_client
+        if fallback_client is None:
+            fallback_client = fallback_client_factory()
+        return fallback_client
+
     # P1-2：prompt 构建内部有远程图片下载与 PIL 压缩（同步阻塞），
     # 放到线程里执行，避免卡住整个事件循环。
     actual_prompt_for_call = await asyncio.to_thread(prompt_func, request_obj.messages)
@@ -828,9 +839,8 @@ async def execute_gemini_call(
         else: # True Streaming
             response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
             async def _gemini_real_stream_generator_inner():
-                # 钉定失败要在这里改写模型名，必须声明 nonlocal，
-                # 否则赋值会把 model_to_call 变成局部变量 → 前面的读取直接 UnboundLocalError。
-                nonlocal model_to_call
+                # 钉定失败要在这里改写模型名与客户端，必须声明 nonlocal。
+                nonlocal model_to_call, current_client
                 max_retries, backoff_sec = get_retry_settings()
                 has_yielded = False  # 是否已向客户端输出过内容
                 # 立即吐一个 SSE 心跳，尽快建立连接（429 重试期间也保活，防前端超时中断）
@@ -917,6 +927,8 @@ async def execute_gemini_call(
                                   "如持续出现，请确认「通道与凭证」里的 Project ID 属于该 API Key 且已开启计费，"
                                   "或把「标准模式 location」设为“默认（后端自选）”。")
                             model_to_call = fallback_model
+                            current_client = _get_fallback_client()
+                            print("ℹ️ [流量等级] 回退默认路由已使用普通请求。")
                             continue
 
                         # 关键修复：只有在“尚未向客户端输出任何内容”时才重试；
@@ -986,6 +998,8 @@ async def execute_gemini_call(
                           "如持续出现，请确认「通道与凭证」里的 Project ID 属于该 API Key 且已开启计费，"
                           "或把「标准模式 location」设为“默认（后端自选）”。")
                     model_to_call = fallback_model
+                    current_client = _get_fallback_client()
+                    print("ℹ️ [流量等级] 回退默认路由已使用普通请求。")
                     continue
                 if is_retryable_exception(e_call) and attempt < max_retries:
                     stats.add_retry()
