@@ -1,9 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Cookie(Studio) 通道工具流量自动降级（疑问1）。
-
-RikkaHub 这类前端只要模型卡勾了工具能力，每条请求都带 tools 声明，
-旧实现只看 tools 非空就 400，Studio 通道等于不可用。
-"""
+"""Cookie(Studio) 通道原生工具流量及受控兼容降级。"""
 import asyncio
 import json
 
@@ -54,9 +50,9 @@ def test_legacy_wrapper_still_true():
     assert cp.has_tool_traffic([OpenAIMessage(role="user", content="hi")], None) is False
 
 
-# ---------- 工具往返渲染成可读文本 ----------
+# ---------- 原生工具往返与文本兼容降级 ----------
 
-def test_tool_history_rendered_as_text():
+def test_tool_history_uses_native_parts_by_default():
     msgs = [
         OpenAIMessage(role="user", content="北京天气?"),
         OpenAIMessage(role="assistant", content=None,
@@ -66,11 +62,16 @@ def test_tool_history_rendered_as_text():
         OpenAIMessage(role="tool", name="get_weather", tool_call_id="1", content="晴 30C"),
     ]
     contents, _ = cp._convert_messages_to_contents(msgs)
-    blob = json.dumps(contents, ensure_ascii=False)
-    assert "请求调用工具" in blob and "get_weather" in blob
-    assert "工具执行结果" in blob and "晴 30C" in blob
-    # 角色序列必须仍然交替合法（user → model → user）
+    assert contents[1]["parts"][0]["functionCall"] == {
+        "name": "get_weather", "args": {"city": "北京"}}
+    assert contents[1]["parts"][0]["thoughtSignature"]
+    assert contents[2]["parts"][0]["functionResponse"] == {
+        "name": "get_weather", "response": {"result": "晴 30C"}}
     assert [c["role"] for c in contents] == ["user", "model", "user"]
+
+    fallback, _ = cp._convert_messages_to_contents(msgs, native_tools=False)
+    blob = json.dumps(fallback, ensure_ascii=False)
+    assert "请求调用工具" in blob and "工具执行结果" in blob
 
 
 def test_plain_text_of_variants():
@@ -102,22 +103,25 @@ def _setup_auth():
     app_state.set_project_id("p")
 
 
-def test_fixed_degrade_ignores_stale_reject_setting(monkeypatch, capsys):
+def test_native_path_ignores_stale_reject_setting(monkeypatch, capsys):
     """旧配置里的 reject 键不再是已知设置，也不能恢复 400 行为。"""
     with app_state._lock:
         app_state._state["settings"] = {"cookie_tool_policy": "reject"}
     assert "cookie_tool_policy" not in app_state.get_settings()
     # 控制台/API 再提交旧键也会被已知键过滤器忽略。
     assert "cookie_tool_policy" not in app_state.update_settings({"cookie_tool_policy": "reject"})
-    captured = {}
+    captured = {"builds": []}
 
-    async def fake_build(project_id, model_name, request, prefill_active=False, force_search=False):
+    async def fake_build(project_id, model_name, request, prefill_active=False,
+                         force_search=False, native_tools=True):
+        captured["builds"].append(native_tools)
         captured["tools"] = request.tools
         captured["tool_choice"] = request.tool_choice
         captured["force_search"] = force_search
-        return {"variables": {"contents": [], "generationConfig": {}}}
+        return {"variables": {"contents": [], "generationConfig": {}, "native": native_tools}}
 
-    async def fake_exec(client, headers, body, sampler=None):
+    async def fake_exec(client, headers, body, sampler=None, fallback_body=None):
+        captured["fallback_body"] = fallback_body
         yield ("text", "正常回复")
         yield ("finish", "STOP")
 
@@ -135,14 +139,16 @@ def test_fixed_degrade_ignores_stale_reject_setting(monkeypatch, capsys):
 
     _setup_auth()
     chunks = asyncio.run(run())
-    assert captured["tools"] is None            # 声明已丢弃
-    assert captured["tool_choice"] is None       # 强制选择已忽略
+    assert captured["tools"] == [_tool("get_weather")]
+    assert captured["tool_choice"]["function"]["name"] == "get_weather"
+    assert captured["builds"] == [True, False]
+    assert captured["fallback_body"]["variables"]["native"] is False
     assert captured["force_search"] is False
     body = "".join(chunks)
     assert "正常回复" in body and "[DONE]" in body
     logs = capsys.readouterr().out
-    assert "已忽略本通道不支持的自定义函数声明" in logs
-    assert "请求强制指定了工具调用" in logs
+    assert "原生函数调用" in logs
+    assert "已忽略本通道不支持" not in logs
 
 
 def test_fixed_degrade_maps_search_tool(monkeypatch):
@@ -152,7 +158,8 @@ def test_fixed_degrade_maps_search_tool(monkeypatch):
         captured["force_search"] = force_search
         return {"variables": {"contents": [], "generationConfig": {}}}
 
-    async def fake_exec(client, headers, body, sampler=None):
+    async def fake_exec(client, headers, body, sampler=None, fallback_body=None):
+        assert fallback_body is None
         yield ("text", "ok")
         yield ("finish", "STOP")
 

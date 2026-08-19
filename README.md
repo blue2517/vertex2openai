@@ -32,7 +32,7 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
   - **实时监控**：运行日志推流、健康度图表（成功/错误/拥堵重试）、Token 消耗统计（两条通道均计入）。
 - **Gemini 能力与适配**
   - 文本对话、流式（SSE）与非流式。
-  - OpenAI tools / function calling ↔ Gemini function calling 适配（含 Gemini 3.x 多轮所需的 thought signature 编解码）。**注意：函数调用仅在 Express 通道支持；Cookie 直连通道不下发函数声明。**
+  - OpenAI tools / function calling ↔ Gemini function calling 适配（含 Gemini 3.x 多轮所需的 thought signature 编解码）；Express 与 Cookie 直连通道均支持自定义函数声明、调用与结果回传。
   - **安全分类对齐**：两条通道下发同一套安全设置（`HARM_CATEGORY_HATE_SPEECH`、`DANGEROUS_CONTENT`、`SEXUALLY_EXPLICIT`、`HARASSMENT`、`JAILBREAK`），阈值最宽松，避免通道间行为不一致。
     > 📌 **更正**：早期版本曾把"有思考、正文为空"归因于 Cookie 通道缺少 `HARM_CATEGORY_JAILBREAK`。这个解释是错的——按官方文档，**越狱分类器默认就是关闭的**，要打开必须显式把该分类的阈值设成具体的拦截值；不下发它不会启用任何过滤，下发 `OFF` 也只是空操作。该现象的真实成因见下方"3.6-flash 只返回思考"一节（前端恒发 `reasoning_effort=xhigh` 导致原生思考在 HIGH 档跑飞/被截断）。
   - **上游错误如实透传**：模型在当前项目/区域不可用（404）、权限不足（403）、参数非法（400）等，会以对应 HTTP 状态码 + OpenAI 错误格式返回，而非笼统的 500。
@@ -101,7 +101,7 @@ http://localhost:8050
 | **`retry_max` 语义** | Express 通道当作总次数，设 0 时一次请求都不发 | 统一为「重试次数」，总请求数 = `retry_max + 1`，设 0 仍请求一次；取值钳到 0–50 |
 | **并行函数调用（流式）** | 只发第一个，`index` 恒为 0 | 全部下发，`index` 跨 chunk 稳定递增 |
 | **思考签名** | base64 拼进 `tool_call_id`（上千字符，易被前端截断） | 短 id（≤40 字符）+ 进程内旁路缓存；旧格式仍可解析；取不回时降级为官方 `skip_thought_signature_validator` 哨兵 |
-| **Cookie 通道 + 函数调用** | 静默把 `role=tool` 折成 model，发出错乱历史 | 入口返回 400，提示切换到标准模式 |
+| **Cookie 通道 + 函数调用** | 静默把 `role=tool` 折成 model，发出错乱历史 | 原生下发函数声明，按 `functionCall` / `functionResponse` 回放历史并保留 thought signature |
 | **Cookie 通道输入图** | 不压缩、不支持 http(s) 图片、不解析正文内联图 | 与标准通道一致（压缩开关对两条通道都生效） |
 | **`stop` 字段** | 只接受数组，传字符串 422 | 字符串/数组都接受 |
 | **`logprobs` 字段** | 按 Gemini 语义当整数 | 兼容 OpenAI 的 `logprobs: bool` + `top_logprobs: int` |
@@ -208,18 +208,17 @@ http://localhost:8050
 
 ---
 
-## Cookie(Studio) 通道的工具降级行为
+## Cookie(Studio) 通道的原生函数调用
 
-Cookie 直连通道不能下发 `functionDeclarations`，也无法表达 `functionCall`/`functionResponse`。但**「不能真的调用工具」不该等于「整单拒绝」**：RikkaHub 这类前端只要在模型卡里勾了工具能力，**每条**请求都会带上 `tools` 声明，哪怕本轮毫无调用需求——旧版据此直接 400，等于 Studio 通道在这些前端下完全不可用。
-
-在原生 Cookie 工具支持实现前，本通道固定采用**安全降级**：
+Cookie 直连通道会把 OpenAI `tools` 转成 batchGraphql 的原生 `functionDeclarations`，并把 `tool_choice` 的 `none` / `auto` / `required` / 指定函数分别映射为 `NONE` / `AUTO` / `ANY` 模式。嵌套对象与数组参数会递归转换成 Studio 私有 UI Schema。
 
 | 情况 | 行为 |
 |---|---|
-| 只带了 `tools` 声明，历史无调用往返 | **丢掉声明，照常正常回复**（最常见：前端模型卡开了工具） |
-| 声明里含搜索类工具（`google_search` / `web_search` 等） | **映射为 Studio 内建 `googleSearch`**（这个通道本来就支持） |
-| 历史里有真实 `functionCall` / `functionResponse` | 渲染成可读文本（`[请求调用工具 · x]` / `[工具执行结果 · x]`）后发送，保住对话连贯；语义有损，日志会警告 |
-| `tool_choice` 强制指定函数 | 无法满足，忽略并警告（按你的要求：调不了就正常回复） |
+| 自定义函数声明 | 原生下发；流式与非流式响应都返回 OpenAI `tool_calls` |
+| 声明里含搜索类工具（`google_search` / `web_search` 等） | 映射为 Studio 内建 `googleSearch`；可与自定义函数声明共存 |
+| 历史里的 assistant `tool_calls` | 回放为 role=`model` 的 `functionCall` Parts，并从 `extra_content` 或短期缓存恢复 thought signature |
+| 连续的 role=`tool` 结果 | 按 `tool_call_id` 关联函数名，合并为 role=`user` 的 `functionResponse` Parts；并行顺序为 FC1, FC2, FR1, FR2 |
+| 模型或协议明确拒绝原生函数 Schema | 仅本次固定降级为文本工具观测并重试一次；没有用户可见策略开关，也不会恢复旧版严格拒绝路径 |
 
 ---
 
