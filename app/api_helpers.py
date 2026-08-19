@@ -447,7 +447,13 @@ class ToolCallIndexer:
 
 def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candidate_index: int = 0,
                             indexer: Optional[ToolCallIndexer] = None) -> str:
-    from message_processing import parse_gemini_response_for_reasoning_and_content, build_tool_call_id
+    from message_processing import (
+        parse_gemini_response_for_reasoning_and_content,
+        build_tool_call_id,
+        thought_signature_extra,
+        _signature_bytes,
+    )
+    from signature_store import SignatureState
     delta_payload = {}
     openai_finish_reason = None
 
@@ -463,44 +469,65 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
             elif raw_gemini_finish_reason_str == "SAFETY": openai_finish_reason = "content_filter"
             elif raw_gemini_finish_reason_str in ["TOOL_CODE", "FUNCTION_CALL"]: openai_finish_reason = "tool_calls"
 
-        # 遍历**全部** parts 收集并行函数调用，不再遇到第一个就 break
+        # Collect every parallel call and keep signatures on their exact tool-call
+        # deltas. Message-level signatures cover ordinary/signature-only Parts.
         tool_call_deltas = []
+        ordinary_signature = None
+        ordinary_signature_kind = None
         if hasattr(candidate, "content") and hasattr(candidate.content, "parts") and candidate.content.parts:
             for part in candidate.content.parts:
                 fc = getattr(part, "function_call", None)
+                sig = _signature_bytes(part, fc)
                 if fc is None:
+                    if sig:
+                        ordinary_signature = sig
+                        if getattr(part, "thought", None) is True:
+                            ordinary_signature_kind = "thought"
+                        elif getattr(part, "text", None) == "":
+                            ordinary_signature_kind = "signature_only"
+                        else:
+                            ordinary_signature_kind = "text"
                     continue
                 tc_index = indexer.next_index(candidate_index) if indexer else len(tool_call_deltas)
-                tool_call_deltas.append({
+                tc = {
                     "index": tc_index,
-                    "id": build_tool_call_id(fc, part),
+                    "id": build_tool_call_id(
+                        fc, part,
+                        missing_state=(SignatureState.UNSIGNED_FOLLOWER
+                                       if tc_index > 0 else SignatureState.UNKNOWN)),
                     "type": "function",
                     "function": {
                         "name": fc.name,
                         "arguments": json.dumps(fc.args) if fc.args is not None else "",
                     },
-                })
+                }
+                extra = thought_signature_extra(sig)
+                if extra:
+                    tc["extra_content"] = extra
+                tool_call_deltas.append(tc)
 
         if tool_call_deltas:
             delta_payload["tool_calls"] = tool_call_deltas
+
+        reasoning_text, normal_text = parse_gemini_response_for_reasoning_and_content(candidate)
+
+        # Only append safety ratings to the final chunk.
+        if (openai_finish_reason and _safety_score_enabled()
+                and hasattr(candidate, "safety_ratings") and candidate.safety_ratings):
+            normal_text += _create_safety_ratings_html(candidate.safety_ratings)
+
+        if reasoning_text:
+            delta_payload["reasoning_content"] = reasoning_text
+        if normal_text:
+            delta_payload["content"] = normal_text
+        elif tool_call_deltas:
             delta_payload["content"] = None
+        elif not reasoning_text and openai_finish_reason is None:
+            delta_payload["content"] = ""
 
-        if not tool_call_deltas:
-            reasoning_text, normal_text = parse_gemini_response_for_reasoning_and_content(candidate)
-
-            # 只在**最后一个** chunk 附安全分：上游每个 chunk 都带 safetyRatings，
-            # 逐块追加会把同一份评分重复插进正文里。同样一律进正文，不进思考字段。
-            # openai_finish_reason 只在**最后一块**才有值——上游每个 chunk 都带
-            # safetyRatings，逐块追加会把同一份评分重复插进正文里。
-            if (openai_finish_reason and _safety_score_enabled()
-                    and hasattr(candidate, "safety_ratings") and candidate.safety_ratings):
-                normal_text += _create_safety_ratings_html(candidate.safety_ratings)
-
-            if reasoning_text: delta_payload["reasoning_content"] = reasoning_text
-            if normal_text: 
-                delta_payload["content"] = normal_text
-            elif not reasoning_text and not delta_payload.get("tool_calls") and openai_finish_reason is None:
-                delta_payload["content"] = ""
+        if ordinary_signature:
+            delta_payload["extra_content"] = thought_signature_extra(
+                ordinary_signature, ordinary_signature_kind)
     
     if not delta_payload and openai_finish_reason is None:
         delta_payload["content"] = ""
