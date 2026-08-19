@@ -286,10 +286,12 @@ class ExpressSDKUpstream(BaseUpstream):
         if thinking_config:
             gen_config_dict["thinking_config"] = thinking_config
 
-        if is_grounded_search and not is_image_model:
+        _tools_disabled = isinstance(request_obj.tool_choice, str) and request_obj.tool_choice.lower() == "none"
+        if is_grounded_search and not _tools_disabled:
             search_tool = {"google_search": {}}
             if "tools" in gen_config_dict and isinstance(gen_config_dict["tools"], list):
-                gen_config_dict["tools"].append(search_tool)
+                if search_tool not in gen_config_dict["tools"]:
+                    gen_config_dict["tools"].append(search_tool)
             else:
                 gen_config_dict["tools"] = [search_tool]
             print(f"🔎 [搜索增强] 已为模型 {base_model_name} 启用 Google Search 工具。")

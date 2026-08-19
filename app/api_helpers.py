@@ -323,8 +323,17 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
             image_config_args["aspect_ratio"] = target_ar
 
         config["image_config"] = types.ImageConfig(**image_config_args)
-        # 生图模型不支持函数调用（官方明确）：丢弃 function_declarations，仅保留搜索
-        tools_list = [{"google_search": {}}]
+        # 生图模型不支持自定义函数调用；只有客户端明确声明搜索工具时才保留
+        # google_search。普通生图请求与 tool_choice=none 都不得偷偷启用搜索。
+        _search_names = {"google_search", "googlesearch", "web_search", "websearch", "search"}
+        _declared_search = any(
+            str(((tool.get("function") or {}).get("name") or "")).lower() in _search_names
+            for tool in (request.tools or []) if isinstance(tool, dict)
+        )
+        _tools_disabled = isinstance(request.tool_choice, str) and request.tool_choice.lower() == "none"
+        tools_list = ([{"google_search": {}}]
+                      if _declared_search and not _tools_disabled and profile.get("supports_search")
+                      else [])
 
         # 生图不支持的键（采样类由 sanitize 统一剥离，这里清理其余）
         for key in ["response_mime_type", "response_schema", "response_logprobs", "logprobs"]:
@@ -352,6 +361,7 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
         if isinstance(choice, str):
             if choice == "none": mode = "NONE"
             elif choice == "auto": mode = "AUTO"
+            elif choice == "required": mode = "ANY"
         elif isinstance(choice, dict) and choice.get("type") == "function":
             func_name = choice.get("function", {}).get("name")
             if func_name:
@@ -438,11 +448,36 @@ class ToolCallIndexer:
 
     def __init__(self):
         self._next: Dict[int, int] = {}
+        self._seen_tool_calls: set[int] = set()
+        self._ordinary_parts: Dict[int, list] = {}
+        self._part_order: Dict[int, list] = {}
 
     def next_index(self, candidate_index: int = 0) -> int:
         i = self._next.get(candidate_index, 0)
         self._next[candidate_index] = i + 1
+        self._seen_tool_calls.add(candidate_index)
         return i
+
+    def record_tool_call(self, candidate_index: int, tool_index: int) -> None:
+        self._part_order.setdefault(candidate_index, []).append(
+            {"type": "tool_call", "index": tool_index})
+
+    def record_ordinary_part(self, candidate_index: int, metadata: dict) -> int:
+        items = self._ordinary_parts.setdefault(candidate_index, [])
+        index = len(items)
+        items.append(metadata)
+        self._part_order.setdefault(candidate_index, []).append(
+            {"type": "ordinary", "index": index})
+        return index
+
+    def topology(self, candidate_index: int = 0) -> tuple[list, list]:
+        return (
+            list(self._ordinary_parts.get(candidate_index, [])),
+            list(self._part_order.get(candidate_index, [])),
+        )
+
+    def has_tool_calls(self, candidate_index: int = 0) -> bool:
+        return candidate_index in self._seen_tool_calls
 
 
 def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candidate_index: int = 0,
@@ -496,8 +531,13 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                         kind = "signature_only"
                     else:
                         kind = "text"
-                    part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
-                    ordinary_metadata.append(ordinary_part_metadata(kind, text_value, sig))
+                    metadata = ordinary_part_metadata(kind, text_value, sig)
+                    if indexer:
+                        ordinary_index = indexer.record_ordinary_part(candidate_index, metadata)
+                    else:
+                        ordinary_index = len(ordinary_metadata)
+                    part_order.append({"type": "ordinary", "index": ordinary_index})
+                    ordinary_metadata.append(metadata)
                     if sig:
                         ordinary_signature = sig
                         ordinary_signature_kind = kind
@@ -518,8 +558,17 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                 extra = thought_signature_extra(sig)
                 if extra:
                     tc["extra_content"] = extra
-                part_order.append({"type": "tool_call", "index": len(tool_call_deltas)})
+                part_order.append({"type": "tool_call", "index": tc_index})
+                if indexer:
+                    indexer.record_tool_call(candidate_index, tc_index)
                 tool_call_deltas.append(tc)
+
+        # Google often emits the functionCall in one chunk and a final STOP in a
+        # later empty chunk. Once this candidate has produced any tool call, the
+        # OpenAI finish reason for that turn must remain tool_calls.
+        if (openai_finish_reason == "stop" and indexer
+                and indexer.has_tool_calls(candidate_index)):
+            openai_finish_reason = "tool_calls"
 
         if tool_call_deltas:
             delta_payload["tool_calls"] = tool_call_deltas
@@ -541,13 +590,31 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
             delta_payload["content"] = ""
 
         google_extra = {}
-        if ordinary_signature:
+        if indexer:
+            metadata_to_emit, order_to_emit = indexer.topology(candidate_index)
+        else:
+            metadata_to_emit, order_to_emit = ordinary_metadata, part_order
+
+        # Emit cumulative topology on every later chunk (including the final STOP)
+        # so standard OpenAI SSE aggregation—which replaces extension objects—keeps
+        # the complete cross-chunk Part order and every ordinary signature.
+        cumulative_signature = None
+        cumulative_signature_kind = None
+        for item in reversed(metadata_to_emit):
+            if item.get("thought_signature"):
+                cumulative_signature = item["thought_signature"]
+                cumulative_signature_kind = item.get("kind")
+                break
+        if cumulative_signature:
+            google_extra["thought_signature"] = cumulative_signature
+            google_extra["thought_signature_part"] = cumulative_signature_kind
+        elif ordinary_signature:
             google_extra.update((thought_signature_extra(
                 ordinary_signature, ordinary_signature_kind) or {}).get("google", {}))
-        if ordinary_metadata:
-            google_extra["ordinary_parts"] = ordinary_metadata
-        if tool_call_deltas and part_order:
-            google_extra["part_order"] = part_order
+        if metadata_to_emit:
+            google_extra["ordinary_parts"] = metadata_to_emit
+        if order_to_emit:
+            google_extra["part_order"] = order_to_emit
         if google_extra:
             delta_payload["extra_content"] = {"google": google_extra}
     

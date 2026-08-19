@@ -188,6 +188,23 @@ def test_function_responses_are_unsigned_user_parts_grouped_without_fresh_user_m
     assert contents[1].parts[0].text == "new turn"
 
 
+def test_tool_result_without_name_recovers_function_name_from_call_id():
+    messages = [
+        OpenAIMessage(role="assistant", tool_calls=[{
+            "id": "call-standard", "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+            "extra_content": {"google": {
+                "thought_signature": base64.b64encode(b"lookup-sig").decode()}},
+        }]),
+        OpenAIMessage(role="tool", tool_call_id="call-standard", content='{"ok":true}'),
+    ]
+    contents = create_gemini_prompt(messages, "gemini-3.5-flash")
+    response_part = contents[1].parts[0]
+    assert response_part.function_response is not None
+    assert response_part.function_response.name == "lookup"
+    assert response_part.thought_signature is None
+
+
 def test_multiple_ordinary_parts_replay_without_aggregate_duplication():
     parts = [
         types.Part(text="A", thought_signature=b"sig-a"),
@@ -268,3 +285,63 @@ def test_express_fake_stream_round_trip_preserves_mixed_content_calls_and_signat
     assert replay[1].thought_signature == b"tool-sig"
     assert replay[2].text == "reason" and replay[2].thought is True
     assert replay[2].thought_signature == b"message-sig"
+
+
+def test_true_stream_cross_chunk_topology_is_cumulative_on_final_delta():
+    indexer = ToolCallIndexer()
+    thought_chunk = convert_chunk_to_openai(
+        _response([types.Part(text="plan", thought=True, thought_signature=b"thought-sig")]),
+        "gemini-3.5-flash", "resp", indexer=indexer,
+    )
+    call_chunk = convert_chunk_to_openai(
+        _response([_fc("act", "cross-call", b"call-sig", value=1)]),
+        "gemini-3.5-flash", "resp", indexer=indexer,
+    )
+    final_candidate = _candidate([])
+    final_candidate.finish_reason = "STOP"
+    final_chunk = convert_chunk_to_openai(
+        SimpleNamespace(candidates=[final_candidate]),
+        "gemini-3.5-flash", "resp", indexer=indexer,
+    )
+
+    deltas = [
+        json.loads(item.removeprefix("data: ").strip())["choices"][0]["delta"]
+        for item in (thought_chunk, call_chunk, final_chunk)
+    ]
+    # Standard SSE aggregation replaces unknown extension objects; the last delta
+    # must therefore contain the complete metadata, not only the final chunk.
+    final_google = deltas[-1]["extra_content"]["google"]
+    assert [item["type"] for item in final_google["part_order"]] == ["ordinary", "tool_call"]
+    assert base64.b64decode(final_google["ordinary_parts"][0]["thought_signature"]) == b"thought-sig"
+
+    call = deltas[1]["tool_calls"][0]
+    message = OpenAIMessage(
+        role="assistant",
+        content=None,
+        reasoning_content="plan",
+        tool_calls=[call],
+        extra_content=deltas[-1]["extra_content"],
+    )
+    replay = create_gemini_prompt([message], "gemini-3.5-flash")[0].parts
+    assert replay[0].thought is True and replay[0].thought_signature == b"thought-sig"
+    assert replay[1].function_call.name == "act"
+    assert replay[1].thought_signature == b"call-sig"
+
+
+def test_true_stream_final_stop_becomes_tool_calls_after_prior_function_call():
+    indexer = ToolCallIndexer()
+    first = convert_chunk_to_openai(
+        _response([_fc("act", "stream-call", b"stream-tool-sig", value=1)]),
+        "gemini-3.5-flash", "resp", indexer=indexer,
+    )
+    first_choice = json.loads(first.removeprefix("data: ").strip())["choices"][0]
+    assert first_choice["delta"]["tool_calls"]
+
+    final_candidate = _candidate([])
+    final_candidate.finish_reason = "STOP"
+    final = convert_chunk_to_openai(
+        SimpleNamespace(candidates=[final_candidate]),
+        "gemini-3.5-flash", "resp", indexer=indexer,
+    )
+    final_choice = json.loads(final.removeprefix("data: ").strip())["choices"][0]
+    assert final_choice["finish_reason"] == "tool_calls"

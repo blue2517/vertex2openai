@@ -158,9 +158,7 @@ def mask_cookie(cookie_str: str) -> str:
         name = seg.strip().split("=", 1)[0].strip()
         if name:
             names.append(name)
-    head = cookie_str.strip()[:6]
-    tail = cookie_str.strip()[-4:]
-    return f"{head}…{tail}（共 {len(names)} 个 cookie 字段，{len(cookie_str)} 字符）"
+    return f"已配置（共 {len(names)} 个 cookie 字段，{len(cookie_str)} 字符）"
 
 
 async def require_auth(request: Request):

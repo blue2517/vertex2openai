@@ -39,6 +39,7 @@ from message_processing import (
     signature_from_extra,
     thought_signature_extra,
     ordinary_part_metadata,
+    _requires_signature,
 )
 from logger import stats
 from api_helpers import get_retry_settings
@@ -512,7 +513,7 @@ def _attach_message_signature(parts: list[dict], message: Any) -> None:
     target["thoughtSignature"] = encoded
 
 
-def _convert_messages_to_contents(messages: list, native_tools: bool = True) -> tuple:
+def _convert_messages_to_contents(messages: list, model_name: str = "", native_tools: bool = True) -> tuple:
     """OpenAI messages → batchGraphql contents.
 
     Native mode emits camelCase ``functionCall`` / ``functionResponse`` Parts.
@@ -521,6 +522,7 @@ def _convert_messages_to_contents(messages: list, native_tools: bool = True) -> 
     """
     contents = []
     system_parts = []
+    require_sig = _requires_signature(model_name)
     call_names = {}
     for message in messages or []:
         for tc in (getattr(message, "tool_calls", None) or []):
@@ -574,7 +576,7 @@ def _convert_messages_to_contents(messages: list, native_tools: bool = True) -> 
                 explicit_sig, _ = signature_from_extra(tc)
                 _, signature = resolve_tool_call_signature(
                     str((tc or {}).get("id") or ""),
-                    require_signature=tool_index == 0,
+                    require_signature=require_sig and tool_index == 0,
                     explicit_signature=explicit_sig,
                     explicit_unsigned=tool_index > 0,
                 )
@@ -665,7 +667,8 @@ def _build_batch_graphql_body(
     force_search: bool = False,
     native_tools: bool = True,
 ) -> dict:
-    contents, system_text = _convert_messages_to_contents(request.messages, native_tools=native_tools)
+    contents, system_text = _convert_messages_to_contents(
+        request.messages, model_name=model_name, native_tools=native_tools)
     model_path = f"projects/{project_id}/locations/global/publishers/google/models/{model_name}"
 
     settings = app_state.get_effective_settings(model_name)
@@ -737,10 +740,10 @@ def _build_batch_graphql_body(
     if request.stop and "stop_sequences" in allowed:
         gen_config["stopSequences"] = request.stop if isinstance(request.stop, list) else [request.stop]
 
-    # Tools share one repeated wire field: custom function declarations and
-    # googleSearch may coexist as separate entries. Image models suppress custom
-    # declarations entirely; built-in search survives only when the profile says
-    # that image model supports it.
+    # Live batchGraphql verification shows that custom functionDeclarations and
+    # googleSearch are each supported, but mixing them in one request is rejected:
+    # "Multiple tools are supported only when they are all search tools." Choose a
+    # single upstream mode deterministically instead of sending a doomed payload.
     declarations, declared_search = _build_function_declarations(request.tools) if native_tools else ([], False)
     if profile["is_image"]:
         declarations = []
@@ -748,26 +751,30 @@ def _build_batch_graphql_body(
     choice_name = _normalized_tool_name(request.tool_choice) if isinstance(request.tool_choice, dict) else ""
     forced_search = bool(choice_name and _is_builtin_search_name(choice_name))
     tools_disabled = isinstance(request.tool_choice, str) and request.tool_choice.lower() == "none"
-    function_names = [item["name"] for item in declarations]
-    wire_tools = []
-    if not tools_disabled and declarations:
-        wire_tools.append({"functionDeclarations": declarations})
-
     _wants_search = (force_search or declared_search or forced_search
                      or (hasattr(request, 'model') and request.model.endswith("-search")))
-    if not tools_disabled and _wants_search and profile["supports_search"]:
-        wire_tools.append({"googleSearch": {}})
-    if wire_tools:
-        variables["tools"] = wire_tools
 
-    if request.tool_choice is not None or declarations or declared_search or force_search:
-        config_choice = request.tool_choice
-        if profile["is_image"] and choice_name and not forced_search:
-            # The requested custom function was deliberately suppressed for this
-            # image model, so do not leave an allowedFunctionNames reference to a
-            # declaration that is absent from tools.
-            config_choice = None
-        variables["toolConfig"] = _build_tool_config(config_choice, function_names)
+    selected_declarations = []
+    use_google_search = False
+    if not tools_disabled:
+        if forced_search:
+            # Built-in search has no functionDeclaration name, so it cannot be
+            # referenced by allowedFunctionNames. Send googleSearch alone.
+            use_google_search = bool(profile["supports_search"])
+        elif declarations:
+            # Custom functions take precedence for mixed AUTO/required traffic.
+            selected_declarations = declarations
+        elif _wants_search and profile["supports_search"]:
+            use_google_search = True
+
+    if selected_declarations:
+        variables["tools"] = [{"functionDeclarations": selected_declarations}]
+        function_names = [item["name"] for item in selected_declarations]
+        variables["toolConfig"] = _build_tool_config(request.tool_choice, function_names)
+    elif use_google_search:
+        variables["tools"] = [{"googleSearch": {}}]
+    # With no upstream tools, omitting toolConfig is equivalent to NONE and avoids
+    # applying custom functionCallingConfig to the built-in search protocol.
 
     return {
         "requestContext": _build_request_context(project_id),
@@ -1307,10 +1314,17 @@ class CookieProxyUpstream(BaseUpstream):
         # ===== 2.5 工具流量处理：原生函数调用 =====
         _tool_info = classify_tool_traffic(request_obj.messages, request_obj.tools)
         force_builtin_search = bool(_tool_info["builtin_search"])
+        _choice_name = _normalized_tool_name(request_obj.tool_choice) if isinstance(request_obj.tool_choice, dict) else ""
+        _forced_search = bool(_choice_name and _is_builtin_search_name(_choice_name))
         native_custom_tools = bool(_tool_info["custom_names"] or _tool_info["history"])
-        if force_builtin_search:
+        if force_builtin_search and _tool_info["custom_names"]:
+            if _forced_search:
+                print("🔎 [Studio] batchGraphql 不支持内建搜索与自定义函数混用；本轮按强制选择仅启用 googleSearch。")
+            else:
+                print("⚠️ [Studio] batchGraphql 不支持内建搜索与自定义函数混用；本轮优先启用自定义函数，忽略搜索声明。")
+        elif force_builtin_search:
             print("🔎 [Studio] 请求声明了搜索类工具，已映射为 Studio 内建 googleSearch。")
-        if _tool_info["custom_names"]:
+        if _tool_info["custom_names"] and not _forced_search:
             print(f"🛠️ [Studio] 原生函数调用：{'、'.join(_tool_info['custom_names'][:5])}"
                   f"{' 等' if len(_tool_info['custom_names']) > 5 else ''}。")
 

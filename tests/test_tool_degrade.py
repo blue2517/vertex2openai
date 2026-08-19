@@ -61,7 +61,7 @@ def test_tool_history_uses_native_parts_by_default():
                                                 "arguments": '{"city":"北京"}'}}]),
         OpenAIMessage(role="tool", name="get_weather", tool_call_id="1", content="晴 30C"),
     ]
-    contents, _ = cp._convert_messages_to_contents(msgs)
+    contents, _ = cp._convert_messages_to_contents(msgs, model_name="gemini-3.7-flash")
     assert contents[1]["parts"][0]["functionCall"] == {
         "name": "get_weather", "args": {"city": "北京"}}
     assert contents[1]["parts"][0]["thoughtSignature"]

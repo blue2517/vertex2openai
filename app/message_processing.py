@@ -642,6 +642,15 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
     print("🔄 [消息转换] 正在将 OpenAI 格式消息转换为 Gemini contents。")
     require_sig = _requires_signature(model_name)
     raw_gemini_messages = []
+    tool_name_by_id = {}
+    for prior in messages:
+        for tool_call in (getattr(prior, "tool_calls", None) or []):
+            call_id = str(tool_call.get("id") or "")
+            call_name = str((tool_call.get("function") or {}).get("name") or "")
+            if call_id and call_name:
+                tool_name_by_id[call_id] = call_name
+                tool_name_by_id[call_id.partition(LEGACY_THOUGHT_SEP)[0]] = call_name
+
     for idx, message in enumerate(messages):
         role = message.role
         if role == "system":
@@ -652,9 +661,11 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
 
         if role == "tool":
             tool_call_id_str = message.tool_call_id or ""
+            real_tool_id = tool_call_id_str.partition(LEGACY_THOUGHT_SEP)[0]
+            function_name = message.name or tool_name_by_id.get(tool_call_id_str) or tool_name_by_id.get(real_tool_id)
 
-            if not message.name:
-                # 没有函数名无法构造规范的 function_response，降级为文本观测
+            if not function_name:
+                # 既没有显式 name，也无法从前面的 assistant.tool_calls 关联时才降级。
                 mock_text = f"[System Observation - Tool Result]:\n{message.content}"
                 parts.append(types.Part.from_text(text=mock_text))
                 current_gemini_role = "user"
@@ -662,9 +673,8 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                 # FunctionResponse is always a Gemini ``user`` Content and never
                 # carries a thought signature. Signatures belong on model Parts.
                 tool_output_data = _coerce_tool_response(message.content)
-                real_tool_id = tool_call_id_str.partition(LEGACY_THOUGHT_SEP)[0]
 
-                func_resp_kwargs = {"name": message.name, "response": tool_output_data}
+                func_resp_kwargs = {"name": function_name, "response": tool_output_data}
                 if real_tool_id:
                     func_resp_kwargs["id"] = real_tool_id
 
@@ -673,7 +683,7 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                         function_response=types.FunctionResponse(**func_resp_kwargs))
                 except Exception as e:
                     print(f"⚠️ [工具调用] 构造 FunctionResponse 失败，将回退为基础形式：{e}")
-                    resp_part = types.Part.from_function_response(name=message.name, response=tool_output_data)
+                    resp_part = types.Part.from_function_response(name=function_name, response=tool_output_data)
 
                 parts.append(resp_part)
                 current_gemini_role = "user"

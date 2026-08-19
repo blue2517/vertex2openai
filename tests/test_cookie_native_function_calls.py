@@ -86,7 +86,7 @@ def test_private_ui_schema_recurses_through_objects_and_arrays():
     [
         (None, {"mode": "AUTO"}),
         ("auto", {"mode": "AUTO"}),
-        ("none", {"mode": "NONE"}),
+        ("none", None),
         ("required", {"mode": "ANY", "allowedFunctionNames": ["one", "two"]}),
         ({"type": "function", "function": {"name": "two"}},
          {"mode": "ANY", "allowedFunctionNames": ["two"]}),
@@ -94,17 +94,24 @@ def test_private_ui_schema_recurses_through_objects_and_arrays():
 )
 def test_tool_choice_wire_modes(choice, expected):
     req = _request(tools=[_function_tool("one"), _function_tool("two")], tool_choice=choice)
-    config = cp._build_batch_graphql_body(
-        "example-project", "gemini-3.7-flash", req)["variables"]["toolConfig"]
-    assert config == {"functionCallingConfig": expected}
+    variables = cp._build_batch_graphql_body(
+        "example-project", "gemini-3.7-flash", req)["variables"]
+    if expected is None:
+        assert "toolConfig" not in variables
+        assert "tools" not in variables
+    else:
+        assert variables["toolConfig"] == {"functionCallingConfig": expected}
 
 
-def test_custom_functions_and_google_search_coexist():
+def test_mixed_custom_and_search_prefers_custom_functions():
+    """实机确认 batchGraphql 会拒绝 custom + googleSearch 混用。"""
     req = _request(tools=[_function_tool("lookup_weather"), _function_tool("google_search")])
     variables = cp._build_batch_graphql_body(
         "example-project", "gemini-3.7-flash", req)["variables"]
+    assert variables["tools"] == [{"functionDeclarations": [
+        variables["tools"][0]["functionDeclarations"][0]
+    ]}]
     assert variables["tools"][0]["functionDeclarations"][0]["name"] == "lookup_weather"
-    assert variables["tools"][1] == {"googleSearch": {}}
 
 
 def test_history_and_parallel_results_round_trip_with_signature_topology():
@@ -141,14 +148,18 @@ def test_missing_first_history_signature_uses_store_then_sentinel():
     signature_store.put("cached-id", b"cached")
     cached = OpenAIMessage(role="assistant", tool_calls=[{
         "id": "cached-id", "type": "function", "function": {"name": "one", "arguments": "{}"}}])
-    part = cp._convert_messages_to_contents([cached])[0][0]["parts"][0]
+    part = cp._convert_messages_to_contents([cached], model_name="gemini-3.7-flash")[0][0]["parts"][0]
     assert base64.b64decode(part["thoughtSignature"]) == b"cached"
 
     signature_store.clear()
     lost = cached.model_copy(update={"tool_calls": [{
         "id": "lost-id", "type": "function", "function": {"name": "one", "arguments": "{}"}}]})
-    part = cp._convert_messages_to_contents([lost])[0][0]["parts"][0]
+    part = cp._convert_messages_to_contents([lost], model_name="gemini-3.7-flash")[0][0]["parts"][0]
     assert base64.b64decode(part["thoughtSignature"]) == SKIP_VALIDATOR_SENTINEL
+
+    # Gemini 2.5 does not require the Gemini 3 validator sentinel.
+    part_25 = cp._convert_messages_to_contents([lost], model_name="gemini-2.5-flash")[0][0]["parts"][0]
+    assert "thoughtSignature" not in part_25
 
 
 def test_single_call_and_proto_default_filtering():
@@ -285,57 +296,58 @@ def test_cookie_function_responses_group_only_when_adjacent():
 
 
 @pytest.mark.parametrize(
-    "choice, expected_mode, expect_tools",
+    "choice, expect_tools",
     [
-        (None, {"mode": "AUTO"}, True),
-        ("auto", {"mode": "AUTO"}, True),
-        ("none", {"mode": "NONE"}, False),
-        ("required", {"mode": "ANY"}, True),
-        ({"type": "function", "function": {"name": "google_search"}}, {"mode": "ANY"}, True),
+        (None, True),
+        ("auto", True),
+        ("none", False),
+        ("required", True),
+        ({"type": "function", "function": {"name": "google_search"}}, True),
     ],
 )
-def test_search_only_tool_choice_modes(choice, expected_mode, expect_tools):
+def test_search_only_tool_choice_modes(choice, expect_tools):
     variables = cp._build_batch_graphql_body(
         "example-project", "gemini-3.7-flash",
         _request(tools=[_function_tool("google_search")], tool_choice=choice),
     )["variables"]
-    assert variables["toolConfig"] == {"functionCallingConfig": expected_mode}
     assert (variables.get("tools") == [{"googleSearch": {}}]) is expect_tools
+    assert "toolConfig" not in variables
 
 
 @pytest.mark.parametrize(
-    "choice, expected_config, expected_tool_count",
+    "choice, expected_config, expect_tools",
     [
-        ("auto", {"mode": "AUTO"}, 2),
-        ("none", {"mode": "NONE"}, 0),
-        ("required", {"mode": "ANY", "allowedFunctionNames": ["lookup"]}, 2),
+        ("auto", {"mode": "AUTO"}, True),
+        ("none", None, False),
+        ("required", {"mode": "ANY", "allowedFunctionNames": ["lookup"]}, True),
         ({"type": "function", "function": {"name": "lookup"}},
-         {"mode": "ANY", "allowedFunctionNames": ["lookup"]}, 2),
+         {"mode": "ANY", "allowedFunctionNames": ["lookup"]}, True),
     ],
 )
-def test_mixed_custom_and_search_tool_choice_modes(choice, expected_config, expected_tool_count):
+def test_mixed_custom_and_search_tool_choice_modes(choice, expected_config, expect_tools):
     variables = cp._build_batch_graphql_body(
         "example-project", "gemini-3.7-flash",
         _request(tools=[_function_tool("lookup"), _function_tool("google_search")],
                  tool_choice=choice),
     )["variables"]
-    assert variables["toolConfig"] == {"functionCallingConfig": expected_config}
-    assert len(variables.get("tools", [])) == expected_tool_count
+    assert ("tools" in variables) is expect_tools
+    if expected_config is None:
+        assert "toolConfig" not in variables
+    else:
+        assert variables["toolConfig"] == {"functionCallingConfig": expected_config}
+        assert len(variables["tools"]) == 1
+        assert "functionDeclarations" in variables["tools"][0]
 
 
-def test_mixed_forced_search_never_names_search_as_declared_function():
+def test_mixed_forced_search_sends_only_google_search():
     req = _request(
         tools=[_function_tool("lookup"), _function_tool("google_search")],
         tool_choice={"type": "function", "function": {"name": "google_search"}},
     )
     variables = cp._build_batch_graphql_body(
         "example-project", "gemini-3.7-flash", req)["variables"]
-    assert variables["toolConfig"] == {"functionCallingConfig": {"mode": "ANY"}}
-    assert variables["tools"] == [
-        {"functionDeclarations": [variables["tools"][0]["functionDeclarations"][0]]},
-        {"googleSearch": {}},
-    ]
-    assert variables["tools"][0]["functionDeclarations"][0]["name"] == "lookup"
+    assert variables["tools"] == [{"googleSearch": {}}]
+    assert "toolConfig" not in variables
 
 
 def test_image_model_suppresses_client_custom_tools_but_keeps_search():

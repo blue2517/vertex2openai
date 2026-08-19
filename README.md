@@ -29,7 +29,7 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
   - 标准模式 / Cookie 直连模式在线一键切换。
   - 在线热更新并保存 Google Cookie 与 Project ID；智能解析 `Cookie-Editor` 导出的 JSON / Header String；自动从整条控制台 URL 提取 Project ID。
   - **模型参数面板**：按所选模型显示其支持能力，并在线调整思考强度、生图分辨率与比例、采样默认值、输入图压缩、重试、假流式/轮询/安全分显示、预填充兼容模式（详见下文）。
-  - **实时监控**：运行日志推流、健康度图表（成功/错误/拥堵重试）、Token 消耗统计（两条通道均计入）。
+  - **实时监控**：运行日志推流、健康度图表（成功/错误/拥堵重试）、Express 通道 Token 消耗统计（Cookie 私有接口通常不返回可靠用量）。
 - **Gemini 能力与适配**
   - 文本对话、流式（SSE）与非流式。
   - OpenAI tools / function calling ↔ Gemini function calling 适配（含 Gemini 3.x 多轮所需的 thought signature 编解码）；Express 与 Cookie 直连通道均支持自定义函数声明、调用与结果回传。
@@ -106,12 +106,12 @@ http://localhost:8050
 | **`stop` 字段** | 只接受数组，传字符串 422 | 字符串/数组都接受 |
 | **`logprobs` 字段** | 按 Gemini 语义当整数 | 兼容 OpenAI 的 `logprobs: bool` + `top_logprobs: int` |
 | **Express 流式 usage** | 从不下发，客户端显示 0 | 支持 `stream_options.include_usage` |
-| **控制台 Cookie 回显** | 明文返回完整 Cookie | 仅返回掩码；输入框留空＝保持原 Cookie 不变 |
+| **控制台 Cookie 回显** | 明文返回完整 Cookie | 仅返回“已配置/字段数/总长度”，不返回任何值的前后缀；输入框留空＝保持原 Cookie 不变 |
 | **登录** | 无限速、会话 token 为确定值 | 失败 3 次后指数退避；随机会话 token，可单独失效 |
 | **状态文件** | 每次读设置都同步读盘、非原子写 | 内存优先 + 原子写 + 权限 0600 + 支持 `STATE_DIR` |
 | **文本保真** | 所有消息的多空格/缩进被压平 | 仅在确实抽走内联图片时才压平 |
 | **2.5 Flash-Lite 思考预算** | 下限按 0 处理 | 下限 512（`0` 仍表示关闭） |
-| **生图比例 `9:21`** | 在白名单里（无官方出处） | 已移除，落到"由模型决定" |
+| **生图比例白名单** | 所有生图模型共用同一套比例 | 按模型分别校验；Flash Image 支持含 `9:21` 在内的扩展比例，Pro Image 使用较小白名单 |
 
 思考签名优先使用请求/响应中的 `extra_content.google` 携带，因此跨进程、多副本部署不依赖本地缓存；旧格式、进程内缓存与跳过校验哨兵仅用于兼容缺失显式签名的客户端。
 
@@ -170,7 +170,7 @@ http://localhost:8050
 | 裸模型名（旧行为）→ express 端点 `https://aiplatform.googleapis.com/v1/publishers/google/models/{model}:generateContent` | **404** `projects/…/locations/asia-southeast1/…was not found` | 区域由后端路由，落到没有该模型的区域 |
 | `projects/{project}/locations/global/publishers/google/models/{model}` | **200 正常出文** | 区域由我们钉定 ✅ |
 
-**默认已经是 `global`**（多数 Gemini 模型只在 global 提供）。控制台「模型参数 → 通道行为 → 标准模式 location」下拉里除 `global` 外还列出了 Agent Platform 提供 Gemini 的各区域（美国 / 欧洲 / 亚太 / 其它，共 30 项）可按需切换；选「默认（后端自选）」＝回到旧行为。
+**默认已经是 `global`**（多数 Gemini 模型只在 global 提供）。控制台「模型参数 → ② 全局设置 → 标准模式 location」下拉里除 `global` 外还列出了 Agent Platform 提供 Gemini 的各区域（美国 / 欧洲 / 亚太 / 其它，共 30 项）可按需切换；选「默认（后端自选）」＝回到旧行为。
 
 **项目 ID 不需要单独配**：自动用「通道与凭证」页填的那个（或环境变量 `GOOGLE_PROJECT_ID`）——一个人通常只有一个 Express 项目。两者都没有时自动退回裸模型名（不会拼出半截路径）。
 
@@ -210,12 +210,12 @@ http://localhost:8050
 
 ## Cookie(Studio) 通道的原生函数调用
 
-Cookie 直连通道会把 OpenAI `tools` 转成 batchGraphql 的原生 `functionDeclarations`，并把 `tool_choice` 的 `none` / `auto` / `required` / 指定函数分别映射为 `NONE` / `AUTO` / `ANY` 模式。嵌套对象与数组参数会递归转换成 Studio 私有 UI Schema。
+Cookie 直连通道会把 OpenAI `tools` 转成 batchGraphql 的原生 `functionDeclarations`。`tool_choice=none` 会直接省略全部上游工具；`auto` / `required` / 指定自定义函数分别使用 Studio 的 `AUTO` / `ANY` 模式。嵌套对象与数组参数会递归转换成 Studio 私有 UI Schema。内建 `googleSearch` 没有可放进 `allowedFunctionNames` 的声明名，因此搜索请求不附加自定义函数的 `toolConfig`。
 
 | 情况 | 行为 |
 |---|---|
 | 自定义函数声明 | 原生下发；流式与非流式响应都返回 OpenAI `tool_calls` |
-| 声明里含搜索类工具（`google_search` / `web_search` 等） | 映射为 Studio 内建 `googleSearch`；可与自定义函数声明共存 |
+| 声明里含搜索类工具（`google_search` / `web_search` 等） | 映射为 Studio 内建 `googleSearch`。实机确认 batchGraphql 不允许它与自定义函数混用：混合 AUTO/required 请求优先自定义函数并忽略搜索；显式强制搜索时只发送 `googleSearch` |
 | 历史里的 assistant `tool_calls` | 回放为 role=`model` 的 `functionCall` Parts，并从 `extra_content` 或短期缓存恢复 thought signature |
 | 连续的 role=`tool` 结果 | 按 `tool_call_id` 关联函数名，合并为 role=`user` 的 `functionResponse` Parts；并行顺序为 FC1, FC2, FR1, FR2 |
 | 模型或协议明确拒绝原生函数 Schema | 仅本次固定降级为文本工具观测并重试一次；没有用户可见策略开关，也不会恢复旧版严格拒绝路径 |

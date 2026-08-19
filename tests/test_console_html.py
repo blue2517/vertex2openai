@@ -116,6 +116,15 @@ def test_location_select_has_global_and_regions():
     assert len(regions) >= 20, f"区域太少：{len(regions)}"
 
 
+def test_cookie_mask_never_exposes_value_prefix_or_suffix():
+    raw = "SAPISID=prefix-secret-value; SID=another-secret-tail"
+    masked = main.mask_cookie(raw)
+    assert "prefix" not in masked
+    assert "tail" not in masked
+    assert "secret" not in masked
+    assert masked.startswith("已配置（共 2 个 cookie 字段")
+
+
 def test_location_select_is_inside_global_settings_section():
     """location 是全局基础设施设置，不能混在按模型参数区域里。"""
     global_heading = re.search(r'<span class="pill"[^>]*>② 全局设置</span>', MARKUP)
