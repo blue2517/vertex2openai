@@ -107,3 +107,15 @@ def test_location_select_has_global_and_regions():
     assert '<option value=""' in block          # 保留“后端自选”旧行为
     regions = re.findall(r'<option value="([a-z]+-[a-z]+\d+)"', block)
     assert len(regions) >= 20, f"区域太少：{len(regions)}"
+
+
+def test_location_select_is_inside_global_settings_section():
+    """location 是全局基础设施设置，不能混在按模型参数区域里。"""
+    global_heading = re.search(r'<span class="pill"[^>]*>② 全局设置</span>', MARKUP)
+    location = re.search(r'<select id="express_location"', MARKUP)
+    global_save = re.search(r'<button[^>]*onclick="saveSettings\(\)"', MARKUP)
+    assert global_heading and location and global_save
+    assert global_heading.start() < location.start() < global_save.start()
+
+    import config as app_config
+    assert "express_location" not in app_config.PER_MODEL_KEYS

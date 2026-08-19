@@ -476,7 +476,47 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             </div>
           </div>
 
-          <div class="pt-4 border-t border-neutral-100">
+        </div>
+      </div>
+
+      <!-- 控制台注入（可按模型覆盖） -->
+      <div class="card p-5">
+        <div class="text-sm font-semibold mb-3">注入与续写 <span class="text-xs font-normal text-neutral-400">（留空＝不启用 / 用内置默认；均支持按模型专属）</span></div>
+        <div class="space-y-3">
+
+          <div>
+            <div class="lbl mb-1">附加 system 指令<span class="helpq" onclick="hlp(this,'h_injs')">?</span></div>
+            <textarea id="inject_system_instruction" rows="2" class="inp log" placeholder="留空 = 不注入"></textarea>
+            <div id="h_injs" class="helpbox">追加到客户端 system 之<b>后</b>，两条通道都生效。<br>给 <b>RikkaHub 这类轻量前端</b>用：它们没有酒馆的预设系统，每开一个新对话都要重设系统提示。填在这里就是<b>所有前端、所有对话通用</b>。<br><b>酒馆用户请留空</b>——预设已经管了 system，这里再加会和预设打架，而且 <code>{{getvar::xx}}</code> 这类宏在代理侧<b>不会被解析</b>。</div>
+          </div>
+          <div>
+            <div class="lbl mb-1">注入预填充<span class="helpq" onclick="hlp(this,'h_injp')">?</span></div>
+            <textarea id="inject_prefill" rows="2" class="inp log" placeholder="留空 = 不注入"></textarea>
+            <div id="h_injp" class="helpbox">
+              客户端<b>没有发送</b>预填充时，代理自动补一条 assistant 消息，然后按上面的“预填充兼容模式”处理。<br>
+              轻量前端<b>从不发送预填充</b>，等于完全用不上破限最强的那个杠杆，连“预填充时压制原生思考”也永远不会触发（3.6-flash 上更容易出现“只有思考没正文”）。填在这里就能补上。<br>
+              内容通常很短：一句开场白 + 思考块的开标签即可，别塞大段规则（规则请放上面的 system 框）。<br>
+              <b>四条护栏，避免和现有功能冲突</b>：① 客户端已自带预填充（酒馆）→ 跳过，不覆盖；② 请求带函数调用 → 跳过；③ 生图模型 → 默认跳过（可用上面的“生图也注入预填充”放行）；④ 留空 → 完全不启用。<br>
+              <b>只填内容还不够</b>：填完必须点保存——点“保存全局设置”＝对所有模型生效；点上方“保存为该模型专属”＝只对当前所选模型生效。（生图模型还需额外打开上面的“生图也注入预填充”开关，那个开关只是放行，内容仍取自这里。）<br>强烈建议按模型分开配：生图要的是画风描述，角色扮演要的是思考块开标签，两者内容完全不同；问答用的模型则应留空（否则每条回复开头都会多出这段文字，原生思考也会被压制、影响答题深度）。
+            </div>
+          </div>
+          <div>
+            <div class="lbl mb-1">续写指令模板<span class="helpq" onclick="hlp(this,'h_pfi')">?</span></div>
+            <textarea id="prefill_instruction" rows="2" class="inp log" placeholder="留空 = 使用内置默认"></textarea>
+            <div id="h_pfi" class="helpbox">留空即用内置默认，一般不用改。<br><b>「智能」模式</b>下它是那句续写指令，预填充文本会附在它后面；<b>「保留模型轮次」模式</b>下它就是末尾那句推动语。<br>若「保留模型轮次」老是重复开标签，可以把这里改得更短更像催促（例如只填 <code>继续</code>），减少“新一轮”的暗示。<br><b>与生图的关系</b>：留空时，生图模型会自动换用一句“直接输出图片”的指令；<b>一旦你在这里填了内容，生图模型也会用你填的这句</b>——若那句写的是“接着往下写”，生图会吐字符画而不是图片。所以给生图模型请用<b>“保存为该模型专属”</b>单独配一句（例如“直接输出图片，不要任何文字”），别让文本模型的模板串过去。</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="flex items-center gap-2 mb-2 mt-6">
+      <span class="pill" style="text-transform:none;background:#f1f1f5;color:#52525b">② 全局设置</span>
+      <span class="text-xs text-neutral-500">对所有模型统一生效，<b>不支持</b>按模型专属；改动后点页面底部「保存全局设置」，它只保存本区、不影响 ① 区。</span>
+    </div>
+
+    <div class="grid md:grid-cols-2 gap-4">
+      <div class="card p-5">
             <div class="flex items-center justify-between gap-3">
               <span class="text-sm">标准模式 location<span class="helpq" onclick="hlp(this,'h_loc')">?</span></span>
               <select id="express_location" class="inp" style="max-width:180px">
@@ -532,46 +572,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             </div>
           </div>
 
-        </div>
-      </div>
-
-      <!-- 控制台注入（可按模型覆盖） -->
-      <div class="card p-5">
-        <div class="text-sm font-semibold mb-3">注入与续写 <span class="text-xs font-normal text-neutral-400">（留空＝不启用 / 用内置默认；均支持按模型专属）</span></div>
-        <div class="space-y-3">
-
-          <div>
-            <div class="lbl mb-1">附加 system 指令<span class="helpq" onclick="hlp(this,'h_injs')">?</span></div>
-            <textarea id="inject_system_instruction" rows="2" class="inp log" placeholder="留空 = 不注入"></textarea>
-            <div id="h_injs" class="helpbox">追加到客户端 system 之<b>后</b>，两条通道都生效。<br>给 <b>RikkaHub 这类轻量前端</b>用：它们没有酒馆的预设系统，每开一个新对话都要重设系统提示。填在这里就是<b>所有前端、所有对话通用</b>。<br><b>酒馆用户请留空</b>——预设已经管了 system，这里再加会和预设打架，而且 <code>{{getvar::xx}}</code> 这类宏在代理侧<b>不会被解析</b>。</div>
-          </div>
-          <div>
-            <div class="lbl mb-1">注入预填充<span class="helpq" onclick="hlp(this,'h_injp')">?</span></div>
-            <textarea id="inject_prefill" rows="2" class="inp log" placeholder="留空 = 不注入"></textarea>
-            <div id="h_injp" class="helpbox">
-              客户端<b>没有发送</b>预填充时，代理自动补一条 assistant 消息，然后按上面的“预填充兼容模式”处理。<br>
-              轻量前端<b>从不发送预填充</b>，等于完全用不上破限最强的那个杠杆，连“预填充时压制原生思考”也永远不会触发（3.6-flash 上更容易出现“只有思考没正文”）。填在这里就能补上。<br>
-              内容通常很短：一句开场白 + 思考块的开标签即可，别塞大段规则（规则请放上面的 system 框）。<br>
-              <b>四条护栏，避免和现有功能冲突</b>：① 客户端已自带预填充（酒馆）→ 跳过，不覆盖；② 请求带函数调用 → 跳过；③ 生图模型 → 默认跳过（可用上面的“生图也注入预填充”放行）；④ 留空 → 完全不启用。<br>
-              <b>只填内容还不够</b>：填完必须点保存——点“保存全局设置”＝对所有模型生效；点上方“保存为该模型专属”＝只对当前所选模型生效。（生图模型还需额外打开上面的“生图也注入预填充”开关，那个开关只是放行，内容仍取自这里。）<br>强烈建议按模型分开配：生图要的是画风描述，角色扮演要的是思考块开标签，两者内容完全不同；问答用的模型则应留空（否则每条回复开头都会多出这段文字，原生思考也会被压制、影响答题深度）。
-            </div>
-          </div>
-          <div>
-            <div class="lbl mb-1">续写指令模板<span class="helpq" onclick="hlp(this,'h_pfi')">?</span></div>
-            <textarea id="prefill_instruction" rows="2" class="inp log" placeholder="留空 = 使用内置默认"></textarea>
-            <div id="h_pfi" class="helpbox">留空即用内置默认，一般不用改。<br><b>「智能」模式</b>下它是那句续写指令，预填充文本会附在它后面；<b>「保留模型轮次」模式</b>下它就是末尾那句推动语。<br>若「保留模型轮次」老是重复开标签，可以把这里改得更短更像催促（例如只填 <code>继续</code>），减少“新一轮”的暗示。<br><b>与生图的关系</b>：留空时，生图模型会自动换用一句“直接输出图片”的指令；<b>一旦你在这里填了内容，生图模型也会用你填的这句</b>——若那句写的是“接着往下写”，生图会吐字符画而不是图片。所以给生图模型请用<b>“保存为该模型专属”</b>单独配一句（例如“直接输出图片，不要任何文字”），别让文本模型的模板串过去。</div>
-          </div>
-        </div>
-      </div>
-
-    </div>
-
-    <div class="flex items-center gap-2 mb-2 mt-6">
-      <span class="pill" style="text-transform:none;background:#f1f1f5;color:#52525b">② 全局设置</span>
-      <span class="text-xs text-neutral-500">对所有模型统一生效，<b>不支持</b>按模型专属；改动后点页面底部「保存全局设置」，它只保存本区、不影响 ① 区。</span>
-    </div>
-
-    <div class="grid md:grid-cols-2 gap-4">
       <!-- 输入图压缩 -->
       <div class="card p-5">
         <div class="flex items-center justify-between mb-3">
