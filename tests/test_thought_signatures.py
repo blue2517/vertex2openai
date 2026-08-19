@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Focused coverage for Google's generateContent thought-signature rules."""
+import asyncio
 import base64
 import json
 from types import SimpleNamespace
@@ -7,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 from google.genai import types
 
-from api_helpers import ToolCallIndexer, convert_chunk_to_openai
+from api_helpers import ToolCallIndexer, convert_chunk_to_openai, _chunk_openai_response_dict_for_sse
 from message_processing import create_gemini_prompt, process_gemini_response_to_openai_dict
 from models import OpenAIMessage
 from signature_store import (
@@ -185,3 +186,85 @@ def test_function_responses_are_unsigned_user_parts_grouped_without_fresh_user_m
     assert all(p.thought_signature is None for p in contents[0].parts)
     assert contents[1].role == "user"
     assert contents[1].parts[0].text == "new turn"
+
+
+def test_multiple_ordinary_parts_replay_without_aggregate_duplication():
+    parts = [
+        types.Part(text="A", thought_signature=b"sig-a"),
+        types.Part(text="B", thought=True, thought_signature=b"sig-b"),
+        types.Part(text="C", thought_signature=b"sig-c"),
+        types.Part(text="", thought_signature=b"sig-final"),
+    ]
+    out = process_gemini_response_to_openai_dict(_response(parts), "gemini-3.7-flash")
+    payload = out["choices"][0]["message"]
+    assert payload["content"] == "AC"
+    assert payload["reasoning_content"] == "B"
+    assert len(payload["extra_content"]["google"]["ordinary_parts"]) == 4
+
+    replay = create_gemini_prompt([OpenAIMessage.model_validate(payload)], "gemini-3.7-flash")[0].parts
+    assert [(p.text, bool(p.thought), p.thought_signature) for p in replay] == [
+        ("A", False, b"sig-a"),
+        ("B", True, b"sig-b"),
+        ("C", False, b"sig-c"),
+        ("", False, b"sig-final"),
+    ]
+
+
+def test_stream_chunk_preserves_all_ordinary_signatures_not_only_last():
+    chunk = _response([
+        types.Part(text="one", thought_signature=b"first"),
+        types.Part(text="two", thought=True, thought_signature=b"last"),
+    ])
+    sse = convert_chunk_to_openai(chunk, "gemini-3.7-flash", "resp",
+                                  indexer=ToolCallIndexer())
+    delta = json.loads(sse.removeprefix("data: ").strip())["choices"][0]["delta"]
+    metadata = delta["extra_content"]["google"]["ordinary_parts"]
+    assert [base64.b64decode(item["thought_signature"]) for item in metadata] == [b"first", b"last"]
+
+
+def test_express_fake_stream_round_trip_preserves_mixed_content_calls_and_signatures():
+    response = process_gemini_response_to_openai_dict(_response([
+        types.Part(text="visible"),
+        _fc("act", "fake-call", b"tool-sig", value=1),
+        types.Part(text="reason", thought=True, thought_signature=b"message-sig"),
+    ]), "gemini-3.7-flash")
+
+    async def collect():
+        return [chunk async for chunk in _chunk_openai_response_dict_for_sse(response)]
+
+    chunks = [json.loads(item[6:]) for item in asyncio.run(collect()) if item.startswith("data: {")]
+    message = {"role": "assistant", "content": "", "reasoning_content": "", "tool_calls": []}
+    calls = {}
+    for chunk in chunks:
+        choice = chunk["choices"][0]
+        delta = choice["delta"]
+        message["content"] += delta.get("content", "")
+        message["reasoning_content"] += delta.get("reasoning_content", "")
+        if "extra_content" in delta:
+            message["extra_content"] = delta["extra_content"]
+        for tc in delta.get("tool_calls", []):
+            call = calls.setdefault(tc["index"], {
+                "id": tc.get("id"), "type": "function",
+                "function": {"name": "", "arguments": ""},
+            })
+            if tc.get("id"):
+                call["id"] = tc["id"]
+            if tc.get("extra_content"):
+                call["extra_content"] = tc["extra_content"]
+            function = tc.get("function") or {}
+            if function.get("name"):
+                call["function"]["name"] = function["name"]
+            call["function"]["arguments"] += function.get("arguments", "")
+    message["tool_calls"] = [calls[i] for i in sorted(calls)]
+
+    assert message["content"] == "visible"
+    assert message["reasoning_content"] == "reason"
+    assert _sig(message["tool_calls"][0]) == b"tool-sig"
+    assert _sig(message) == b"message-sig"
+
+    replay = create_gemini_prompt([OpenAIMessage.model_validate(message)], "gemini-3.7-flash")[0].parts
+    assert replay[0].text == "visible"
+    assert replay[1].function_call.name == "act"
+    assert replay[1].thought_signature == b"tool-sig"
+    assert replay[2].text == "reason" and replay[2].thought is True
+    assert replay[2].thought_signature == b"message-sig"

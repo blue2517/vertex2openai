@@ -141,8 +141,8 @@ def test_native_path_ignores_stale_reject_setting(monkeypatch, capsys):
     chunks = asyncio.run(run())
     assert captured["tools"] == [_tool("get_weather")]
     assert captured["tool_choice"]["function"]["name"] == "get_weather"
-    assert captured["builds"] == [True, False]
-    assert captured["fallback_body"]["variables"]["native"] is False
+    assert captured["builds"] == [True]
+    assert callable(captured["fallback_body"])
     assert captured["force_search"] is False
     body = "".join(chunks)
     assert "正常回复" in body and "[DONE]" in body

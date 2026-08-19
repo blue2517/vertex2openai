@@ -21,6 +21,7 @@ from http_options import get_http_options, should_use_priority_paygo
 import model_capabilities as mc
 from runtime_state import app_state
 import config as app_config
+from schema_validation import SchemaValidationError, validate_request_schemas
 
 LEGACY_EXPRESS_PREFIX = "[EXPRESS] "
 LEGACY_PAY_PREFIX = "[PAY]"
@@ -179,6 +180,14 @@ class ExpressSDKUpstream(BaseUpstream):
     封装了原有的多密钥切匙、代理挂载以及 SDK 运行时调用
     """
     async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request):
+        try:
+            validate_request_schemas(request_obj)
+        except SchemaValidationError as exc:
+            return JSONResponse(
+                status_code=400,
+                content=create_openai_error_response(400, str(exc), "invalid_request_error"),
+            )
+
         express_key_manager_instance = fastapi_request.app.state.express_key_manager
 
         base_model_name, is_grounded_search, model_error = _normalize_model_name(request_obj.model)

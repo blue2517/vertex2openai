@@ -157,6 +157,47 @@ def signature_from_extra(value: Any) -> Tuple[Optional[bytes], Optional[str]]:
         return str(encoded).encode("utf-8"), google.get("thought_signature_part")
 
 
+def ordinary_part_metadata(kind: str, text: str, signature: Optional[bytes]) -> dict:
+    item = {"kind": kind, "text": text}
+    encoded = encode_thought_signature(signature)
+    if encoded:
+        item["thought_signature"] = encoded
+    return item
+
+
+def ordinary_parts_from_extra(value: Any) -> Optional[List[types.Part]]:
+    """Restore exact flattened ordinary Part boundaries from bridge metadata."""
+    raw = _extra_google(value).get("ordinary_parts")
+    if not isinstance(raw, list):
+        return None
+    parts: List[types.Part] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return None
+        kind = item.get("kind")
+        text = item.get("text")
+        if kind not in {"text", "thought", "signature_only"} or not isinstance(text, str):
+            return None
+        # Generated images are flattened to markdown in OpenAI content. Let the
+        # normal content path parse them back into inline_data rather than
+        # replaying the data URL as ordinary text.
+        if kind == "text" and "data:image/" in text:
+            return None
+        encoded = item.get("thought_signature")
+        signature = None
+        if encoded:
+            try:
+                signature = base64.b64decode(str(encoded), validate=True)
+            except Exception:
+                signature = str(encoded).encode("utf-8")
+        parts.append(types.Part(
+            text=text,
+            thought=(True if kind == "thought" else None),
+            thought_signature=signature,
+        ))
+    return parts
+
+
 def build_tool_call_id(fc: Any, part: Any,
                        missing_state: SignatureState = SignatureState.UNKNOWN) -> str:
     """Return a short OpenAI call id and cache signed/unsigned topology fallback."""
@@ -676,31 +717,33 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                     fc_part = types.Part.from_function_call(name=function_name, args=parsed_arguments)
                 tool_parts.append(fc_part)
 
-            ordinary_parts = []
-            reasoning = getattr(message, "reasoning_content", None)
-            if reasoning:
-                ordinary_parts.append(types.Part(text=reasoning, thought=True))
-            if isinstance(message.content, str) and message.content:
-                image_parts, clean_text = _extract_markdown_images_to_parts(message.content)
-                if clean_text:
-                    ordinary_parts.append(types.Part.from_text(text=clean_text))
-                ordinary_parts.extend(image_parts)
+            ordinary_parts = ordinary_parts_from_extra(message)
+            if ordinary_parts is None:
+                ordinary_parts = []
+                reasoning = getattr(message, "reasoning_content", None)
+                if reasoning:
+                    ordinary_parts.append(types.Part(text=reasoning, thought=True))
+                if isinstance(message.content, str) and message.content:
+                    image_parts, clean_text = _extract_markdown_images_to_parts(message.content)
+                    if clean_text:
+                        ordinary_parts.append(types.Part.from_text(text=clean_text))
+                    ordinary_parts.extend(image_parts)
 
-            message_sig, signature_kind = signature_from_extra(message)
-            if message_sig:
-                target = None
-                if signature_kind == "thought":
-                    target = next((p for p in reversed(ordinary_parts) if getattr(p, "thought", None)), None)
-                elif signature_kind == "text":
-                    target = next((p for p in reversed(ordinary_parts)
-                                   if getattr(p, "text", None) is not None and not getattr(p, "thought", None)), None)
-                if target is None and signature_kind != "signature_only":
-                    target = ordinary_parts[-1] if ordinary_parts else None
-                if target is not None:
-                    ordinary_parts[ordinary_parts.index(target)] = target.model_copy(
-                        update={"thought_signature": message_sig})
-                else:
-                    ordinary_parts.append(types.Part(text="", thought_signature=message_sig))
+                message_sig, signature_kind = signature_from_extra(message)
+                if message_sig:
+                    target = None
+                    if signature_kind == "thought":
+                        target = next((p for p in reversed(ordinary_parts) if getattr(p, "thought", None)), None)
+                    elif signature_kind == "text":
+                        target = next((p for p in reversed(ordinary_parts)
+                                       if getattr(p, "text", None) is not None and not getattr(p, "thought", None)), None)
+                    if target is None and signature_kind != "signature_only":
+                        target = ordinary_parts[-1] if ordinary_parts else None
+                    if target is not None:
+                        ordinary_parts[ordinary_parts.index(target)] = target.model_copy(
+                            update={"thought_signature": message_sig})
+                    else:
+                        ordinary_parts.append(types.Part(text="", thought_signature=message_sig))
 
             google_extra = _extra_google(message)
             part_order = google_extra.get("part_order")
@@ -735,15 +778,19 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
             if current_gemini_role not in SUPPORTED_ROLES:
                 current_gemini_role = "user"
 
-            if reasoning:
+            exact_ordinary_parts = ordinary_parts_from_extra(message)
+            if exact_ordinary_parts is not None:
+                parts.extend(exact_ordinary_parts)
+
+            if reasoning and exact_ordinary_parts is None:
                 parts.append(types.Part(text=reasoning, thought=True))
 
-            if isinstance(message.content, str):
+            if exact_ordinary_parts is None and isinstance(message.content, str):
                 image_parts, clean_text = _extract_markdown_images_to_parts(message.content)
                 if clean_text: parts.append(types.Part.from_text(text=clean_text))
                 parts.extend(image_parts)
 
-            elif isinstance(message.content, list):
+            elif exact_ordinary_parts is None and isinstance(message.content, list):
                 for part_item in message.content:
                     # F-1：pydantic 会把标准 part 解析成 ContentPartText / ContentPartImage 实例，
                     # 归一成 dict 后只保留一条处理路径（原先 dict 与实例两套分支已出现行为分歧：
@@ -783,7 +830,7 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                                 opt_bytes, opt_mime = optimize_image_bytes(img_bytes, mime_type)
                                 parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
 
-            if message_sig:
+            if message_sig and exact_ordinary_parts is None:
                 target = None
                 if signature_kind == "thought":
                     target = next((p for p in reversed(parts) if getattr(p, "thought", None)), None)
@@ -1144,6 +1191,7 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
                 normal_content_str += _create_safety_ratings_html(candidate.safety_ratings)
 
             tool_index = 0
+            ordinary_metadata = []
             order_descriptors = []
             message_signature = None
             message_signature_kind = None
@@ -1173,13 +1221,21 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
 
                 is_thought = getattr(part, "thought", None) is True
                 text_value = getattr(part, "text", None)
+                if text_value is None and getattr(part, "inline_data", None) is not None:
+                    inline = part.inline_data
+                    text_value = _convert_image_to_markdown(inline.data, inline.mime_type)
+                elif text_value is None and getattr(part, "file_data", None) is not None:
+                    text_value = f"![Image]({part.file_data.file_uri})"
+                text_value = "" if text_value is None else str(text_value)
                 if is_thought:
                     ordinary_kind = "thought"
                 elif text_value == "" and sig:
                     ordinary_kind = "signature_only"
                 else:
                     ordinary_kind = "text"
-                order_descriptors.append({"type": "ordinary", "kind": ordinary_kind})
+                ordinary_index = len(ordinary_metadata)
+                ordinary_metadata.append(ordinary_part_metadata(ordinary_kind, text_value, sig))
+                order_descriptors.append({"type": "ordinary", "index": ordinary_index})
                 if sig:
                     message_signature = sig
                     message_signature_kind = ordinary_kind
@@ -1194,23 +1250,12 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
             if message_signature:
                 message_payload["extra_content"] = thought_signature_extra(
                     message_signature, message_signature_kind)
+            if ordinary_metadata:
+                google = message_payload.setdefault("extra_content", {}).setdefault("google", {})
+                google["ordinary_parts"] = ordinary_metadata
             if message_payload.get("tool_calls") and order_descriptors:
                 google = message_payload.setdefault("extra_content", {}).setdefault("google", {})
-                # Translate original ordinary kinds to the aggregate Parts that
-                # the OpenAI message can represent (thought first, then text).
-                has_reasoning = bool(reasoning_str)
-                normalized_order = []
-                for item in order_descriptors:
-                    if item["type"] == "tool_call":
-                        normalized_order.append(item)
-                    elif item.get("kind") == "thought" and has_reasoning:
-                        normalized_order.append({"type": "ordinary", "index": 0})
-                    elif item.get("kind") == "text" and normal_content_str:
-                        normalized_order.append({"type": "ordinary", "index": 1 if has_reasoning else 0})
-                    elif item.get("kind") == "signature_only" and message_signature_kind == "signature_only":
-                        normalized_order.append({"type": "ordinary", "index":
-                                                 (1 if has_reasoning else 0) + (1 if normal_content_str else 0)})
-                google["part_order"] = normalized_order
+                google["part_order"] = order_descriptors
             
             choice_item = {"index": i, "message": message_payload, "finish_reason": openai_finish_reason}
             if hasattr(candidate, "logprobs") and candidate.logprobs is not None: choice_item["logprobs"] = candidate.logprobs

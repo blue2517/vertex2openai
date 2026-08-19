@@ -270,3 +270,149 @@ def test_controlled_fallback_runs_once_for_clear_native_schema_error(monkeypatch
     assert calls == ["native", "fallback"]
     assert cp._native_tool_error("Invalid argument: functionCallingConfig is not supported")
     assert not cp._native_tool_error("429 quota exhausted")
+
+
+def test_cookie_function_responses_group_only_when_adjacent():
+    messages = [
+        OpenAIMessage(role="tool", name="one", tool_call_id="one", content="1"),
+        OpenAIMessage(role="tool", name="two", tool_call_id="two", content="2"),
+        OpenAIMessage(role="user", content="fresh turn"),
+    ]
+    contents, _ = cp._convert_messages_to_contents(messages)
+    assert len(contents) == 2
+    assert [p["functionResponse"]["name"] for p in contents[0]["parts"]] == ["one", "two"]
+    assert contents[1] == {"role": "user", "parts": [{"text": "fresh turn"}]}
+
+
+@pytest.mark.parametrize(
+    "choice, expected_mode, expect_tools",
+    [
+        (None, {"mode": "AUTO"}, True),
+        ("auto", {"mode": "AUTO"}, True),
+        ("none", {"mode": "NONE"}, False),
+        ("required", {"mode": "ANY"}, True),
+        ({"type": "function", "function": {"name": "google_search"}}, {"mode": "ANY"}, True),
+    ],
+)
+def test_search_only_tool_choice_modes(choice, expected_mode, expect_tools):
+    variables = cp._build_batch_graphql_body(
+        "example-project", "gemini-3.7-flash",
+        _request(tools=[_function_tool("google_search")], tool_choice=choice),
+    )["variables"]
+    assert variables["toolConfig"] == {"functionCallingConfig": expected_mode}
+    assert (variables.get("tools") == [{"googleSearch": {}}]) is expect_tools
+
+
+@pytest.mark.parametrize(
+    "choice, expected_config, expected_tool_count",
+    [
+        ("auto", {"mode": "AUTO"}, 2),
+        ("none", {"mode": "NONE"}, 0),
+        ("required", {"mode": "ANY", "allowedFunctionNames": ["lookup"]}, 2),
+        ({"type": "function", "function": {"name": "lookup"}},
+         {"mode": "ANY", "allowedFunctionNames": ["lookup"]}, 2),
+    ],
+)
+def test_mixed_custom_and_search_tool_choice_modes(choice, expected_config, expected_tool_count):
+    variables = cp._build_batch_graphql_body(
+        "example-project", "gemini-3.7-flash",
+        _request(tools=[_function_tool("lookup"), _function_tool("google_search")],
+                 tool_choice=choice),
+    )["variables"]
+    assert variables["toolConfig"] == {"functionCallingConfig": expected_config}
+    assert len(variables.get("tools", [])) == expected_tool_count
+
+
+def test_mixed_forced_search_never_names_search_as_declared_function():
+    req = _request(
+        tools=[_function_tool("lookup"), _function_tool("google_search")],
+        tool_choice={"type": "function", "function": {"name": "google_search"}},
+    )
+    variables = cp._build_batch_graphql_body(
+        "example-project", "gemini-3.7-flash", req)["variables"]
+    assert variables["toolConfig"] == {"functionCallingConfig": {"mode": "ANY"}}
+    assert variables["tools"] == [
+        {"functionDeclarations": [variables["tools"][0]["functionDeclarations"][0]]},
+        {"googleSearch": {}},
+    ]
+    assert variables["tools"][0]["functionDeclarations"][0]["name"] == "lookup"
+
+
+def test_image_model_suppresses_client_custom_tools_but_keeps_search():
+    req = OpenAIRequest(
+        model="gemini-3.1-flash-image", stream=True,
+        messages=[OpenAIMessage(role="user", content="draw it")],
+        tools=[_function_tool("client_helper"), _function_tool("google_search")],
+    )
+    variables = cp._build_batch_graphql_body(
+        "example-project", "gemini-3.1-flash-image", req)["variables"]
+    assert variables["tools"] == [{"googleSearch": {}}]
+    assert not any("functionDeclarations" in tool for tool in variables["tools"])
+
+
+def test_fallback_body_is_lazy_and_latches_state():
+    calls = []
+    state = {"latched": False}
+
+    async def fake_once(client, headers, body, sampler=None):
+        calls.append(body["kind"])
+        if body["kind"] == "native":
+            yield "native_tool_unsupported", "FunctionDeclarations unsupported"
+        else:
+            yield "retryable_error", "429"
+
+    async def lazy_fallback():
+        state["latched"] = True
+        calls.append("built-fallback")
+        return {"kind": "fallback"}
+
+    async def run():
+        return [event async for event in cp._execute_stream_request_generator(
+            object(), {}, {"kind": "native"}, fallback_body=lazy_fallback)]
+
+    original = cp._execute_stream_request_generator_once
+    try:
+        cp._execute_stream_request_generator_once = fake_once
+        assert calls == []
+        assert asyncio.run(run()) == [("retryable_error", "429")]
+    finally:
+        cp._execute_stream_request_generator_once = original
+    assert calls == ["native", "built-fallback", "fallback"]
+    assert state["latched"] is True
+
+
+def test_stream_request_keeps_degraded_mode_for_later_retry(monkeypatch):
+    app_state.set_google_cookie("SAPISID=test; SID=test")
+    app_state.set_project_id("example-project")
+    builds = []
+
+    async def fake_build(project_id, model_name, request, prefill_active=False,
+                         force_search=False, native_tools=True):
+        builds.append(native_tools)
+        return {"variables": {"contents": [], "generationConfig": {}, "native": native_tools}}
+
+    async def fake_once(client, headers, body, sampler=None):
+        if body["variables"]["native"]:
+            yield "native_tool_unsupported", "FunctionDeclarations unsupported"
+        elif builds.count(False) == 1:
+            yield "retryable_error", "429 quota"
+        else:
+            yield "text", "degraded retry ok"
+            yield "finish", "STOP"
+
+    monkeypatch.setattr(cp, "build_batch_graphql_body_async", fake_build)
+    monkeypatch.setattr(cp, "_execute_stream_request_generator_once", fake_once)
+    monkeypatch.setattr(cp, "get_retry_settings", lambda: (1, 0))
+    req = _request(tools=[_function_tool("helper")], stream=True)
+
+    class FakeRequest:
+        async def is_disconnected(self):
+            return False
+
+    async def run():
+        response = await cp.CookieProxyUpstream().chat_completions(req, FakeRequest())
+        return "".join([chunk async for chunk in response.body_iterator])
+
+    raw = asyncio.run(run())
+    assert "degraded retry ok" in raw
+    assert builds == [True, False, False]

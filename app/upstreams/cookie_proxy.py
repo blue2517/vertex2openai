@@ -38,10 +38,12 @@ from message_processing import (
     resolve_tool_call_signature,
     signature_from_extra,
     thought_signature_extra,
+    ordinary_part_metadata,
 )
 from logger import stats
 from api_helpers import get_retry_settings
 from signature_store import SignatureRecord, SignatureState, signature_store
+from schema_validation import SchemaValidationError, validate_request_schemas
 
 from cookie_auth import (
     build_headers,
@@ -351,7 +353,7 @@ def _build_function_declarations(tools: Any) -> tuple[list[dict], bool]:
 
 
 def _build_tool_config(tool_choice: Any, function_names: list[str]) -> Optional[dict]:
-    """Map OpenAI's four function-selection forms to the verified wire shape."""
+    """Map OpenAI selection to Studio without naming built-in search as a function."""
     if tool_choice is None:
         mode, allowed = "AUTO", None
     elif isinstance(tool_choice, str):
@@ -364,7 +366,11 @@ def _build_tool_config(tool_choice: Any, function_names: list[str]) -> Optional[
             mode, allowed = "AUTO", None
     elif isinstance(tool_choice, dict):
         name = _normalized_tool_name(tool_choice)
-        mode, allowed = "ANY", ([name] if name else (function_names or None))
+        mode = "ANY"
+        # googleSearch is a built-in Tool, not a FunctionDeclaration. Putting its
+        # OpenAI alias in allowedFunctionNames makes the wire config self-invalid.
+        allowed = None if (name and _is_builtin_search_name(name)) else (
+            [name] if name else (function_names or None))
     else:
         mode, allowed = "AUTO", None
 
@@ -466,6 +472,27 @@ def _parse_function_args(value: Any) -> dict:
     return {}
 
 
+def _ordinary_wire_parts_from_extra(message: Any) -> Optional[list[dict]]:
+    google = ((getattr(message, "extra_content", None) or {}).get("google") or {})
+    raw = google.get("ordinary_parts")
+    if not isinstance(raw, list):
+        return None
+    parts = []
+    for item in raw:
+        if not isinstance(item, dict) or item.get("kind") not in {"text", "thought", "signature_only"}:
+            return None
+        text = item.get("text")
+        if not isinstance(text, str) or (item["kind"] == "text" and "data:image/" in text):
+            return None
+        part = {"text": text}
+        if item["kind"] == "thought":
+            part["thought"] = True
+        if item.get("thought_signature"):
+            part["thoughtSignature"] = item["thought_signature"]
+        parts.append(part)
+    return parts
+
+
 def _attach_message_signature(parts: list[dict], message: Any) -> None:
     signature, kind = signature_from_extra(message)
     encoded = _encode_wire_signature(signature)
@@ -560,12 +587,14 @@ def _convert_messages_to_contents(messages: list, native_tools: bool = True) -> 
                     part["thoughtSignature"] = encoded
                 call_parts.append(part)
 
-            ordinary_parts = []
-            reasoning = getattr(msg, "reasoning_content", None)
-            if reasoning:
-                ordinary_parts.append({"text": reasoning, "thought": True})
-            ordinary_parts.extend(openai_content_to_wire_parts(content))
-            _attach_message_signature(ordinary_parts, msg)
+            ordinary_parts = _ordinary_wire_parts_from_extra(msg)
+            if ordinary_parts is None:
+                ordinary_parts = []
+                reasoning = getattr(msg, "reasoning_content", None)
+                if reasoning:
+                    ordinary_parts.append({"text": reasoning, "thought": True})
+                ordinary_parts.extend(openai_content_to_wire_parts(content))
+                _attach_message_signature(ordinary_parts, msg)
 
             google = ((getattr(msg, "extra_content", None) or {}).get("google") or {})
             order = google.get("part_order")
@@ -587,9 +616,12 @@ def _convert_messages_to_contents(messages: list, native_tools: bool = True) -> 
             continue
 
         gemini_role = "user" if role == "user" else "model"
-        parts = openai_content_to_wire_parts(content)
-        if role in ("assistant", "model"):
-            _attach_message_signature(parts, msg)
+        parts = (_ordinary_wire_parts_from_extra(msg)
+                 if role in ("assistant", "model") else None)
+        if parts is None:
+            parts = openai_content_to_wire_parts(content)
+            if role in ("assistant", "model"):
+                _attach_message_signature(parts, msg)
         if parts:
             contents.append({"role": gemini_role, "parts": parts})
 
@@ -597,8 +629,14 @@ def _convert_messages_to_contents(messages: list, native_tools: bool = True) -> 
     merged: list = []
     for c in contents:
         if merged and merged[-1]["role"] == c["role"]:
-            previous_fr = all("functionResponse" in p for p in merged[-1]["parts"])
-            current_fr = all("functionResponse" in p for p in c["parts"])
+            previous_fr = bool(merged[-1]["parts"]) and all(
+                "functionResponse" in p for p in merged[-1]["parts"])
+            current_fr = bool(c["parts"]) and all("functionResponse" in p for p in c["parts"])
+            # Only adjacent FunctionResponse messages belong to the same parallel
+            # result turn. Never merge a later fresh user message into that turn.
+            if previous_fr != current_fr:
+                merged.append(c)
+                continue
             if not (previous_fr and current_fr):
                 merged[-1]["parts"].append({"text": "\n\n"})
             merged[-1]["parts"].extend(c["parts"])
@@ -700,20 +738,36 @@ def _build_batch_graphql_body(
         gen_config["stopSequences"] = request.stop if isinstance(request.stop, list) else [request.stop]
 
     # Tools share one repeated wire field: custom function declarations and
-    # googleSearch may coexist as separate entries.
+    # googleSearch may coexist as separate entries. Image models suppress custom
+    # declarations entirely; built-in search survives only when the profile says
+    # that image model supports it.
     declarations, declared_search = _build_function_declarations(request.tools) if native_tools else ([], False)
-    wire_tools = []
-    if declarations:
-        wire_tools.append({"functionDeclarations": declarations})
-        variables["toolConfig"] = _build_tool_config(
-            request.tool_choice, [item["name"] for item in declarations])
+    if profile["is_image"]:
+        declarations = []
 
-    _wants_search = (force_search or declared_search
+    choice_name = _normalized_tool_name(request.tool_choice) if isinstance(request.tool_choice, dict) else ""
+    forced_search = bool(choice_name and _is_builtin_search_name(choice_name))
+    tools_disabled = isinstance(request.tool_choice, str) and request.tool_choice.lower() == "none"
+    function_names = [item["name"] for item in declarations]
+    wire_tools = []
+    if not tools_disabled and declarations:
+        wire_tools.append({"functionDeclarations": declarations})
+
+    _wants_search = (force_search or declared_search or forced_search
                      or (hasattr(request, 'model') and request.model.endswith("-search")))
-    if _wants_search and profile["supports_search"]:
+    if not tools_disabled and _wants_search and profile["supports_search"]:
         wire_tools.append({"googleSearch": {}})
     if wire_tools:
         variables["tools"] = wire_tools
+
+    if request.tool_choice is not None or declarations or declared_search or force_search:
+        config_choice = request.tool_choice
+        if profile["is_image"] and choice_name and not forced_search:
+            # The requested custom function was deliberately suppressed for this
+            # image model, so do not leave an allowedFunctionNames reference to a
+            # declaration that is absent from tools.
+            config_choice = None
+        variables["toolConfig"] = _build_tool_config(config_choice, function_names)
 
     return {
         "requestContext": _build_request_context(project_id),
@@ -1105,9 +1159,10 @@ async def _execute_stream_request_generator(
     headers: dict,
     body: dict,
     sampler: "_RawSampler | None" = None,
-    fallback_body: Optional[dict] = None,
+    fallback_body: Any = None,
+    fallback_state: Optional[dict] = None,
 ) -> AsyncGenerator[tuple[str, Any], None]:
-    """Execute native tools, degrading once only for a clear protocol rejection."""
+    """Execute native tools, lazily degrading after one clear protocol rejection."""
     async for status, data in _execute_stream_request_generator_once(client, headers, body, sampler):
         if status != "native_tool_unsupported":
             yield status, data
@@ -1115,9 +1170,14 @@ async def _execute_stream_request_generator(
         if fallback_body is None:
             yield "fatal_error", data
             return
-        print("⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；本次固定降级为文本工具观测后重试一次。")
+        if fallback_state is not None:
+            fallback_state["latched"] = True
+        resolved_fallback = fallback_body() if callable(fallback_body) else fallback_body
+        if hasattr(resolved_fallback, "__await__"):
+            resolved_fallback = await resolved_fallback
+        print("⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；本次及后续重试固定降级为文本工具观测。")
         async for fallback_status, fallback_data in _execute_stream_request_generator_once(
-                client, headers, fallback_body, sampler):
+                client, headers, resolved_fallback, sampler):
             yield fallback_status, fallback_data
         return
 
@@ -1212,6 +1272,13 @@ class CookieProxyUpstream(BaseUpstream):
     """
 
     async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request):
+        try:
+            validate_request_schemas(request_obj)
+        except SchemaValidationError as exc:
+            return JSONResponse(status_code=400, content={
+                "error": {"message": str(exc), "type": "invalid_request_error", "code": 400}
+            })
+
         # ===== 1. 验证认证 =====
         cookie_str = _get_cookie_string()
         if not cookie_str:
@@ -1370,6 +1437,7 @@ class CookieProxyUpstream(BaseUpstream):
 
                 # 立即吐一个心跳，尽快建立连接（避免首个上游调用较慢/429 时前端久等无字节）
                 yield _sse_heartbeat()
+                native_fallback_state = {"latched": False}
 
                 for attempt in range(retry_max + 1):
                     # 客户端已断开则立即停止，避免无谓的上游调用与重试
@@ -1377,14 +1445,26 @@ class CookieProxyUpstream(BaseUpstream):
                         print("ℹ️ [Studio] 客户端已断开连接，停止流式重试。")
                         return
 
-                    body = await build_batch_graphql_body_async(
-                        project_id, base_model_name, request_obj, prefill_active=prefill_active,
-                        force_search=force_builtin_search)
-                    fallback_body = None
-                    if native_custom_tools:
-                        fallback_body = await build_batch_graphql_body_async(
+                    use_native_tools = not native_fallback_state["latched"]
+                    if use_native_tools:
+                        body = await build_batch_graphql_body_async(
+                            project_id, base_model_name, request_obj, prefill_active=prefill_active,
+                            force_search=force_builtin_search)
+                    else:
+                        body = await build_batch_graphql_body_async(
                             project_id, base_model_name, request_obj, prefill_active=prefill_active,
                             force_search=force_builtin_search, native_tools=False)
+                    fallback_body = None
+                    if native_custom_tools and use_native_tools:
+                        # Building can download/compress images, so keep it lazy
+                        # until the native schema is actually rejected. Invoking
+                        # this factory also latches degraded mode across retries.
+                        async def fallback_body():
+                            native_fallback_state["latched"] = True
+                            return await build_batch_graphql_body_async(
+                                project_id, base_model_name, request_obj,
+                                prefill_active=prefill_active,
+                                force_search=force_builtin_search, native_tools=False)
                     req_headers = build_headers(_get_cookie_string()) or headers
                     if cookie_debug:
                         print(f"🔎 [Studio 调试] 出站 generationConfig: "
@@ -1396,6 +1476,8 @@ class CookieProxyUpstream(BaseUpstream):
                         got_thought = False    # 是否收到过思考
                         got_tool_call = False
                         tool_call_index = 0
+                        stream_ordinary_metadata = []
+                        stream_part_order = []
                         should_retry = False
                         error_to_raise = None
                         usage_meta = None
@@ -1422,6 +1504,7 @@ class CookieProxyUpstream(BaseUpstream):
                                     has_yielded_to_client = True
                                 tool_payload = _openai_tool_call(response_id, tool_call_index, data)
                                 tool_payload["index"] = tool_call_index
+                                stream_part_order.append({"type": "tool_call", "index": tool_call_index})
                                 yield _make_openai_chunk(response_id, model_display, tool_calls=[tool_payload])
                                 tool_call_index += 1
                                 got_tool_call = True
@@ -1430,6 +1513,17 @@ class CookieProxyUpstream(BaseUpstream):
                                 signature = _signature_bytes_from_wire(data.get("value"))
                                 extra = thought_signature_extra(signature, data.get("part_kind"))
                                 if extra:
+                                    if stream_ordinary_metadata:
+                                        stream_ordinary_metadata[-1]["thought_signature"] = _encode_wire_signature(signature)
+                                    elif data.get("part_kind") == "signature_only":
+                                        stream_part_order.append({"type": "ordinary", "index": 0})
+                                        stream_ordinary_metadata.append(
+                                            ordinary_part_metadata("signature_only", "", signature))
+                                    google = extra.setdefault("google", {})
+                                    if stream_ordinary_metadata:
+                                        google["ordinary_parts"] = list(stream_ordinary_metadata)
+                                    if got_tool_call:
+                                        google["part_order"] = list(stream_part_order)
                                     if not has_yielded_to_client:
                                         yield _make_openai_chunk(response_id, model_display, role="assistant")
                                         has_yielded_to_client = True
@@ -1445,16 +1539,22 @@ class CookieProxyUpstream(BaseUpstream):
                                         yield _make_openai_chunk(response_id, model_display, content=prefill_text)
 
                                 if status == "thought":
+                                    stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
+                                    stream_ordinary_metadata.append(ordinary_part_metadata("thought", data, None))
                                     yield _make_openai_chunk(response_id, model_display, reasoning_content=data)
                                 elif status == "api_error_text":
                                     yield _make_openai_chunk(response_id, model_display, content=f"\n[Studio API 错误] {data}")
                                 elif status == "image":
                                     got_text = True
+                                    stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
+                                    stream_ordinary_metadata.append(ordinary_part_metadata("text", data, None))
                                     yield _make_openai_chunk(response_id, model_display, content=data)
                                 else:  # text（经过预填充去重器）
                                     got_text = True
                                     out = deduper.feed(data)
                                     if out:
+                                        stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
+                                        stream_ordinary_metadata.append(ordinary_part_metadata("text", out, None))
                                         yield _make_openai_chunk(response_id, model_display, content=out)
 
                             elif status == "finish":
@@ -1528,10 +1628,24 @@ class CookieProxyUpstream(BaseUpstream):
                         # 预填充去重器里可能还攒着开头的一小段（短回复场景）
                         tail = deduper.flush()
                         if tail:
+                            stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
+                            stream_ordinary_metadata.append(ordinary_part_metadata("text", tail, None))
                             yield _make_openai_chunk(response_id, model_display, content=tail)
 
                         if got_text or got_tool_call:
                             stats.add_success()
+                            if got_tool_call and stream_ordinary_metadata:
+                                google = {
+                                    "ordinary_parts": list(stream_ordinary_metadata),
+                                    "part_order": list(stream_part_order),
+                                }
+                                last_signed = next((item for item in reversed(stream_ordinary_metadata)
+                                                    if item.get("thought_signature")), None)
+                                if last_signed:
+                                    google["thought_signature"] = last_signed["thought_signature"]
+                                    google["thought_signature_part"] = last_signed["kind"]
+                                yield _make_openai_chunk(
+                                    response_id, model_display, extra_content={"google": google})
                             yield _make_openai_chunk(
                                 response_id, model_display,
                                 finish_reason="tool_calls" if got_tool_call else _map_finish_reason(finish_raw))
@@ -1567,6 +1681,7 @@ class CookieProxyUpstream(BaseUpstream):
 
         # ========== 非流式处理 ==========
         else:
+            native_fallback_state = {"latched": False}
             for attempt in range(retry_max + 1):
                 # 客户端已断开则立即停止，避免无谓的上游调用与重试
                 if await fastapi_request.is_disconnected():
@@ -1575,14 +1690,26 @@ class CookieProxyUpstream(BaseUpstream):
                         "error": {"message": "客户端已断开连接，请求已取消。", "type": "client_closed_request"}
                     })
                 try:
-                    body = await build_batch_graphql_body_async(
-                        project_id, base_model_name, request_obj, prefill_active=prefill_active,
-                        force_search=force_builtin_search)
-                    fallback_body = None
-                    if native_custom_tools:
-                        fallback_body = await build_batch_graphql_body_async(
+                    use_native_tools = not native_fallback_state["latched"]
+                    if use_native_tools:
+                        body = await build_batch_graphql_body_async(
+                            project_id, base_model_name, request_obj, prefill_active=prefill_active,
+                            force_search=force_builtin_search)
+                    else:
+                        body = await build_batch_graphql_body_async(
                             project_id, base_model_name, request_obj, prefill_active=prefill_active,
                             force_search=force_builtin_search, native_tools=False)
+                    fallback_body = None
+                    if native_custom_tools and use_native_tools:
+                        # Building can download/compress images, so keep it lazy
+                        # until the native schema is actually rejected. Invoking
+                        # this factory also latches degraded mode across retries.
+                        async def fallback_body():
+                            native_fallback_state["latched"] = True
+                            return await build_batch_graphql_body_async(
+                                project_id, base_model_name, request_obj,
+                                prefill_active=prefill_active,
+                                force_search=force_builtin_search, native_tools=False)
                     req_headers = build_headers(_get_cookie_string()) or headers
                     if cookie_debug:
                         print(f"🔎 [Studio 调试] 出站 generationConfig: "
@@ -1594,9 +1721,13 @@ class CookieProxyUpstream(BaseUpstream):
                         )
                         if fallback_body is not None and _native_tool_error_response(
                                 response.status_code, response.text):
-                            print("⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；本次固定降级为文本工具观测后重试一次。")
+                            native_fallback_state["latched"] = True
+                            resolved_fallback = fallback_body()
+                            if hasattr(resolved_fallback, "__await__"):
+                                resolved_fallback = await resolved_fallback
+                            print("⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；本次及后续重试固定降级为文本工具观测。")
                             response = await client.post(
-                                BATCH_GRAPHQL_URL, headers=req_headers, json=fallback_body
+                                BATCH_GRAPHQL_URL, headers=req_headers, json=resolved_fallback
                             )
                             fallback_body = None
 
@@ -1619,6 +1750,8 @@ class CookieProxyUpstream(BaseUpstream):
                     reasoning_text = ""
                     safety_html = ""
                     tool_calls = []
+                    ordinary_metadata = []
+                    part_order = []
                     message_extra = None
                     api_error = None
                     usage_meta = None
@@ -1638,16 +1771,28 @@ class CookieProxyUpstream(BaseUpstream):
                         for event_type, data in _extract_from_results(obj):
                             if event_type == "text":
                                 full_text += data
+                                part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
+                                ordinary_metadata.append(ordinary_part_metadata("text", data, None))
                             elif event_type == "thought":
                                 reasoning_text += data   # 先收集（供诊断判断），输出时按 strip 决定是否附带
+                                part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
+                                ordinary_metadata.append(ordinary_part_metadata("thought", data, None))
                             elif event_type == "image":
                                 full_text += data
+                                part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
+                                ordinary_metadata.append(ordinary_part_metadata("text", data, None))
                             elif event_type == "function_call":
+                                part_order.append({"type": "tool_call", "index": len(tool_calls)})
                                 tool_calls.append(_openai_tool_call(response_id, len(tool_calls), data))
                             elif event_type == "thought_signature":
                                 sig = _signature_bytes_from_wire(data.get("value"))
                                 if sig:
                                     message_extra = thought_signature_extra(sig, data.get("part_kind"))
+                                    if ordinary_metadata:
+                                        ordinary_metadata[-1]["thought_signature"] = _encode_wire_signature(sig)
+                                    elif data.get("part_kind") == "signature_only":
+                                        part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
+                                        ordinary_metadata.append(ordinary_part_metadata("signature_only", "", sig))
                             elif event_type == "finish":
                                 finish_raw = data
                             elif event_type == "safety":
@@ -1703,6 +1848,13 @@ class CookieProxyUpstream(BaseUpstream):
                         message_obj["reasoning_content"] = reasoning_text
                     if tool_calls:
                         message_obj["tool_calls"] = tool_calls
+                    if ordinary_metadata:
+                        if message_extra is None:
+                            message_extra = {"google": {}}
+                        google = message_extra.setdefault("google", {})
+                        google["ordinary_parts"] = ordinary_metadata
+                        if tool_calls:
+                            google["part_order"] = part_order
                     if message_extra:
                         message_obj["extra_content"] = message_extra
 

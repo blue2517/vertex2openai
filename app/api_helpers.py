@@ -451,6 +451,8 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
         parse_gemini_response_for_reasoning_and_content,
         build_tool_call_id,
         thought_signature_extra,
+        ordinary_part_metadata,
+        _convert_image_to_markdown,
         _signature_bytes,
     )
     from signature_store import SignatureState
@@ -472,6 +474,8 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
         # Collect every parallel call and keep signatures on their exact tool-call
         # deltas. Message-level signatures cover ordinary/signature-only Parts.
         tool_call_deltas = []
+        ordinary_metadata = []
+        part_order = []
         ordinary_signature = None
         ordinary_signature_kind = None
         if hasattr(candidate, "content") and hasattr(candidate.content, "parts") and candidate.content.parts:
@@ -479,14 +483,24 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                 fc = getattr(part, "function_call", None)
                 sig = _signature_bytes(part, fc)
                 if fc is None:
+                    text_value = getattr(part, "text", None)
+                    if text_value is None and getattr(part, "inline_data", None) is not None:
+                        inline = part.inline_data
+                        text_value = _convert_image_to_markdown(inline.data, inline.mime_type)
+                    elif text_value is None and getattr(part, "file_data", None) is not None:
+                        text_value = f"![Image]({part.file_data.file_uri})"
+                    text_value = "" if text_value is None else str(text_value)
+                    if getattr(part, "thought", None) is True:
+                        kind = "thought"
+                    elif text_value == "" and sig:
+                        kind = "signature_only"
+                    else:
+                        kind = "text"
+                    part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
+                    ordinary_metadata.append(ordinary_part_metadata(kind, text_value, sig))
                     if sig:
                         ordinary_signature = sig
-                        if getattr(part, "thought", None) is True:
-                            ordinary_signature_kind = "thought"
-                        elif getattr(part, "text", None) == "":
-                            ordinary_signature_kind = "signature_only"
-                        else:
-                            ordinary_signature_kind = "text"
+                        ordinary_signature_kind = kind
                     continue
                 tc_index = indexer.next_index(candidate_index) if indexer else len(tool_call_deltas)
                 tc = {
@@ -504,6 +518,7 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                 extra = thought_signature_extra(sig)
                 if extra:
                     tc["extra_content"] = extra
+                part_order.append({"type": "tool_call", "index": len(tool_call_deltas)})
                 tool_call_deltas.append(tc)
 
         if tool_call_deltas:
@@ -525,9 +540,16 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
         elif not reasoning_text and openai_finish_reason is None:
             delta_payload["content"] = ""
 
+        google_extra = {}
         if ordinary_signature:
-            delta_payload["extra_content"] = thought_signature_extra(
-                ordinary_signature, ordinary_signature_kind)
+            google_extra.update((thought_signature_extra(
+                ordinary_signature, ordinary_signature_kind) or {}).get("google", {}))
+        if ordinary_metadata:
+            google_extra["ordinary_parts"] = ordinary_metadata
+        if tool_call_deltas and part_order:
+            google_extra["part_order"] = part_order
+        if google_extra:
+            delta_payload["extra_content"] = {"google": google_extra}
     
     if not delta_payload and openai_finish_reason is None:
         delta_payload["content"] = ""
@@ -562,53 +584,56 @@ async def _chunk_openai_response_dict_for_sse(
         message = choice.get("message", {})
         final_finish_reason = choice.get("finish_reason", "stop")
 
-        if message.get("tool_calls"):
-            tool_calls_list = message.get("tool_calls", [])
-            for tc_item_idx, tool_call_item in enumerate(tool_calls_list):
-                delta_tc_start = {
-                    "tool_calls": [{
-                        "index": tc_item_idx, 
-                        "id": tool_call_item["id"],
-                        "type": "function",
-                        "function": {"name": tool_call_item["function"]["name"], "arguments": ""}
-                    }]
-                }
-                yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': delta_tc_start, 'finish_reason': None}]})}\n\n"
-                await asyncio.sleep(0.01) 
+        def _sse(delta):
+            payload = {"id": resp_id, "object": "chat.completion.chunk", "created": created_time,
+                       "model": model_name, "choices": [{"index": choice_idx, "delta": delta,
+                                                           "finish_reason": None}]}
+            return f"data: {json.dumps(payload)}\n\n"
 
-                delta_tc_args = {
-                    "tool_calls": [{
-                        "index": tc_item_idx,
-                        "id": tool_call_item["id"], 
-                        "function": {"arguments": tool_call_item["function"]["arguments"]}
-                    }]
-                }
-                yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': delta_tc_args, 'finish_reason': None}]})}\n\n"
-                await asyncio.sleep(0.01)
-        
-        elif message.get("content") is not None or message.get("reasoning_content") is not None : 
-            reasoning_content = message.get("reasoning_content", "")
-            actual_content = message.get("content") 
+        # A response may legitimately mix thoughts, visible text, tool calls and
+        # message-level signature metadata in the same assistant turn. Emit each
+        # independently instead of the old mutually-exclusive tool/text branches.
+        if message.get("extra_content") is not None:
+            yield _sse({"extra_content": message["extra_content"]})
 
-            if reasoning_content:
-                delta_reasoning = {"reasoning_content": reasoning_content}
-                yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': delta_reasoning, 'finish_reason': None}]})}\n\n"
-                if actual_content is not None: await asyncio.sleep(0.01)
+        reasoning_content = message.get("reasoning_content", "")
+        actual_content = message.get("content")
+        if reasoning_content:
+            yield _sse({"reasoning_content": reasoning_content})
+            await asyncio.sleep(0.01)
 
-            content_to_chunk = actual_content if actual_content is not None else ""
-            if actual_content is not None:
-                # 【回滚】：恢复原版图片传输方案（一次性全量发送），彻底拯救前端解析器不卡死
-                if "![Image](data:image/" in content_to_chunk:
-                    chunk_size = max(1, len(content_to_chunk))
-                else:
-                    chunk_size = max(1, math.ceil(len(content_to_chunk) / 10)) if content_to_chunk else 1
+        if actual_content is not None:
+            content_to_chunk = actual_content
+            # Keep generated images whole; chunk ordinary text for fake-stream UX.
+            if "![Image](data:image/" in content_to_chunk:
+                chunk_size = max(1, len(content_to_chunk))
+            else:
+                chunk_size = max(1, math.ceil(len(content_to_chunk) / 10)) if content_to_chunk else 1
+            if not content_to_chunk and not reasoning_content:
+                yield _sse({"content": ""})
+            else:
+                for i in range(0, len(content_to_chunk), chunk_size):
+                    yield _sse({"content": content_to_chunk[i:i + chunk_size]})
+                    if len(content_to_chunk) > chunk_size:
+                        await asyncio.sleep(0.01)
 
-                if not content_to_chunk and not reasoning_content : 
-                    yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': {'content': ''}, 'finish_reason': None}]})}\n\n"
-                else:
-                    for i in range(0, len(content_to_chunk), chunk_size):
-                        yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': {'content': content_to_chunk[i:i+chunk_size]}, 'finish_reason': None}]})}\n\n"
-                        if len(content_to_chunk) > chunk_size: await asyncio.sleep(0.01)
+        for tc_item_idx, tool_call_item in enumerate(message.get("tool_calls") or []):
+            tool_delta = {
+                "index": tc_item_idx,
+                "id": tool_call_item["id"],
+                "type": "function",
+                "function": {"name": tool_call_item["function"]["name"], "arguments": ""},
+            }
+            if tool_call_item.get("extra_content") is not None:
+                tool_delta["extra_content"] = tool_call_item["extra_content"]
+            yield _sse({"tool_calls": [tool_delta]})
+            await asyncio.sleep(0.01)
+            yield _sse({"tool_calls": [{
+                "index": tc_item_idx,
+                "id": tool_call_item["id"],
+                "function": {"arguments": tool_call_item["function"]["arguments"]},
+            }]})
+            await asyncio.sleep(0.01)
         
         yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': {}, 'finish_reason': final_finish_reason}]})}\n\n"
 

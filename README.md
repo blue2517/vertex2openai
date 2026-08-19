@@ -100,7 +100,7 @@ http://localhost:8050
 | **思考档位兜底** | 非法档位一律抬到 `high`（Pro 上选 minimal 反而变 high） | 就近**向下**夹取：Pro 选 minimal → `low` |
 | **`retry_max` 语义** | Express 通道当作总次数，设 0 时一次请求都不发 | 统一为「重试次数」，总请求数 = `retry_max + 1`，设 0 仍请求一次；取值钳到 0–50 |
 | **并行函数调用（流式）** | 只发第一个，`index` 恒为 0 | 全部下发，`index` 跨 chunk 稳定递增 |
-| **思考签名** | base64 拼进 `tool_call_id`（上千字符，易被前端截断） | 短 id（≤40 字符）+ 进程内旁路缓存；旧格式仍可解析；取不回时降级为官方 `skip_thought_signature_validator` 哨兵 |
+| **思考签名** | base64 拼进 `tool_call_id`（上千字符，易被前端截断） | 主要通过 OpenAI 扩展 `extra_content.google.thought_signature` 原样回传；进程内短期缓存、旧 id 格式与官方 `skip_thought_signature_validator` 哨兵仅作兼容兜底 |
 | **Cookie 通道 + 函数调用** | 静默把 `role=tool` 折成 model，发出错乱历史 | 原生下发函数声明，按 `functionCall` / `functionResponse` 回放历史并保留 thought signature |
 | **Cookie 通道输入图** | 不压缩、不支持 http(s) 图片、不解析正文内联图 | 与标准通道一致（压缩开关对两条通道都生效） |
 | **`stop` 字段** | 只接受数组，传字符串 422 | 字符串/数组都接受 |
@@ -113,7 +113,7 @@ http://localhost:8050
 | **2.5 Flash-Lite 思考预算** | 下限按 0 处理 | 下限 512（`0` 仍表示关闭） |
 | **生图比例 `9:21`** | 在白名单里（无官方出处） | 已移除，落到"由模型决定" |
 
-新增两个控制台开关：**思考签名内嵌 tool_call_id**（默认关，多副本部署才需开）与**生图下发 system 指令**（默认关，开启前请真机验证）。
+思考签名优先使用请求/响应中的 `extra_content.google` 携带，因此跨进程、多副本部署不依赖本地缓存；旧格式、进程内缓存与跳过校验哨兵仅用于兼容缺失显式签名的客户端。
 
 ---
 
