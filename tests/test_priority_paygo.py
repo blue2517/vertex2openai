@@ -8,7 +8,7 @@ from google import genai
 from google.genai import types
 
 import config as app_config
-from api_helpers import execute_gemini_call
+from api_helpers import _record_usage, execute_gemini_call
 from models import OpenAIRequest
 from http_options import (
     PRIORITY_PAYGO_HEADERS,
@@ -183,6 +183,19 @@ def test_streaming_fallback_switches_to_standard_client(monkeypatch):
     asyncio.run(run())
     assert priority_calls == [full]
     assert standard_calls == ["gemini-example"]
+
+
+def test_priority_traffic_type_is_logged(capsys):
+    response = types.GenerateContentResponse.model_validate({
+        "usageMetadata": {
+            "promptTokenCount": 1,
+            "candidatesTokenCount": 1,
+            "totalTokenCount": 2,
+            "trafficType": "ON_DEMAND_PRIORITY",
+        },
+    })
+    _record_usage(response)
+    assert "traffic_type=ON_DEMAND_PRIORITY" in capsys.readouterr().out
 
 
 def test_priority_headers_are_wired_into_express_client():

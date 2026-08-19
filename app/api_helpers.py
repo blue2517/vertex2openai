@@ -379,11 +379,13 @@ def _extract_usage(resp: Any) -> tuple[int, int, int]:
 
 
 def _record_usage(resp: Any) -> dict:
-    """记录 token 用量并打印。
+    """记录 token 用量，并打印上游实际返回的流量等级。"""
+    usage_metadata = getattr(resp, "usage_metadata", None)
+    traffic_type = getattr(usage_metadata, "traffic_type", None) if usage_metadata else None
+    if traffic_type:
+        value = getattr(traffic_type, "value", None) or str(traffic_type)
+        print(f"🚦 [流量等级] 上游实际 traffic_type={value}")
 
-    P1-5：直接调 stats.add_tokens()，不再让 logger 用正则从日志文本里反解——
-    那种做法与中文文案强耦合，改一个字就静默失效。
-    """
     p_tk, c_tk, t_tk = _extract_usage(resp)
     if p_tk or c_tk:
         stats.add_tokens(p_tk, c_tk)
