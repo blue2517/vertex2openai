@@ -221,7 +221,7 @@ class ExpressSDKUpstream(BaseUpstream):
         if model_to_call != base_model_name:
             print(f"🌐 [上游端点] 已钉定 location：{model_to_call}")
         if priority_paygo:
-            print("🚦 [流量等级] global 请求已使用 Priority PayGo。")
+            print("🚦 [流量等级] global 请求已附加 Priority PayGo 请求头；实际是否命中以上游 traffic_type 为准。")
         else:
             print("ℹ️ [流量等级] 当前未钉定 global，使用普通请求。")
 
