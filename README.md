@@ -208,11 +208,11 @@ http://localhost:8050
 
 ---
 
-## Cookie(Studio) 通道的工具策略（`cookie_tool_policy`）
+## Cookie(Studio) 通道的工具降级行为
 
 Cookie 直连通道不能下发 `functionDeclarations`，也无法表达 `functionCall`/`functionResponse`。但**「不能真的调用工具」不该等于「整单拒绝」**：RikkaHub 这类前端只要在模型卡里勾了工具能力，**每条**请求都会带上 `tools` 声明，哪怕本轮毫无调用需求——旧版据此直接 400，等于 Studio 通道在这些前端下完全不可用。
 
-现在默认 **自动降级（`degrade`）**：
+在原生 Cookie 工具支持实现前，本通道固定采用**安全降级**：
 
 | 情况 | 行为 |
 |---|---|
@@ -220,8 +220,6 @@ Cookie 直连通道不能下发 `functionDeclarations`，也无法表达 `functi
 | 声明里含搜索类工具（`google_search` / `web_search` 等） | **映射为 Studio 内建 `googleSearch`**（这个通道本来就支持） |
 | 历史里有真实 `functionCall` / `functionResponse` | 渲染成可读文本（`[请求调用工具 · x]` / `[工具执行结果 · x]`）后发送，保住对话连贯；语义有损，日志会警告 |
 | `tool_choice` 强制指定函数 | 无法满足，忽略并警告（按你的要求：调不了就正常回复） |
-
-需要函数调用**必须真实可用**时，把控制台的「Cookie 通道工具策略」改为 **严格拒绝（`reject`）**，恢复旧的明确 400 提示。
 
 ---
 

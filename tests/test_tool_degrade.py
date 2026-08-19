@@ -102,28 +102,18 @@ def _setup_auth():
     app_state.set_project_id("p")
 
 
-def _call(req):
-    _setup_auth()
-    return asyncio.run(cp.CookieProxyUpstream().chat_completions(req, _FakeReq()))
-
-
-def test_reject_policy_returns_400():
-    app_state.update_settings({"cookie_tool_policy": "reject"})
-    req = OpenAIRequest(model="gemini-3.7-flash", stream=False,
-                        messages=[OpenAIMessage(role="user", content="hi")],
-                        tools=[_tool("get_weather")])
-    resp = _call(req)
-    assert resp.status_code == 400
-    assert "不支持函数调用" in json.loads(resp.body)["error"]["message"]
-
-
-def test_degrade_policy_drops_tools_and_proceeds(monkeypatch):
-    """默认降级：不再 400，工具声明被丢弃，请求照常发出。"""
-    app_state.update_settings({"cookie_tool_policy": "degrade"})
+def test_fixed_degrade_ignores_stale_reject_setting(monkeypatch, capsys):
+    """旧配置里的 reject 键不再是已知设置，也不能恢复 400 行为。"""
+    with app_state._lock:
+        app_state._state["settings"] = {"cookie_tool_policy": "reject"}
+    assert "cookie_tool_policy" not in app_state.get_settings()
+    # 控制台/API 再提交旧键也会被已知键过滤器忽略。
+    assert "cookie_tool_policy" not in app_state.update_settings({"cookie_tool_policy": "reject"})
     captured = {}
 
     async def fake_build(project_id, model_name, request, prefill_active=False, force_search=False):
         captured["tools"] = request.tools
+        captured["tool_choice"] = request.tool_choice
         captured["force_search"] = force_search
         return {"variables": {"contents": [], "generationConfig": {}}}
 
@@ -136,7 +126,8 @@ def test_degrade_policy_drops_tools_and_proceeds(monkeypatch):
 
     req = OpenAIRequest(model="gemini-3.7-flash", stream=True,
                         messages=[OpenAIMessage(role="user", content="hi")],
-                        tools=[_tool("get_weather")], tool_choice="auto")
+                        tools=[_tool("get_weather")],
+                        tool_choice={"type": "function", "function": {"name": "get_weather"}})
 
     async def run():
         resp = await cp.CookieProxyUpstream().chat_completions(req, _FakeReq())
@@ -145,13 +136,16 @@ def test_degrade_policy_drops_tools_and_proceeds(monkeypatch):
     _setup_auth()
     chunks = asyncio.run(run())
     assert captured["tools"] is None            # 声明已丢弃
+    assert captured["tool_choice"] is None       # 强制选择已忽略
     assert captured["force_search"] is False
     body = "".join(chunks)
     assert "正常回复" in body and "[DONE]" in body
+    logs = capsys.readouterr().out
+    assert "已忽略本通道不支持的自定义函数声明" in logs
+    assert "请求强制指定了工具调用" in logs
 
 
-def test_degrade_maps_search_tool(monkeypatch):
-    app_state.update_settings({"cookie_tool_policy": "degrade"})
+def test_fixed_degrade_maps_search_tool(monkeypatch):
     captured = {}
 
     async def fake_build(project_id, model_name, request, prefill_active=False, force_search=False):

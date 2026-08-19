@@ -454,31 +454,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <p id="sampling-note" class="text-xs text-neutral-500 mt-2"></p>
       </div>
 
-      <!-- 通道行为（全局，不按模型区分） -->
-      <div class="card p-5">
-        <div class="text-sm font-semibold mb-1">通道行为 <span class="text-xs font-normal text-neutral-400">（全局设置）</span></div>
-        <div class="space-y-4 mt-4">
-
-          <div>
-            <div class="flex items-center justify-between gap-3">
-              <span class="text-sm">Cookie 通道工具策略<span class="helpq" onclick="hlp(this,'h_ctp')">?</span></span>
-              <select id="cookie_tool_policy" class="inp" style="max-width:170px"><option value="degrade">自动降级（默认）</option><option value="reject">严格拒绝</option></select>
-            </div>
-            <div id="h_ctp" class="helpbox">
-              Cookie 直连通道<b>无法真正执行函数调用</b>（不能下发 functionDeclarations，也无法表达 functionCall / functionResponse）。这里决定遇到工具流量时怎么办。<br><br>
-              <b>自动降级（默认）</b><br>
-              • 只是<b>声明</b>了工具、本轮没有调用需求 → 丢掉声明，<b>照常正常回复</b>。<br>
-              • 声明里有<b>搜索类</b>工具 → 映射为本通道支持的<b>内建 Google 搜索</b>。<br>
-              • 历史里<b>真有</b>调用往返 → 渲染成可读文本发送，保住对话连贯（语义有损，日志会提示）。<br>
-              • 前端强制指定了工具 → 无法满足，忽略并提示。<br><br>
-              <b>为什么默认降级</b>：RikkaHub 等前端只要模型卡勾了“工具”，<b>每一条</b>请求都会带上声明，哪怕这轮用不到。严格拒绝会让 Studio 通道在这些前端下完全没法用。<br><br>
-              <b>严格拒绝</b>：恢复旧行为，直接报错并提示改用标准模式。需要函数调用<b>必须真实可用</b>时选它。
-            </div>
-          </div>
-
-        </div>
-      </div>
-
       <!-- 控制台注入（可按模型覆盖） -->
       <div class="card p-5">
         <div class="text-sm font-semibold mb-3">注入与续写 <span class="text-xs font-normal text-neutral-400">（留空＝不启用 / 用内置默认；均支持按模型专属）</span></div>
@@ -751,7 +726,7 @@ async function loadParams(){
     const s=await (await fetch('/api/settings')).json();
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
-    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','cookie_tool_policy','express_location'].forEach(k=>setV(k,s[k]));
+    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location'].forEach(k=>setV(k,s[k]));
     ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard'].forEach(k=>setV(k,s[k]));
     // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
@@ -923,7 +898,6 @@ async function saveSettings(){
     cookie_debug:$('cookie_debug').checked,
     debug_outbound:$('debug_outbound').checked,
     prefill_mode:$('prefill_mode').value,
-    cookie_tool_policy:$('cookie_tool_policy').value,
     express_location:$('express_location').value,
     prefill_suppress_thinking:$('prefill_suppress_thinking').checked,
   };

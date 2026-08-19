@@ -70,6 +70,13 @@ def test_no_removed_project_id_field():
     assert "express_project_id" not in HTML
 
 
+def test_no_removed_cookie_tool_policy_control():
+    """Cookie 工具流量固定安全降级，不再暴露可恢复严格拒绝的设置。"""
+    import config as app_config
+    assert "cookie_tool_policy" not in app_config.DEFAULT_SETTINGS
+    assert "cookie_tool_policy" not in HTML
+
+
 def test_native_thinking_note_is_model_agnostic():
     """原生思考说明对所有模型都要成立，不能写死某个具体型号。"""
     note = re.search(r"🎭.*?</p>", HTML, re.DOTALL)
@@ -92,7 +99,7 @@ def test_sampling_inputs_stack_on_narrow_screens():
 
 def test_selects_do_not_use_fixed_width():
     """下拉用 max-width 而不是固定 width，窄屏才不会溢出。"""
-    for sid in ["cookie_tool_policy", "express_location", "sampling_policy"]:
+    for sid in ["express_location", "sampling_policy"]:
         m = re.search(rf'<select id="{sid}"[^>]*>', HTML)
         assert m, f"没找到下拉 {sid}"
         assert "width:" not in m.group(0) or "max-width" in m.group(0), \

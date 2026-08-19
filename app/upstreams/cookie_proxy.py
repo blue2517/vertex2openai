@@ -307,9 +307,8 @@ def _convert_messages_to_contents(messages: list) -> tuple:
             continue
 
         # 工具流量降级：本通道无法表达 functionCall / functionResponse，
-        # 但把它们**渲染成可读文本**至少能保住对话的连贯性（严格拒绝策略下
-        # 根本走不到这里；旧实现是直接丢弃 tool_calls、把 role="tool" 折成
-        # model 轮次，那才是语义错乱）。
+        # 但把它们**渲染成可读文本**至少能保住对话的连贯性（旧实现是直接
+        # 丢弃 tool_calls、把 role="tool" 折成 model 轮次，那才是语义错乱）。
         if role == "tool":
             name = getattr(msg, "name", None) or "tool"
             body = _plain_text_of(content)
@@ -911,25 +910,15 @@ class CookieProxyUpstream(BaseUpstream):
                 "请确保 Cookie 来自已登录的 console.cloud.google.com 页面。"
             ), "type": "auth_error"}})
 
-        # ===== 2.5 工具流量处理：默认自动降级，可在控制台改回严格拒绝 =====
-        # 关键区分（见 classify_tool_traffic）：
-        #   仅声明工具（RikkaHub 等前端每条请求都带）→ 丢掉声明，正常对话；
-        #   历史里真有调用往返        → 无法如实表达，降级成文本观测或拒绝。
+        # ===== 2.5 工具流量处理：固定安全降级 =====
+        # Cookie 直连无法表达自定义函数声明/调用/结果，因此始终：
+        #   - 丢掉不支持的声明；搜索类声明映射为 Studio 内建 googleSearch；
+        #   - 历史调用往返由消息转换器渲染成可读文本；
+        #   - 忽略无法满足的强制 tool_choice，并留下明确日志。
         _tool_info = classify_tool_traffic(request_obj.messages, request_obj.tools)
-        _tool_policy = str(app_state.get_setting("cookie_tool_policy", "degrade") or "degrade").lower()
+        _forced_tool_choice = request_obj.tool_choice not in (None, "none", "auto")
         force_builtin_search = False
-        if _tool_info["declared"] or _tool_info["history"]:
-            if _tool_policy == "reject":
-                print("⛔ [Studio] 请求含函数调用内容，按控制台策略（严格拒绝）已拒绝。")
-                return JSONResponse(status_code=400, content={"error": {
-                    "message": ("Cookie 直连通道暂不支持函数调用（不下发 functionDeclarations，"
-                                "也无法表达 functionCall / functionResponse）。\n"
-                                "请切换到「标准模式（Express API Key）」，"
-                                "或在控制台把「Cookie 通道工具策略」改为「自动降级」。"),
-                    "type": "unsupported_feature",
-                }})
-
-            # —— 自动降级 ——
+        if _tool_info["declared"] or _tool_info["history"] or _forced_tool_choice:
             if _tool_info["builtin_search"]:
                 force_builtin_search = True
                 print("🔎 [Studio] 请求声明了搜索类工具，已映射为 Studio 内建 googleSearch。")
@@ -940,9 +929,9 @@ class CookieProxyUpstream(BaseUpstream):
             if _tool_info["history"]:
                 print("⚠️ [Studio] 历史含函数调用往返，已降级为文本观测发送"
                       "（语义会有损；需要完整函数调用请切标准模式）。")
-            if request_obj.tool_choice not in (None, "none", "auto"):
+            if _forced_tool_choice:
                 print("⚠️ [Studio] 请求强制指定了工具调用（tool_choice），本通道无法满足，已忽略。")
-            # 丢掉声明：下游一律按普通对话构建载荷
+            # 丢掉声明和强制选择：下游按普通对话构建载荷（搜索映射除外）。
             request_obj = request_obj.model_copy(update={"tools": None, "tool_choice": None})
 
         # ===== 3. 解析模型名 =====
@@ -956,7 +945,7 @@ class CookieProxyUpstream(BaseUpstream):
         prefill_text = ""
         prefill_active = False
         # 控制台注入（轻量前端用；两个字段都留空时是空操作）。
-        # 本通道入口已拒绝工具流量，故 has_tools 恒为 False。
+        # 本通道入口已将工具流量安全降级，故 has_tools 恒为 False。
         _inj_settings = app_state.get_effective_settings(base_model_name)
         _injected, _inj_notes = apply_console_injection(
             request_obj.messages,
