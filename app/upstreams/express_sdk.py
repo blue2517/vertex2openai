@@ -17,10 +17,11 @@ from api_helpers import (
 )
 from message_processing import (create_gemini_prompt, apply_prefill_compat,
                                 apply_console_injection, DEFAULT_IMAGE_PREFILL_NUDGE)
-from http_options import get_http_options
+from http_options import get_http_options, should_use_priority_paygo
 import model_capabilities as mc
 from runtime_state import app_state
 import config as app_config
+from schema_validation import SchemaValidationError, validate_request_schemas
 
 LEGACY_EXPRESS_PREFIX = "[EXPRESS] "
 LEGACY_PAY_PREFIX = "[PAY]"
@@ -179,6 +180,14 @@ class ExpressSDKUpstream(BaseUpstream):
     封装了原有的多密钥切匙、代理挂载以及 SDK 运行时调用
     """
     async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request):
+        try:
+            validate_request_schemas(request_obj)
+        except SchemaValidationError as exc:
+            return JSONResponse(
+                status_code=400,
+                content=create_openai_error_response(400, str(exc), "invalid_request_error"),
+            )
+
         express_key_manager_instance = fastapi_request.app.state.express_key_manager
 
         base_model_name, is_grounded_search, model_error = _normalize_model_name(request_obj.model)
@@ -207,13 +216,23 @@ class ExpressSDKUpstream(BaseUpstream):
             )
 
         _, express_api_key = key_tuple
+        _inj_settings = app_state.get_effective_settings(base_model_name)
+        model_to_call = resolve_express_model_path(base_model_name, _inj_settings)
+        priority_paygo = should_use_priority_paygo(model_to_call)
+
         client_to_use = genai.Client(
             vertexai=True,
             api_key=express_api_key,
-            http_options=get_http_options(),
+            http_options=get_http_options(priority_paygo=priority_paygo),
         )
         _log_resolved_endpoint(client_to_use)
         print(f"🌐 [上游端点] 使用官方 Gemini Express Mode SDK 调用模型 {base_model_name}。")
+        if model_to_call != base_model_name:
+            print(f"🌐 [上游端点] 已钉定 location：{model_to_call}")
+        if priority_paygo:
+            print("🚦 [流量等级] global 请求已附加 Priority PayGo 请求头；实际是否命中以上游 traffic_type 为准。")
+        else:
+            print("ℹ️ [流量等级] 当前未钉定 global，使用普通请求。")
 
         profile = mc.get_profile(base_model_name)
         is_image_model = profile["is_image"]
@@ -226,7 +245,6 @@ class ExpressSDKUpstream(BaseUpstream):
         prefill_active = False
         # 控制台注入（轻量前端用；两个字段都留空时是空操作）。
         # 必须在 apply_prefill_compat 之前，注入后的消息与前端自发预填充同形。
-        _inj_settings = app_state.get_effective_settings(base_model_name)
         _injected, _inj_notes = apply_console_injection(
             request_obj.messages,
             system_text=_inj_settings.get("inject_system_instruction", ""),
@@ -268,10 +286,12 @@ class ExpressSDKUpstream(BaseUpstream):
         if thinking_config:
             gen_config_dict["thinking_config"] = thinking_config
 
-        if is_grounded_search and not is_image_model:
+        _tools_disabled = isinstance(request_obj.tool_choice, str) and request_obj.tool_choice.lower() == "none"
+        if is_grounded_search and not _tools_disabled:
             search_tool = {"google_search": {}}
             if "tools" in gen_config_dict and isinstance(gen_config_dict["tools"], list):
-                gen_config_dict["tools"].append(search_tool)
+                if search_tool not in gen_config_dict["tools"]:
+                    gen_config_dict["tools"].append(search_tool)
             else:
                 gen_config_dict["tools"] = [search_tool]
             print(f"🔎 [搜索增强] 已为模型 {base_model_name} 启用 Google Search 工具。")
@@ -287,15 +307,17 @@ class ExpressSDKUpstream(BaseUpstream):
                              "response_modalities", "image_config")}
             print(f"🔎 [出站调试] Express 通道 生成参数={_dbg}")
 
-        # location 钉定：按控制台设置决定是发裸模型名（后端自行路由）还是完整资源路径
-        model_to_call = resolve_express_model_path(base_model_name, _inj_settings)
-        if model_to_call != base_model_name:
-            print(f"🌐 [上游端点] 已钉定 location：{model_to_call}")
-
         return await execute_gemini_call(
             client_to_use, model_to_call, prompt_func, gen_config_dict, request_obj,
             fastapi_request=fastapi_request, prefill_text=prefill_text,
             # 钉定路径万一不对（Project ID 与 Key 不同项目、该区域没有此模型），
-            # 自动退回裸模型名重试一次 = 回到旧行为，不会比不钉定更糟。
+            # 自动退回裸模型名重试一次，并改用不带 Priority 请求头的普通客户端。
             fallback_model=(base_model_name if model_to_call != base_model_name else None),
+            fallback_client_factory=(
+                lambda: genai.Client(
+                    vertexai=True,
+                    api_key=express_api_key,
+                    http_options=get_http_options(priority_paygo=False),
+                )
+            ) if priority_paygo else None,
         )

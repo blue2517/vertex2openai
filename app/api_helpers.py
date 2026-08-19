@@ -323,8 +323,17 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
             image_config_args["aspect_ratio"] = target_ar
 
         config["image_config"] = types.ImageConfig(**image_config_args)
-        # 生图模型不支持函数调用（官方明确）：丢弃 function_declarations，仅保留搜索
-        tools_list = [{"google_search": {}}]
+        # 生图模型不支持自定义函数调用；只有客户端明确声明搜索工具时才保留
+        # google_search。普通生图请求与 tool_choice=none 都不得偷偷启用搜索。
+        _search_names = {"google_search", "googlesearch", "web_search", "websearch", "search"}
+        _declared_search = any(
+            str(((tool.get("function") or {}).get("name") or "")).lower() in _search_names
+            for tool in (request.tools or []) if isinstance(tool, dict)
+        )
+        _tools_disabled = isinstance(request.tool_choice, str) and request.tool_choice.lower() == "none"
+        tools_list = ([{"google_search": {}}]
+                      if _declared_search and not _tools_disabled and profile.get("supports_search")
+                      else [])
 
         # 生图不支持的键（采样类由 sanitize 统一剥离，这里清理其余）
         for key in ["response_mime_type", "response_schema", "response_logprobs", "logprobs"]:
@@ -352,6 +361,7 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
         if isinstance(choice, str):
             if choice == "none": mode = "NONE"
             elif choice == "auto": mode = "AUTO"
+            elif choice == "required": mode = "ANY"
         elif isinstance(choice, dict) and choice.get("type") == "function":
             func_name = choice.get("function", {}).get("name")
             if func_name:
@@ -379,11 +389,13 @@ def _extract_usage(resp: Any) -> tuple[int, int, int]:
 
 
 def _record_usage(resp: Any) -> dict:
-    """记录 token 用量并打印。
+    """记录 token 用量，并打印上游实际返回的流量等级。"""
+    usage_metadata = getattr(resp, "usage_metadata", None)
+    traffic_type = getattr(usage_metadata, "traffic_type", None) if usage_metadata else None
+    if traffic_type:
+        value = getattr(traffic_type, "value", None) or str(traffic_type)
+        print(f"🚦 [流量等级] 上游实际 traffic_type={value}")
 
-    P1-5：直接调 stats.add_tokens()，不再让 logger 用正则从日志文本里反解——
-    那种做法与中文文案强耦合，改一个字就静默失效。
-    """
     p_tk, c_tk, t_tk = _extract_usage(resp)
     if p_tk or c_tk:
         stats.add_tokens(p_tk, c_tk)
@@ -436,16 +448,49 @@ class ToolCallIndexer:
 
     def __init__(self):
         self._next: Dict[int, int] = {}
+        self._seen_tool_calls: set[int] = set()
+        self._ordinary_parts: Dict[int, list] = {}
+        self._part_order: Dict[int, list] = {}
 
     def next_index(self, candidate_index: int = 0) -> int:
         i = self._next.get(candidate_index, 0)
         self._next[candidate_index] = i + 1
+        self._seen_tool_calls.add(candidate_index)
         return i
+
+    def record_tool_call(self, candidate_index: int, tool_index: int) -> None:
+        self._part_order.setdefault(candidate_index, []).append(
+            {"type": "tool_call", "index": tool_index})
+
+    def record_ordinary_part(self, candidate_index: int, metadata: dict) -> int:
+        items = self._ordinary_parts.setdefault(candidate_index, [])
+        index = len(items)
+        items.append(metadata)
+        self._part_order.setdefault(candidate_index, []).append(
+            {"type": "ordinary", "index": index})
+        return index
+
+    def topology(self, candidate_index: int = 0) -> tuple[list, list]:
+        return (
+            list(self._ordinary_parts.get(candidate_index, [])),
+            list(self._part_order.get(candidate_index, [])),
+        )
+
+    def has_tool_calls(self, candidate_index: int = 0) -> bool:
+        return candidate_index in self._seen_tool_calls
 
 
 def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candidate_index: int = 0,
                             indexer: Optional[ToolCallIndexer] = None) -> str:
-    from message_processing import parse_gemini_response_for_reasoning_and_content, build_tool_call_id
+    from message_processing import (
+        parse_gemini_response_for_reasoning_and_content,
+        build_tool_call_id,
+        thought_signature_extra,
+        ordinary_part_metadata,
+        _convert_image_to_markdown,
+        _signature_bytes,
+    )
+    from signature_store import SignatureState
     delta_payload = {}
     openai_finish_reason = None
 
@@ -461,44 +506,117 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
             elif raw_gemini_finish_reason_str == "SAFETY": openai_finish_reason = "content_filter"
             elif raw_gemini_finish_reason_str in ["TOOL_CODE", "FUNCTION_CALL"]: openai_finish_reason = "tool_calls"
 
-        # 遍历**全部** parts 收集并行函数调用，不再遇到第一个就 break
+        # Collect every parallel call and keep signatures on their exact tool-call
+        # deltas. Message-level signatures cover ordinary/signature-only Parts.
         tool_call_deltas = []
+        ordinary_metadata = []
+        part_order = []
+        ordinary_signature = None
+        ordinary_signature_kind = None
         if hasattr(candidate, "content") and hasattr(candidate.content, "parts") and candidate.content.parts:
             for part in candidate.content.parts:
                 fc = getattr(part, "function_call", None)
+                sig = _signature_bytes(part, fc)
                 if fc is None:
+                    text_value = getattr(part, "text", None)
+                    if text_value is None and getattr(part, "inline_data", None) is not None:
+                        inline = part.inline_data
+                        text_value = _convert_image_to_markdown(inline.data, inline.mime_type)
+                    elif text_value is None and getattr(part, "file_data", None) is not None:
+                        text_value = f"![Image]({part.file_data.file_uri})"
+                    text_value = "" if text_value is None else str(text_value)
+                    if getattr(part, "thought", None) is True:
+                        kind = "thought"
+                    elif text_value == "" and sig:
+                        kind = "signature_only"
+                    else:
+                        kind = "text"
+                    metadata = ordinary_part_metadata(kind, text_value, sig)
+                    if indexer:
+                        ordinary_index = indexer.record_ordinary_part(candidate_index, metadata)
+                    else:
+                        ordinary_index = len(ordinary_metadata)
+                    part_order.append({"type": "ordinary", "index": ordinary_index})
+                    ordinary_metadata.append(metadata)
+                    if sig:
+                        ordinary_signature = sig
+                        ordinary_signature_kind = kind
                     continue
                 tc_index = indexer.next_index(candidate_index) if indexer else len(tool_call_deltas)
-                tool_call_deltas.append({
+                tc = {
                     "index": tc_index,
-                    "id": build_tool_call_id(fc, part),
+                    "id": build_tool_call_id(
+                        fc, part,
+                        missing_state=(SignatureState.UNSIGNED_FOLLOWER
+                                       if tc_index > 0 else SignatureState.UNKNOWN)),
                     "type": "function",
                     "function": {
                         "name": fc.name,
                         "arguments": json.dumps(fc.args) if fc.args is not None else "",
                     },
-                })
+                }
+                extra = thought_signature_extra(sig)
+                if extra:
+                    tc["extra_content"] = extra
+                part_order.append({"type": "tool_call", "index": tc_index})
+                if indexer:
+                    indexer.record_tool_call(candidate_index, tc_index)
+                tool_call_deltas.append(tc)
+
+        # Google often emits the functionCall in one chunk and a final STOP in a
+        # later empty chunk. Once this candidate has produced any tool call, the
+        # OpenAI finish reason for that turn must remain tool_calls.
+        if (openai_finish_reason == "stop" and indexer
+                and indexer.has_tool_calls(candidate_index)):
+            openai_finish_reason = "tool_calls"
 
         if tool_call_deltas:
             delta_payload["tool_calls"] = tool_call_deltas
+
+        reasoning_text, normal_text = parse_gemini_response_for_reasoning_and_content(candidate)
+
+        # Only append safety ratings to the final chunk.
+        if (openai_finish_reason and _safety_score_enabled()
+                and hasattr(candidate, "safety_ratings") and candidate.safety_ratings):
+            normal_text += _create_safety_ratings_html(candidate.safety_ratings)
+
+        if reasoning_text:
+            delta_payload["reasoning_content"] = reasoning_text
+        if normal_text:
+            delta_payload["content"] = normal_text
+        elif tool_call_deltas:
             delta_payload["content"] = None
+        elif not reasoning_text and openai_finish_reason is None:
+            delta_payload["content"] = ""
 
-        if not tool_call_deltas:
-            reasoning_text, normal_text = parse_gemini_response_for_reasoning_and_content(candidate)
+        google_extra = {}
+        if indexer:
+            metadata_to_emit, order_to_emit = indexer.topology(candidate_index)
+        else:
+            metadata_to_emit, order_to_emit = ordinary_metadata, part_order
 
-            # 只在**最后一个** chunk 附安全分：上游每个 chunk 都带 safetyRatings，
-            # 逐块追加会把同一份评分重复插进正文里。同样一律进正文，不进思考字段。
-            # openai_finish_reason 只在**最后一块**才有值——上游每个 chunk 都带
-            # safetyRatings，逐块追加会把同一份评分重复插进正文里。
-            if (openai_finish_reason and _safety_score_enabled()
-                    and hasattr(candidate, "safety_ratings") and candidate.safety_ratings):
-                normal_text += _create_safety_ratings_html(candidate.safety_ratings)
-
-            if reasoning_text: delta_payload["reasoning_content"] = reasoning_text
-            if normal_text: 
-                delta_payload["content"] = normal_text
-            elif not reasoning_text and not delta_payload.get("tool_calls") and openai_finish_reason is None:
-                delta_payload["content"] = ""
+        # Emit cumulative topology on every later chunk (including the final STOP)
+        # so standard OpenAI SSE aggregation—which replaces extension objects—keeps
+        # the complete cross-chunk Part order and every ordinary signature.
+        cumulative_signature = None
+        cumulative_signature_kind = None
+        for item in reversed(metadata_to_emit):
+            if item.get("thought_signature"):
+                cumulative_signature = item["thought_signature"]
+                cumulative_signature_kind = item.get("kind")
+                break
+        if cumulative_signature:
+            google_extra["thought_signature"] = cumulative_signature
+            google_extra["thought_signature_part"] = cumulative_signature_kind
+        elif ordinary_signature:
+            google_extra.update((thought_signature_extra(
+                ordinary_signature, ordinary_signature_kind) or {}).get("google", {}))
+        if metadata_to_emit:
+            google_extra["ordinary_parts"] = metadata_to_emit
+        if order_to_emit:
+            google_extra["part_order"] = order_to_emit
+        if google_extra:
+            delta_payload["extra_content"] = {"google": google_extra}
     
     if not delta_payload and openai_finish_reason is None:
         delta_payload["content"] = ""
@@ -533,53 +651,56 @@ async def _chunk_openai_response_dict_for_sse(
         message = choice.get("message", {})
         final_finish_reason = choice.get("finish_reason", "stop")
 
-        if message.get("tool_calls"):
-            tool_calls_list = message.get("tool_calls", [])
-            for tc_item_idx, tool_call_item in enumerate(tool_calls_list):
-                delta_tc_start = {
-                    "tool_calls": [{
-                        "index": tc_item_idx, 
-                        "id": tool_call_item["id"],
-                        "type": "function",
-                        "function": {"name": tool_call_item["function"]["name"], "arguments": ""}
-                    }]
-                }
-                yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': delta_tc_start, 'finish_reason': None}]})}\n\n"
-                await asyncio.sleep(0.01) 
+        def _sse(delta):
+            payload = {"id": resp_id, "object": "chat.completion.chunk", "created": created_time,
+                       "model": model_name, "choices": [{"index": choice_idx, "delta": delta,
+                                                           "finish_reason": None}]}
+            return f"data: {json.dumps(payload)}\n\n"
 
-                delta_tc_args = {
-                    "tool_calls": [{
-                        "index": tc_item_idx,
-                        "id": tool_call_item["id"], 
-                        "function": {"arguments": tool_call_item["function"]["arguments"]}
-                    }]
-                }
-                yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': delta_tc_args, 'finish_reason': None}]})}\n\n"
-                await asyncio.sleep(0.01)
-        
-        elif message.get("content") is not None or message.get("reasoning_content") is not None : 
-            reasoning_content = message.get("reasoning_content", "")
-            actual_content = message.get("content") 
+        # A response may legitimately mix thoughts, visible text, tool calls and
+        # message-level signature metadata in the same assistant turn. Emit each
+        # independently instead of the old mutually-exclusive tool/text branches.
+        if message.get("extra_content") is not None:
+            yield _sse({"extra_content": message["extra_content"]})
 
-            if reasoning_content:
-                delta_reasoning = {"reasoning_content": reasoning_content}
-                yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': delta_reasoning, 'finish_reason': None}]})}\n\n"
-                if actual_content is not None: await asyncio.sleep(0.01)
+        reasoning_content = message.get("reasoning_content", "")
+        actual_content = message.get("content")
+        if reasoning_content:
+            yield _sse({"reasoning_content": reasoning_content})
+            await asyncio.sleep(0.01)
 
-            content_to_chunk = actual_content if actual_content is not None else ""
-            if actual_content is not None:
-                # 【回滚】：恢复原版图片传输方案（一次性全量发送），彻底拯救前端解析器不卡死
-                if "![Image](data:image/" in content_to_chunk:
-                    chunk_size = max(1, len(content_to_chunk))
-                else:
-                    chunk_size = max(1, math.ceil(len(content_to_chunk) / 10)) if content_to_chunk else 1
+        if actual_content is not None:
+            content_to_chunk = actual_content
+            # Keep generated images whole; chunk ordinary text for fake-stream UX.
+            if "![Image](data:image/" in content_to_chunk:
+                chunk_size = max(1, len(content_to_chunk))
+            else:
+                chunk_size = max(1, math.ceil(len(content_to_chunk) / 10)) if content_to_chunk else 1
+            if not content_to_chunk and not reasoning_content:
+                yield _sse({"content": ""})
+            else:
+                for i in range(0, len(content_to_chunk), chunk_size):
+                    yield _sse({"content": content_to_chunk[i:i + chunk_size]})
+                    if len(content_to_chunk) > chunk_size:
+                        await asyncio.sleep(0.01)
 
-                if not content_to_chunk and not reasoning_content : 
-                    yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': {'content': ''}, 'finish_reason': None}]})}\n\n"
-                else:
-                    for i in range(0, len(content_to_chunk), chunk_size):
-                        yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': {'content': content_to_chunk[i:i+chunk_size]}, 'finish_reason': None}]})}\n\n"
-                        if len(content_to_chunk) > chunk_size: await asyncio.sleep(0.01)
+        for tc_item_idx, tool_call_item in enumerate(message.get("tool_calls") or []):
+            tool_delta = {
+                "index": tc_item_idx,
+                "id": tool_call_item["id"],
+                "type": "function",
+                "function": {"name": tool_call_item["function"]["name"], "arguments": ""},
+            }
+            if tool_call_item.get("extra_content") is not None:
+                tool_delta["extra_content"] = tool_call_item["extra_content"]
+            yield _sse({"tool_calls": [tool_delta]})
+            await asyncio.sleep(0.01)
+            yield _sse({"tool_calls": [{
+                "index": tc_item_idx,
+                "id": tool_call_item["id"],
+                "function": {"arguments": tool_call_item["function"]["arguments"]},
+            }]})
+            await asyncio.sleep(0.01)
         
         yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': {}, 'finish_reason': final_finish_reason}]})}\n\n"
 
@@ -797,7 +918,18 @@ async def execute_gemini_call(
     fastapi_request: Optional[Any] = None,
     prefill_text: str = "",
     fallback_model: Optional[str] = None,
+    fallback_client_factory: Optional[Callable[[], Any]] = None,
 ):
+    fallback_client = None
+
+    def _get_fallback_client():
+        nonlocal fallback_client
+        if fallback_client_factory is None:
+            return current_client
+        if fallback_client is None:
+            fallback_client = fallback_client_factory()
+        return fallback_client
+
     # P1-2：prompt 构建内部有远程图片下载与 PIL 压缩（同步阻塞），
     # 放到线程里执行，避免卡住整个事件循环。
     actual_prompt_for_call = await asyncio.to_thread(prompt_func, request_obj.messages)
@@ -828,9 +960,8 @@ async def execute_gemini_call(
         else: # True Streaming
             response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
             async def _gemini_real_stream_generator_inner():
-                # 钉定失败要在这里改写模型名，必须声明 nonlocal，
-                # 否则赋值会把 model_to_call 变成局部变量 → 前面的读取直接 UnboundLocalError。
-                nonlocal model_to_call
+                # 钉定失败要在这里改写模型名与客户端，必须声明 nonlocal。
+                nonlocal model_to_call, current_client
                 max_retries, backoff_sec = get_retry_settings()
                 has_yielded = False  # 是否已向客户端输出过内容
                 # 立即吐一个 SSE 心跳，尽快建立连接（429 重试期间也保活，防前端超时中断）
@@ -917,6 +1048,8 @@ async def execute_gemini_call(
                                   "如持续出现，请确认「通道与凭证」里的 Project ID 属于该 API Key 且已开启计费，"
                                   "或把「标准模式 location」设为“默认（后端自选）”。")
                             model_to_call = fallback_model
+                            current_client = _get_fallback_client()
+                            print("ℹ️ [流量等级] 回退默认路由已使用普通请求。")
                             continue
 
                         # 关键修复：只有在“尚未向客户端输出任何内容”时才重试；
@@ -986,6 +1119,8 @@ async def execute_gemini_call(
                           "如持续出现，请确认「通道与凭证」里的 Project ID 属于该 API Key 且已开启计费，"
                           "或把「标准模式 location」设为“默认（后端自选）”。")
                     model_to_call = fallback_model
+                    current_client = _get_fallback_client()
+                    print("ℹ️ [流量等级] 回退默认路由已使用普通请求。")
                     continue
                 if is_retryable_exception(e_call) and attempt < max_retries:
                     stats.add_retry()

@@ -35,6 +35,12 @@ class OpenAIMessage(BaseModel):
     name: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
     tool_call_id: str | None = None
+    reasoning_content: str | None = None
+    # Google documents this OpenAI-compatible extension as the primary carrier
+    # for thought signatures on messages and individual tool calls.
+    extra_content: dict[str, Any] | None = None
+
+    model_config = ConfigDict(extra='allow')
 
 class OpenAIRequest(BaseModel):
     model: str

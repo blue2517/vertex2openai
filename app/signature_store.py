@@ -1,57 +1,78 @@
-"""思考签名（thought signature）旁路缓存。
+"""Short-lived fallback storage for Gemini thought-signature topology.
 
-背景（官方文档，核对于 2026-07-26）：
-- 签名可以出现在任意 content part 上（text / functionCall）。
-- **函数调用是强校验**：Gemini 3 拿不到签名直接 400。
-- 纯文本不强校验，但省略会降低推理质量。
-- 实在拿不到签名时，可把 thought_signature 设为 `skip_thought_signature_validator`
-  跳过校验，官方明确这是最后手段、会损害模型表现。
+OpenAI-compatible responses carry signatures in ``extra_content.google``. This
+store is deliberately only a fallback for clients that strip that extension. A
+record has three possible states because ``None`` alone is ambiguous:
 
-旧实现把 base64 签名直接拼进 OpenAI 的 `tool_call_id`
-（`{id}__thought__{base64}`）。签名通常几百到上千字符，很多前端对 tool_call_id
-有长度限制或会截断，一旦截断回传时就解不出签名 → 400，且没有任何降级路径。
-
-现在的策略是三层：
-  1. 出站时生成短 id（≤40 字符），签名存进这里的 TTL LRU；回传时按 id 取回。
-  2. 缓存未命中时，仍尝试解析旧的 `__thought__` 内嵌格式（向后兼容历史会话）。
-  3. 都拿不到时，用官方哨兵值跳过校验，保证请求不会整体失败。
-
-局限：仅进程内有效。多 worker 或重启后落到第 2/3 层。
-这是有意的取舍——把签名持久化到磁盘意味着把模型内部状态落盘，收益不抵复杂度。
+* ``SIGNED``: this exact function-call part carried a signature.
+* ``UNSIGNED_FOLLOWER``: this was a later call in a parallel batch and must stay
+  unsigned when replayed.
+* ``UNKNOWN``: signature topology was lost; validation may need the documented
+  skip sentinel for the first call of a step.
 """
 
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
+from enum import Enum
 from typing import Optional
 
-# 官方允许的跳过校验哨兵值（会降低模型表现，仅作最后手段）
 SKIP_VALIDATOR_SENTINEL = b"skip_thought_signature_validator"
 
-DEFAULT_TTL_SECONDS = 2 * 60 * 60   # 2 小时：远长于一轮工具往返，远短于无限增长
+DEFAULT_TTL_SECONDS = 2 * 60 * 60
 DEFAULT_MAX_ENTRIES = 5000
 
 
+class SignatureState(str, Enum):
+    SIGNED = "signed"
+    UNSIGNED_FOLLOWER = "unsigned_follower"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class SignatureRecord:
+    state: SignatureState
+    signature: Optional[bytes] = None
+
+    def __post_init__(self) -> None:
+        if self.state is SignatureState.SIGNED and not self.signature:
+            raise ValueError("signed signature records require signature bytes")
+        if self.state is not SignatureState.SIGNED and self.signature is not None:
+            raise ValueError("unsigned/unknown signature records cannot carry bytes")
+
+
 class SignatureStore:
-    """tool_call_id -> thought_signature 的短期缓存（线程安全）。"""
+    """Thread-safe tool_call_id -> :class:`SignatureRecord` TTL/LRU cache."""
 
     def __init__(self, ttl_seconds: int = DEFAULT_TTL_SECONDS,
                  max_entries: int = DEFAULT_MAX_ENTRIES):
         self._ttl = ttl_seconds
         self._max = max_entries
         self._lock = threading.Lock()
-        self._data: "OrderedDict[str, tuple[float, bytes]]" = OrderedDict()
+        self._data: "OrderedDict[str, tuple[float, SignatureRecord]]" = OrderedDict()
 
-    def put(self, call_id: str, signature: Optional[bytes]) -> None:
-        if not call_id or not signature:
+    def put_record(self, call_id: str, record: SignatureRecord) -> None:
+        if not call_id:
             return
         now = time.time()
         with self._lock:
-            self._data[call_id] = (now, signature)
+            self._data[call_id] = (now, record)
             self._data.move_to_end(call_id)
             self._evict(now)
 
-    def get(self, call_id: str) -> Optional[bytes]:
+    def put(self, call_id: str, signature: Optional[bytes]) -> None:
+        """Backward-compatible signed-record writer."""
+        if signature:
+            self.put_record(call_id, SignatureRecord(SignatureState.SIGNED, signature))
+
+    def put_unsigned_follower(self, call_id: str) -> None:
+        self.put_record(call_id, SignatureRecord(SignatureState.UNSIGNED_FOLLOWER))
+
+    def put_unknown(self, call_id: str) -> None:
+        self.put_record(call_id, SignatureRecord(SignatureState.UNKNOWN))
+
+    def get_record(self, call_id: str) -> Optional[SignatureRecord]:
         if not call_id:
             return None
         now = time.time()
@@ -59,15 +80,21 @@ class SignatureStore:
             item = self._data.get(call_id)
             if item is None:
                 return None
-            ts, sig = item
+            ts, record = item
             if now - ts > self._ttl:
                 self._data.pop(call_id, None)
                 return None
             self._data.move_to_end(call_id)
-            return sig
+            return record
+
+    def get(self, call_id: str) -> Optional[bytes]:
+        """Backward-compatible accessor returning bytes only for signed calls."""
+        record = self.get_record(call_id)
+        if record and record.state is SignatureState.SIGNED:
+            return record.signature
+        return None
 
     def _evict(self, now: float) -> None:
-        """调用方须持锁。先按 TTL 清理，再按容量淘汰最久未用的。"""
         while self._data:
             oldest_key = next(iter(self._data))
             ts, _ = self._data[oldest_key]
@@ -80,12 +107,15 @@ class SignatureStore:
 
     def stats(self) -> dict:
         with self._lock:
-            return {"entries": len(self._data), "ttl_seconds": self._ttl, "max_entries": self._max}
+            states = {state.value: 0 for state in SignatureState}
+            for _, record in self._data.values():
+                states[record.state.value] += 1
+            return {"entries": len(self._data), "ttl_seconds": self._ttl,
+                    "max_entries": self._max, "states": states}
 
     def clear(self) -> None:
         with self._lock:
             self._data.clear()
 
 
-# 单例
 signature_store = SignatureStore()

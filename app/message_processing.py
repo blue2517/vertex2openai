@@ -10,7 +10,12 @@ from typing import List, Dict, Any, Optional, Tuple
 import config as app_config
 import model_capabilities as mc
 from runtime_state import app_state
-from signature_store import signature_store, SKIP_VALIDATOR_SENTINEL
+from signature_store import (
+    signature_store,
+    SKIP_VALIDATOR_SENTINEL,
+    SignatureRecord,
+    SignatureState,
+)
 
 from google.genai import types
 from models import OpenAIMessage, ContentPartText, ContentPartImage, normalize_content_part
@@ -113,51 +118,136 @@ def _signature_bytes(part: Any, fc: Any) -> Optional[bytes]:
     return None
 
 
-def build_tool_call_id(fc: Any, part: Any) -> str:
-    """生成 OpenAI 侧的 tool_call_id，并把思考签名登记进旁路缓存。
+def encode_thought_signature(signature: Optional[bytes]) -> Optional[str]:
+    """Encode SDK signature bytes for the documented OpenAI extension."""
+    if not signature:
+        return None
+    return base64.b64encode(signature).decode("ascii")
 
-    返回**短 id**（≤40 字符）。旧实现把 base64 签名拼进 id，动辄上千字符，
-    很多前端会截断，回传时签名丢失 → 400。
 
-    注意：这里只是不再**生成**旧的内嵌格式，`resolve_tool_call_signature` 仍然
-    **解析**它——升级前发出的 id 可能还留在客户端的对话历史里。
-    """
+def thought_signature_extra(signature: Optional[bytes], part_kind: Optional[str] = None) -> Optional[dict]:
+    encoded = encode_thought_signature(signature)
+    if not encoded:
+        return None
+    google = {"thought_signature": encoded}
+    # Google only standardizes thought_signature. This optional hint lets this
+    # bridge put a message-level signature back on a thought/text/signature-only
+    # Part instead of moving it during OpenAI flattening.
+    if part_kind:
+        google["thought_signature_part"] = part_kind
+    return {"google": google}
+
+
+def _extra_google(value: Any) -> dict:
+    extra = value.get("extra_content") if isinstance(value, dict) else getattr(value, "extra_content", None)
+    return (extra.get("google") or {}) if isinstance(extra, dict) and isinstance(extra.get("google"), dict) else {}
+
+
+def signature_from_extra(value: Any) -> Tuple[Optional[bytes], Optional[str]]:
+    google = _extra_google(value)
+    encoded = google.get("thought_signature")
+    if not encoded:
+        return None, google.get("thought_signature_part")
+    if isinstance(encoded, bytes):
+        return encoded, google.get("thought_signature_part")
+    try:
+        return base64.b64decode(str(encoded), validate=True), google.get("thought_signature_part")
+    except Exception:
+        # Preserve non-base64 callers rather than silently discarding their explicit carrier.
+        return str(encoded).encode("utf-8"), google.get("thought_signature_part")
+
+
+def ordinary_part_metadata(kind: str, text: str, signature: Optional[bytes]) -> dict:
+    item = {"kind": kind, "text": text}
+    encoded = encode_thought_signature(signature)
+    if encoded:
+        item["thought_signature"] = encoded
+    return item
+
+
+def ordinary_parts_from_extra(value: Any) -> Optional[List[types.Part]]:
+    """Restore exact flattened ordinary Part boundaries from bridge metadata."""
+    raw = _extra_google(value).get("ordinary_parts")
+    if not isinstance(raw, list):
+        return None
+    parts: List[types.Part] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return None
+        kind = item.get("kind")
+        text = item.get("text")
+        if kind not in {"text", "thought", "signature_only"} or not isinstance(text, str):
+            return None
+        # Generated images are flattened to markdown in OpenAI content. Let the
+        # normal content path parse them back into inline_data rather than
+        # replaying the data URL as ordinary text.
+        if kind == "text" and "data:image/" in text:
+            return None
+        encoded = item.get("thought_signature")
+        signature = None
+        if encoded:
+            try:
+                signature = base64.b64decode(str(encoded), validate=True)
+            except Exception:
+                signature = str(encoded).encode("utf-8")
+        parts.append(types.Part(
+            text=text,
+            thought=(True if kind == "thought" else None),
+            thought_signature=signature,
+        ))
+    return parts
+
+
+def build_tool_call_id(fc: Any, part: Any,
+                       missing_state: SignatureState = SignatureState.UNKNOWN) -> str:
+    """Return a short OpenAI call id and cache signed/unsigned topology fallback."""
     real_id = getattr(fc, "id", None) or ""
     if not isinstance(real_id, str):
         real_id = str(real_id)
     if not real_id:
-        real_id = "call_" + uuid.uuid4().hex[:16]   # 共 21 字符
+        real_id = "call_" + uuid.uuid4().hex[:16]
 
     sig = _signature_bytes(part, fc)
     if sig:
-        signature_store.put(real_id, sig)
+        signature_store.put_record(real_id, SignatureRecord(SignatureState.SIGNED, sig))
+    elif missing_state is SignatureState.UNSIGNED_FOLLOWER:
+        signature_store.put_unsigned_follower(real_id)
+    else:
+        signature_store.put_unknown(real_id)
     return real_id
 
 
 def resolve_tool_call_signature(tool_call_id: str,
-                                require_signature: bool = False) -> Tuple[str, Optional[bytes]]:
-    """从客户端回传的 tool_call_id 还原 (真实 id, 思考签名)。
+                                require_signature: bool = False,
+                                explicit_signature: Optional[bytes] = None,
+                                explicit_unsigned: bool = False) -> Tuple[str, Optional[bytes]]:
+    """Restore ``(real id, signature)`` with explicit OpenAI metadata first.
 
-    三层降级：旁路缓存 → 旧的 `__thought__` 内嵌格式 → 官方哨兵值。
-    require_signature=True（Gemini 3.x）时绝不返回 None，避免整个请求 400。
+    The skip sentinel is used only for the first call in a required Gemini 3
+    step when neither explicit metadata, the legacy id, nor the fallback store
+    can recover a signature. Explicitly unsigned parallel followers stay bare.
     """
     real_id = tool_call_id or ""
-    sig: Optional[bytes] = None
+    sig: Optional[bytes] = explicit_signature
 
     if LEGACY_THOUGHT_SEP in real_id:
         real_id, _, encoded = real_id.partition(LEGACY_THOUGHT_SEP)
-        try:
-            sig = base64.b64decode(encoded) or None
-        except Exception:
-            sig = None
+        if sig is None:
+            try:
+                sig = base64.b64decode(encoded) or None
+            except Exception:
+                sig = None
 
-    if sig is None:
-        sig = signature_store.get(real_id)
+    record = signature_store.get_record(real_id) if sig is None and not explicit_unsigned else None
+    if sig is None and record and record.state is SignatureState.SIGNED:
+        sig = record.signature
+    is_unsigned_follower = explicit_unsigned or bool(
+        record and record.state is SignatureState.UNSIGNED_FOLLOWER)
 
-    if sig is None and require_signature:
+    if sig is None and require_signature and not is_unsigned_follower:
         sig = SKIP_VALIDATOR_SENTINEL
-        print("⚠️ [工具调用] 未能恢复思考签名（可能被前端截断或服务已重启），"
-              "已使用官方跳过校验哨兵。请求不会失败，但模型表现会下降。")
+        print("⚠️ [工具调用] 必需的思考签名无法恢复，已使用官方跳过校验哨兵。"
+              "请求不会失败，但模型表现可能下降。")
 
     return real_id, sig
 
@@ -552,6 +642,15 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
     print("🔄 [消息转换] 正在将 OpenAI 格式消息转换为 Gemini contents。")
     require_sig = _requires_signature(model_name)
     raw_gemini_messages = []
+    tool_name_by_id = {}
+    for prior in messages:
+        for tool_call in (getattr(prior, "tool_calls", None) or []):
+            call_id = str(tool_call.get("id") or "")
+            call_name = str((tool_call.get("function") or {}).get("name") or "")
+            if call_id and call_name:
+                tool_name_by_id[call_id] = call_name
+                tool_name_by_id[call_id.partition(LEGACY_THOUGHT_SEP)[0]] = call_name
+
     for idx, message in enumerate(messages):
         role = message.role
         if role == "system":
@@ -562,41 +661,37 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
 
         if role == "tool":
             tool_call_id_str = message.tool_call_id or ""
+            real_tool_id = tool_call_id_str.partition(LEGACY_THOUGHT_SEP)[0]
+            function_name = message.name or tool_name_by_id.get(tool_call_id_str) or tool_name_by_id.get(real_tool_id)
 
-            if not message.name:
-                # 没有函数名无法构造规范的 function_response，降级为文本观测
+            if not function_name:
+                # 既没有显式 name，也无法从前面的 assistant.tool_calls 关联时才降级。
                 mock_text = f"[System Observation - Tool Result]:\n{message.content}"
                 parts.append(types.Part.from_text(text=mock_text))
                 current_gemini_role = "user"
             else:
-                # 无论是否带 __thought__ 后缀，都构造规范的 function_response，
-                # 让标准 OpenAI 客户端的工具往返也能正确工作（修复退化为纯文本的问题）。
+                # FunctionResponse is always a Gemini ``user`` Content and never
+                # carries a thought signature. Signatures belong on model Parts.
                 tool_output_data = _coerce_tool_response(message.content)
 
-                # 函数**结果**不需要签名（官方只对 functionCall 强校验），因此不注入哨兵；
-                # 但如果能取回签名就照常带上，保持与上游一致。
-                real_tool_id, thought_sig_bytes = resolve_tool_call_signature(
-                    tool_call_id_str, require_signature=False)
-
-                func_resp_kwargs = {"name": message.name, "response": tool_output_data}
+                func_resp_kwargs = {"name": function_name, "response": tool_output_data}
                 if real_tool_id:
                     func_resp_kwargs["id"] = real_tool_id
 
                 try:
-                    part_kwargs = {"function_response": types.FunctionResponse(**func_resp_kwargs)}
-                    if thought_sig_bytes:
-                        part_kwargs["thought_signature"] = thought_sig_bytes
-                    resp_part = types.Part(**part_kwargs)
+                    resp_part = types.Part(
+                        function_response=types.FunctionResponse(**func_resp_kwargs))
                 except Exception as e:
                     print(f"⚠️ [工具调用] 构造 FunctionResponse 失败，将回退为基础形式：{e}")
-                    resp_part = types.Part.from_function_response(name=message.name, response=tool_output_data)
+                    resp_part = types.Part.from_function_response(name=function_name, response=tool_output_data)
 
                 parts.append(resp_part)
-                current_gemini_role = "function"
+                current_gemini_role = "user"
 
-        elif role == "assistant" and message.tool_calls:
+        elif role in ("assistant", "model") and message.tool_calls:
             current_gemini_role = "model"
-            for tool_call in message.tool_calls:
+            tool_parts = []
+            for tool_index, tool_call in enumerate(message.tool_calls):
                 function_call_data = tool_call.get("function", {})
                 function_name = function_call_data.get("name", "unknown")
                 arguments_str = function_call_data.get("arguments", "{}")
@@ -607,10 +702,16 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                 except json.JSONDecodeError:
                     parsed_arguments = {}
 
-                # 函数**调用**是强校验点：Gemini 3.x 缺签名直接 400，
-                # 因此这里允许降级到官方哨兵，保证请求不会整体失败。
+                explicit_sig, _ = signature_from_extra(tool_call)
+                # One assistant message is one function-calling step: only its
+                # first call requires a signature. Later calls are explicitly
+                # unsigned parallel followers and must not receive sentinels.
                 real_tool_id, thought_sig_bytes = resolve_tool_call_signature(
-                    tool_call_id_str, require_signature=require_sig)
+                    tool_call_id_str,
+                    require_signature=require_sig and tool_index == 0,
+                    explicit_signature=explicit_sig,
+                    explicit_unsigned=tool_index > 0,
+                )
 
                 fc_kwargs = {"name": function_name, "args": parsed_arguments}
                 if real_tool_id:
@@ -624,28 +725,82 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                 except Exception as e:
                     print(f"⚠️ [工具调用] 构造 FunctionCall 失败，将回退为基础形式：{e}")
                     fc_part = types.Part.from_function_call(name=function_name, args=parsed_arguments)
+                tool_parts.append(fc_part)
 
-                parts.append(fc_part)
-
-            if message.content:
-                if isinstance(message.content, str):
+            ordinary_parts = ordinary_parts_from_extra(message)
+            if ordinary_parts is None:
+                ordinary_parts = []
+                reasoning = getattr(message, "reasoning_content", None)
+                if reasoning:
+                    ordinary_parts.append(types.Part(text=reasoning, thought=True))
+                if isinstance(message.content, str) and message.content:
                     image_parts, clean_text = _extract_markdown_images_to_parts(message.content)
-                    if clean_text: parts.append(types.Part.from_text(text=clean_text))
-                    parts.extend(image_parts)
-        else: 
-            if message.content is None: continue
-            
+                    if clean_text:
+                        ordinary_parts.append(types.Part.from_text(text=clean_text))
+                    ordinary_parts.extend(image_parts)
+
+                message_sig, signature_kind = signature_from_extra(message)
+                if message_sig:
+                    target = None
+                    if signature_kind == "thought":
+                        target = next((p for p in reversed(ordinary_parts) if getattr(p, "thought", None)), None)
+                    elif signature_kind == "text":
+                        target = next((p for p in reversed(ordinary_parts)
+                                       if getattr(p, "text", None) is not None and not getattr(p, "thought", None)), None)
+                    if target is None and signature_kind != "signature_only":
+                        target = ordinary_parts[-1] if ordinary_parts else None
+                    if target is not None:
+                        ordinary_parts[ordinary_parts.index(target)] = target.model_copy(
+                            update={"thought_signature": message_sig})
+                    else:
+                        ordinary_parts.append(types.Part(text="", thought_signature=message_sig))
+
+            google_extra = _extra_google(message)
+            part_order = google_extra.get("part_order")
+            if isinstance(part_order, list):
+                ordered, used_tools, used_ordinary = [], set(), set()
+                for item in part_order:
+                    if isinstance(item, dict) and item.get("type") == "tool_call":
+                        i = item.get("index")
+                        if isinstance(i, int) and 0 <= i < len(tool_parts):
+                            ordered.append(tool_parts[i]); used_tools.add(i)
+                    elif isinstance(item, dict) and item.get("type") == "ordinary":
+                        i = item.get("index")
+                        if isinstance(i, int) and 0 <= i < len(ordinary_parts):
+                            ordered.append(ordinary_parts[i]); used_ordinary.add(i)
+                ordered.extend(p for i, p in enumerate(ordinary_parts) if i not in used_ordinary)
+                ordered.extend(p for i, p in enumerate(tool_parts) if i not in used_tools)
+                parts.extend(ordered)
+            else:
+                # Historical behavior emitted calls first. Preserve it unless a
+                # response from this bridge supplies exact part_order metadata.
+                parts.extend(tool_parts)
+                parts.extend(ordinary_parts)
+        else:
+            message_sig, signature_kind = signature_from_extra(message)
+            reasoning = getattr(message, "reasoning_content", None)
+            if message.content is None and not reasoning and not message_sig:
+                continue
+
             current_gemini_role = role
-            if current_gemini_role == "assistant": current_gemini_role = "model"
+            if current_gemini_role in ("assistant", "model"):
+                current_gemini_role = "model"
             if current_gemini_role not in SUPPORTED_ROLES:
                 current_gemini_role = "user"
 
-            if isinstance(message.content, str):
+            exact_ordinary_parts = ordinary_parts_from_extra(message)
+            if exact_ordinary_parts is not None:
+                parts.extend(exact_ordinary_parts)
+
+            if reasoning and exact_ordinary_parts is None:
+                parts.append(types.Part(text=reasoning, thought=True))
+
+            if exact_ordinary_parts is None and isinstance(message.content, str):
                 image_parts, clean_text = _extract_markdown_images_to_parts(message.content)
                 if clean_text: parts.append(types.Part.from_text(text=clean_text))
                 parts.extend(image_parts)
 
-            elif isinstance(message.content, list):
+            elif exact_ordinary_parts is None and isinstance(message.content, list):
                 for part_item in message.content:
                     # F-1：pydantic 会把标准 part 解析成 ContentPartText / ContentPartImage 实例，
                     # 归一成 dict 后只保留一条处理路径（原先 dict 与实例两套分支已出现行为分歧：
@@ -685,6 +840,20 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                                 opt_bytes, opt_mime = optimize_image_bytes(img_bytes, mime_type)
                                 parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
 
+            if message_sig and exact_ordinary_parts is None:
+                target = None
+                if signature_kind == "thought":
+                    target = next((p for p in reversed(parts) if getattr(p, "thought", None)), None)
+                elif signature_kind == "text":
+                    target = next((p for p in reversed(parts)
+                                   if getattr(p, "text", None) is not None and not getattr(p, "thought", None)), None)
+                if target is None and signature_kind != "signature_only":
+                    target = parts[-1] if parts else None
+                if target is None:
+                    parts.append(types.Part(text="", thought_signature=message_sig))
+                else:
+                    parts[parts.index(target)] = target.model_copy(update={"thought_signature": message_sig})
+
         if not parts: continue
         raw_gemini_messages.append(types.Content(role=current_gemini_role, parts=parts))
 
@@ -701,15 +870,25 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                 return False
         return True
 
+    def _is_function_response_only(content: types.Content) -> bool:
+        return bool(content.parts) and all(
+            getattr(p, "function_response", None) is not None for p in content.parts)
+
     merged_messages = []
     for msg in raw_gemini_messages:
         if merged_messages and merged_messages[-1].role == msg.role:
-            # 只有两侧都是纯文本时才插入 "\n\n" 分隔符。
-            # 若两个连续 model 轮次都带 function call，插入文本 part 会打断
-            # 官方要求的 FC 连续排列，可能触发 Malformed_Function_Call 或签名校验失败。
-            if _is_text_only(merged_messages[-1]) and _is_text_only(msg):
-                merged_messages[-1].parts.append(types.Part.from_text(text="\n\n"))
-            merged_messages[-1].parts.extend(msg.parts)
+            previous = merged_messages[-1]
+            previous_is_results = _is_function_response_only(previous)
+            current_is_results = _is_function_response_only(msg)
+            # Parallel tool results are contiguous user Parts. A later fresh
+            # user turn must remain a new Content because it starts a new turn
+            # for Gemini's signature validator.
+            if previous_is_results != current_is_results:
+                merged_messages.append(msg)
+                continue
+            if _is_text_only(previous) and _is_text_only(msg):
+                previous.parts.append(types.Part.from_text(text="\n\n"))
+            previous.parts.extend(msg.parts)
         else:
             merged_messages.append(msg)
 
@@ -1016,39 +1195,77 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
                 elif raw_gemini_finish_reason_str == "SAFETY": openai_finish_reason = "content_filter"
                 elif raw_gemini_finish_reason_str in ["TOOL_CODE", "FUNCTION_CALL"]: openai_finish_reason = "tool_calls"
             
-            function_call_detected = False
-            if hasattr(candidate, "content") and hasattr(candidate.content, "parts") and candidate.content.parts:
-                for part in candidate.content.parts:
-                    if hasattr(part, "function_call") and part.function_call is not None: 
-                        fc = part.function_call
+            parts_in_order = list(getattr(getattr(candidate, "content", None), "parts", None) or [])
+            reasoning_str, normal_content_str = parse_gemini_response_for_reasoning_and_content(candidate)
+            if app_state.get_setting("safety_score", app_config.SAFETY_SCORE) and hasattr(candidate, "safety_ratings") and candidate.safety_ratings:
+                normal_content_str += _create_safety_ratings_html(candidate.safety_ratings)
 
-                        # 统一走 build_tool_call_id：短 id + 签名进旁路缓存
-                        tool_call_id = build_tool_call_id(fc, part)
+            tool_index = 0
+            ordinary_metadata = []
+            order_descriptors = []
+            message_signature = None
+            message_signature_kind = None
+            for part in parts_in_order:
+                fc = getattr(part, "function_call", None)
+                sig = _signature_bytes(part, fc)
+                if fc is not None:
+                    missing_state = (SignatureState.UNSIGNED_FOLLOWER if tool_index > 0
+                                     else SignatureState.UNKNOWN)
+                    tool_call_id = build_tool_call_id(fc, part, missing_state=missing_state)
+                    tool_payload = {
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": fc.name,
+                            "arguments": json.dumps(fc.args or {})
+                        }
+                    }
+                    extra = thought_signature_extra(sig)
+                    if extra:
+                        tool_payload["extra_content"] = extra
+                    message_payload.setdefault("tool_calls", []).append(tool_payload)
+                    order_descriptors.append({"type": "tool_call", "index": tool_index})
+                    tool_index += 1
+                    openai_finish_reason = "tool_calls"
+                    continue
 
-                        if "tool_calls" not in message_payload:
-                            message_payload["tool_calls"] = []
-                        
-                        message_payload["tool_calls"].append({
-                            "id": tool_call_id,
-                            "type": "function",
-                            "function": {
-                                "name": fc.name,
-                                "arguments": json.dumps(fc.args or {})
-                            }
-                        })
-                        message_payload["content"] = None 
-                        openai_finish_reason = "tool_calls" 
-                        function_call_detected = True
-            
-            if not function_call_detected:
-                reasoning_str, normal_content_str = parse_gemini_response_for_reasoning_and_content(candidate)
-                if app_state.get_setting("safety_score", app_config.SAFETY_SCORE) and hasattr(candidate, "safety_ratings") and candidate.safety_ratings:
-                    # 一律附在正文末尾。旧实现"有思考就塞进思考字段"，结果被埋进前端
-                    # 折叠起来的思考区，甚至在剥离思考的配置下整块消失——开了开关却看不到东西。
-                    normal_content_str += _create_safety_ratings_html(candidate.safety_ratings)
-                
+                is_thought = getattr(part, "thought", None) is True
+                text_value = getattr(part, "text", None)
+                if text_value is None and getattr(part, "inline_data", None) is not None:
+                    inline = part.inline_data
+                    text_value = _convert_image_to_markdown(inline.data, inline.mime_type)
+                elif text_value is None and getattr(part, "file_data", None) is not None:
+                    text_value = f"![Image]({part.file_data.file_uri})"
+                text_value = "" if text_value is None else str(text_value)
+                if is_thought:
+                    ordinary_kind = "thought"
+                elif text_value == "" and sig:
+                    ordinary_kind = "signature_only"
+                else:
+                    ordinary_kind = "text"
+                ordinary_index = len(ordinary_metadata)
+                ordinary_metadata.append(ordinary_part_metadata(ordinary_kind, text_value, sig))
+                order_descriptors.append({"type": "ordinary", "index": ordinary_index})
+                if sig:
+                    message_signature = sig
+                    message_signature_kind = ordinary_kind
+
+            if normal_content_str or not message_payload.get("tool_calls"):
                 message_payload["content"] = normal_content_str
-                if reasoning_str: message_payload["reasoning_content"] = reasoning_str
+            else:
+                message_payload["content"] = None
+            if reasoning_str:
+                message_payload["reasoning_content"] = reasoning_str
+
+            if message_signature:
+                message_payload["extra_content"] = thought_signature_extra(
+                    message_signature, message_signature_kind)
+            if ordinary_metadata:
+                google = message_payload.setdefault("extra_content", {}).setdefault("google", {})
+                google["ordinary_parts"] = ordinary_metadata
+            if message_payload.get("tool_calls") and order_descriptors:
+                google = message_payload.setdefault("extra_content", {}).setdefault("google", {})
+                google["part_order"] = order_descriptors
             
             choice_item = {"index": i, "message": message_payload, "finish_reason": openai_finish_reason}
             if hasattr(candidate, "logprobs") and candidate.logprobs is not None: choice_item["logprobs"] = candidate.logprobs

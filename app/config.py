@@ -155,13 +155,6 @@ DEFAULT_SETTINGS = {
     # 钉定失败（项目不匹配/该区域无此模型）会自动退回裸模型名重试一次，见
     # api_helpers.is_location_pin_failure —— 所以这个默认值不会把任何人变糟。
     "express_location": "global",
-    # Cookie(Studio) 通道遇到工具流量时怎么办：
-    #   degrade（默认）= 自动降级：丢掉无法表达的函数声明、照常回复；声明里的搜索类
-    #     工具映射为 Studio 内建 googleSearch；历史里的调用往返渲染成可读文本。
-    #     RikkaHub 这类前端只要模型卡勾了工具就每条请求都带 tools，严格拒绝会让
-    #     Studio 通道彻底不可用，所以默认降级。
-    #   reject = 旧行为，明确 400 并提示改用标准模式（要求函数调用必须真实可用时选它）。
-    "cookie_tool_policy": "degrade",
     # 按模型单独保存的参数覆盖：{ "模型ID": { 键: 值, ... } }
     # 仅覆盖“与模型相关”的参数（见 PER_MODEL_KEYS）；优先级 请求 > 模型专属 > 全局 > 内置。
     "model_overrides": {},

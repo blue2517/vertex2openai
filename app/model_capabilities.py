@@ -32,12 +32,9 @@ SAMPLING_KEYS = {
 # 出处：ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite-image
 #      「1:1, 3:2, 2:3, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9 aspect ratios」（核对于 2026-07-26）
 _PRO_IMAGE_ARS = {"1:1", "3:2", "2:3", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"}
-# 出处：ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-image
-#      「New 1:4, 4:1, 1:8 and 8:1 aspect ratios」（核对于 2026-07-26）
-# 注意：曾经这里还有 "9:21"，但官方文档从未提及该比例。发送不支持的比例会 400，
-#      而不在白名单里只会回退成“由模型决定”（不报错），因此按保守策略移除。
-#      若日后真机验证可用，加回来并在此注明验证日期。
-_FLASH_IMAGE_ARS = _PRO_IMAGE_ARS | {"1:4", "4:1", "1:8", "8:1"}
+# 出处：Agent Platform gemini-3.1-flash-image 模型文档（核对于 2026-08）
+#      Flash Image 在 Pro Image 的 10 种比例外，额外支持 1:4、4:1、1:8、8:1、9:21。
+_FLASH_IMAGE_ARS = _PRO_IMAGE_ARS | {"1:4", "4:1", "1:8", "8:1", "9:21"}
 
 # ---- 思考档位阶梯（由低到高）----
 # 出处：Agent Platform → Get started with Gemini 3（核对于 2026-07-26）
