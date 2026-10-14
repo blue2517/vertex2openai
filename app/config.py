@@ -131,12 +131,6 @@ DEFAULT_SETTINGS = {
     # 采样参数处理：auto=按版本自动判定 / deprecated=强制剥离 / allowed=强制保留。
     # 给"新出的模型版本号更小但已废弃采样"这类情况留的手动出口，免于改代码。
     "sampling_policy": "auto",
-    # 思维链守卫（默认开）：预填充停在未闭合的思维链开标签时（标签名由各人预设决定，
-    # 代理只按"未闭合"这一形状识别，不预设任何具体标签名），
-    # 在续写指令末尾追加一条硬性要求——先写完思维链再闭合标签、然后才写正文。
-    # 背景：预填充只把话头停在开标签上，没有任何一句话要求模型"必须先完成思考"，
-    # 实测模型经常跳过思考直接写正文，前端正则于是抓不到思维链（多数情况没有思维链）。
-    "prefill_cot_guard": True,
     # ===== 标准（Express）模式的 location 钉定（实测有效，见 README“标准模式的 location”）=====
     # 背景：只发裸模型名时，请求走 express 端点格式
     #   https://aiplatform.googleapis.com/v1/publishers/google/models/{model}:generateContent
@@ -184,6 +178,4 @@ PER_MODEL_KEYS = [
     "image_system_instruction",
     "inject_prefill_for_image",
     "sampling_policy",
-    # 思维链守卫按模型分开很自然：只给跑角色扮演预设的模型开。
-    "prefill_cot_guard",
 ]

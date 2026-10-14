@@ -100,7 +100,7 @@ http://localhost:8050
 | **思考档位兜底** | 非法档位一律抬到 `high`（Pro 上选 minimal 反而变 high） | 就近**向下**夹取：Pro 选 minimal → `low` |
 | **`retry_max` 语义** | Express 通道当作总次数，设 0 时一次请求都不发 | 统一为「重试次数」，总请求数 = `retry_max + 1`，设 0 仍请求一次；取值钳到 0–50 |
 | **并行函数调用（流式）** | 只发第一个，`index` 恒为 0 | 全部下发，`index` 跨 chunk 稳定递增 |
-| **思考签名** | base64 拼进 `tool_call_id`（上千字符，易被前端截断） | 主要通过 OpenAI 扩展 `extra_content.google.thought_signature` 原样回传；进程内短期缓存、旧 id 格式与官方 `skip_thought_signature_validator` 哨兵仅作兼容兜底 |
+| **思考签名** | base64 拼进 `tool_call_id`（上千字符，易被前端截断） | 服务端通过 `tool_call_id` 自动缓存与映射，响应体保持纯净 OpenAI 规范（不注入非标字段）；缺失签名时使用官方 `skip_thought_signature_validator` 哨兵兜底 |
 | **Cookie 通道 + 函数调用** | 静默把 `role=tool` 折成 model，发出错乱历史 | 原生下发函数声明，按 `functionCall` / `functionResponse` 回放历史并保留 thought signature |
 | **Cookie 通道输入图** | 不压缩、不支持 http(s) 图片、不解析正文内联图 | 与标准通道一致（压缩开关对两条通道都生效） |
 | **`stop` 字段** | 只接受数组，传字符串 422 | 字符串/数组都接受 |
@@ -113,7 +113,7 @@ http://localhost:8050
 | **2.5 Flash-Lite 思考预算** | 下限按 0 处理 | 下限 512（`0` 仍表示关闭） |
 | **生图比例白名单** | 所有生图模型共用同一套比例 | 按模型分别校验；Flash Image 支持含 `9:21` 在内的扩展比例，Pro Image 使用较小白名单 |
 
-思考签名优先使用请求/响应中的 `extra_content.google` 携带，因此跨进程、多副本部署不依赖本地缓存；旧格式、进程内缓存与跳过校验哨兵仅用于兼容缺失显式签名的客户端。
+思考签名由反代服务内部通过 `tool_call_id` 与短期缓存（`SignatureStore`）自动管理，下游响应保持标准 OpenAI 格式；缺失显式签名时由跳过校验哨兵兼容处理。
 
 ---
 
@@ -150,11 +150,10 @@ http://localhost:8050
     - **关闭原生思考（角色扮演推荐）**：忽略前端 effort，把档位压到该模型最低（3.x=`minimal`、2.5-flash 预算 `0`、2.5-pro `128`），并**不返回思考**。
     - **强制用上方档位**：忽略前端 effort，用你在卡片里选的档位（返回思考）。
   - 🎭 **酒馆预设“卡原生思维链”一键配置**：许多预设把思维链写在 **system 提示**里（不是预填充），并恒发 `reasoning_effort=xhigh`。把"原生思考控制"选 **“关闭原生思考”** 即可（可用"保存为该模型专属"只对 3.6-flash 生效），让预设自己的思维链接管。
-  - ⚠️ **重要（Studio/Cookie 通道实测）**：`batchGraphql` 私有接口**会忽略 `includeThoughts=false`**——即使设了也照样回传思考。因此 Cookie 通道在"关闭原生思考"时会**在响应侧主动剥离思考块**，并**把档位压到 `minimal`**（这才是真正减少原生思考、避免重预设在思考阶段被截断/无正文的关键）。标准（Express）通道由 SDK 原生支持不返回思考。
-  - 🩺 **3.6-flash 在 Studio 只返回思考、无正文（`FINISH_REASON_UNSPECIFIED`）怎么办**：真机定案——这是**原生思考在 HIGH 档跑飞/被截断**（SillyTavern 恒发 `reasoning_effort=xhigh` 覆盖了控制台档位），**不是**安全策略/`HARM_CATEGORY_JAILBREAK` 的问题（已用含/不含 jailbreak 的多组对照验证）。**解决：把"原生思考控制"设为"关闭原生思考"**（对 3.6-flash 用"保存为该模型专属"），即忽略前端 `xhigh`、压到 `minimal` 并剥离原生思考——真机验证可稳定输出正文与预设自带的思维链。仅设"思考档位=minimal"无效，因为会被前端 `xhigh` 覆盖。
+  - 🩺 **3.6-flash 在 Studio 只返回思考、无正文（`FINISH_REASON_UNSPECIFIED`）怎么办**：真机定案——这是**原生思考在 HIGH 档跑飞/被截断**（SillyTavern 恒发 `reasoning_effort=xhigh` 覆盖了控制台档位），**不是**安全策略/`HARM_CATEGORY_JAILBREAK` 的问题（已用含/不含 jailbreak 的多组对照验证）。**解决：把"原生思考控制"设为"关闭原生思考"**（对 3.6-flash 用"保存为该模型专属"），即忽略前端 `xhigh` 并压到 `minimal` 档位。
 - **生图**：剥离全部采样参数；`response_modalities=["TEXT","IMAGE"]`；**两个生图模型比例白名单不同**（pro-image 10 种；flash-image 15 种，含 `1:4/4:1/1:8/8:1/9:21`），控制台按所选模型过滤，后端也会校验，选到不支持的比例会**自动回退为"由模型决定"（不报错）**。
-- **预填充（重要，专为 SillyTavern 等酒馆预设优化）**：Gemini 3.x 拒绝以 `model` 轮次结尾的请求（返回 `Requests ending with a model turn are not supported.`）。代理内置"预填充智能兼容"（`smart`/`minimal`/`off`，默认 `smart`，控制台可切）：
-  - **按模型能力自动选策略**：2.5 及更早模型允许以 model 轮次结尾 → **原生透传**，模型直接续写你的预填充，最忠实；3.x 拒绝 → 自动把末尾 assistant 预填充转成末尾 user 的"续写指令"（模板可在控制台自定义）。两种情况都会把预填充文本**拼回输出开头**，并对模型复述的重叠部分**自动去重**。
+- **预填充（专为 SillyTavern 等酒馆预设优化）**：Gemini 3.x 拒绝以 `model` 轮次结尾的请求（返回 `Requests ending with a model turn are not supported.`）。代理内置"预填充智能兼容"（`smart`/`minimal`/`off`，默认 `smart`，控制台可切）：
+  - **按模型能力自动选策略**：2.5 及更早模型允许以 model 轮次结尾 → **原生透传**，模型直接续写你的预填充；3.x 拒绝 → 自动把末尾 assistant 预填充转成末尾 user 的"续写指令"（模板可在控制台自定义）。
   - **预填充时压制原生思考（"卡思维链"，默认开启）**：酒馆预设通常自带思维链，靠预填充卡掉模型原生思考、让预设的思维链接管。开启后，检测到预填充即把思考压到该模型最低并**不回传思考**：3.x 压到 `minimal`（`pro` 无 minimal 则 `low`，官方规定 3.x 无法完全关闭思考）；2.5-flash 预算设 `0` **完全关闭**、2.5-pro 降到最低 `128`。**单次请求显式传 `reasoning_effort` / `thinking_budget` 时不压制**（请求优先）。可在控制台关闭此开关恢复模型原生思考。
   - **与模型名无关，新模型自动生效**。
 - **新增/未来模型**：按家族/版本模式自动归类；未知/未来型号按"最新代"前向安全处理（自动移除已废弃采样参数、走预填充兼容）。
@@ -216,20 +215,9 @@ Cookie 直连通道会把 OpenAI `tools` 转成 batchGraphql 的原生 `function
 |---|---|
 | 自定义函数声明 | 原生下发；流式与非流式响应都返回 OpenAI `tool_calls` |
 | 声明里含搜索类工具（`google_search` / `web_search` 等） | 映射为 Studio 内建 `googleSearch`。实机确认 batchGraphql 不允许它与自定义函数混用：混合 AUTO/required 请求优先自定义函数并忽略搜索；显式强制搜索时只发送 `googleSearch` |
-| 历史里的 assistant `tool_calls` | 回放为 role=`model` 的 `functionCall` Parts，并从 `extra_content` 或短期缓存恢复 thought signature |
+| 历史里的 assistant `tool_calls` | 回放为 role=`model` 的 `functionCall` Parts，并从短期缓存或上下文恢复 thought signature |
 | 连续的 role=`tool` 结果 | 按 `tool_call_id` 关联函数名，合并为 role=`user` 的 `functionResponse` Parts；并行顺序为 FC1, FC2, FR1, FR2 |
 | 模型或协议明确拒绝原生函数 Schema | 仅本次固定降级为文本工具观测并重试一次；没有用户可见策略开关，也不会恢复旧版严格拒绝路径 |
-
----
-
-## 思维链守卫（`prefill_cot_guard`，默认开）
-
-针对「**预填充确实卡掉了原生思维链，但预设自己的思维链也经常不写、直接出正文**」：
-
-- **成因**：预填充只是把话头停在你预设自己的**未闭合思维链开标签**上，请求里**没有任何一句话**告诉模型"接下来必须先完成思考再写正文"。模型于是常常跨过思考直接写正文，输出里只剩一个孤立开标签，前端正则自然抓不到思维链。
-- **做法**：自动识别预填充里未闭合的标签名（**不预设任何具体标签**，只按"开了没闭合"这一形状匹配，`<thinking>`、`<CoT>`、`<plan_1>`、`<分析~>` 之类自定义标签都能识别），在续写指令**末尾**（即模型最后读到的位置）追加一条硬性要求：先逐条写完该标签内的思考 → 用对应闭合标签收尾 → 然后才写正文，且不允许空标签。`smart` 与 `keep_turn` 两种模式都生效。
-- **无副作用**：预填充里没有未闭合标签时（普通句子），本项什么都不做；生图模型不适用；可按模型单独开关。
-- **仍不稳定时的对照实验**：把「原生思考控制」从 **关闭原生思考** 改成 **强制用上方档位 + `low`** 再测一轮。把档位压到 `minimal` 会把模型推向"直接给答案"的行为，**有可能连带跳过预设要求的长思维链**；`low` 保留一点推理惯性、同时仍显著少于默认档。这一条是机理推断，请以你自己的 A/B 结果为准。
 
 ---
 

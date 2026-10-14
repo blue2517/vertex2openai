@@ -14,8 +14,6 @@ from message_processing import (
     convert_to_openai_format,
     extract_reasoning_by_tags,
     _create_safety_ratings_html,
-    strip_prefill_overlap,
-    PrefillDeduper,
 )
 import config as app_config
 from config import VERTEX_REASONING_TAG
@@ -469,8 +467,6 @@ class ToolCallIndexer:
     def __init__(self):
         self._next: Dict[int, int] = {}
         self._seen_tool_calls: set[int] = set()
-        self._ordinary_parts: Dict[int, list] = {}
-        self._part_order: Dict[int, list] = {}
 
     def next_index(self, candidate_index: int = 0) -> int:
         i = self._next.get(candidate_index, 0)
@@ -479,22 +475,7 @@ class ToolCallIndexer:
         return i
 
     def record_tool_call(self, candidate_index: int, tool_index: int) -> None:
-        self._part_order.setdefault(candidate_index, []).append(
-            {"type": "tool_call", "index": tool_index})
-
-    def record_ordinary_part(self, candidate_index: int, metadata: dict) -> int:
-        items = self._ordinary_parts.setdefault(candidate_index, [])
-        index = len(items)
-        items.append(metadata)
-        self._part_order.setdefault(candidate_index, []).append(
-            {"type": "ordinary", "index": index})
-        return index
-
-    def topology(self, candidate_index: int = 0) -> tuple[list, list]:
-        return (
-            list(self._ordinary_parts.get(candidate_index, [])),
-            list(self._part_order.get(candidate_index, [])),
-        )
+        self._seen_tool_calls.add(candidate_index)
 
     def has_tool_calls(self, candidate_index: int = 0) -> bool:
         return candidate_index in self._seen_tool_calls
@@ -505,10 +486,6 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
     from message_processing import (
         parse_gemini_response_for_reasoning_and_content,
         build_tool_call_id,
-        thought_signature_extra,
-        ordinary_part_metadata,
-        _convert_image_to_markdown,
-        _signature_bytes,
     )
     from signature_store import SignatureState
     delta_payload = {}
@@ -526,41 +503,11 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
             elif raw_gemini_finish_reason_str == "SAFETY": openai_finish_reason = "content_filter"
             elif raw_gemini_finish_reason_str in ["TOOL_CODE", "FUNCTION_CALL"]: openai_finish_reason = "tool_calls"
 
-        # Collect every parallel call and keep signatures on their exact tool-call
-        # deltas. Message-level signatures cover ordinary/signature-only Parts.
         tool_call_deltas = []
-        ordinary_metadata = []
-        part_order = []
-        ordinary_signature = None
-        ordinary_signature_kind = None
         if hasattr(candidate, "content") and hasattr(candidate.content, "parts") and candidate.content.parts:
             for part in candidate.content.parts:
                 fc = getattr(part, "function_call", None)
-                sig = _signature_bytes(part, fc)
                 if fc is None:
-                    text_value = getattr(part, "text", None)
-                    if text_value is None and getattr(part, "inline_data", None) is not None:
-                        inline = part.inline_data
-                        text_value = _convert_image_to_markdown(inline.data, inline.mime_type)
-                    elif text_value is None and getattr(part, "file_data", None) is not None:
-                        text_value = f"![Image]({part.file_data.file_uri})"
-                    text_value = "" if text_value is None else str(text_value)
-                    if getattr(part, "thought", None) is True:
-                        kind = "thought"
-                    elif text_value == "" and sig:
-                        kind = "signature_only"
-                    else:
-                        kind = "text"
-                    metadata = ordinary_part_metadata(kind, text_value, sig)
-                    if indexer:
-                        ordinary_index = indexer.record_ordinary_part(candidate_index, metadata)
-                    else:
-                        ordinary_index = len(ordinary_metadata)
-                    part_order.append({"type": "ordinary", "index": ordinary_index})
-                    ordinary_metadata.append(metadata)
-                    if sig:
-                        ordinary_signature = sig
-                        ordinary_signature_kind = kind
                     continue
                 tc_index = indexer.next_index(candidate_index) if indexer else len(tool_call_deltas)
                 tc = {
@@ -575,10 +522,6 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                         "arguments": json.dumps(fc.args) if fc.args is not None else "",
                     },
                 }
-                extra = thought_signature_extra(sig)
-                if extra:
-                    tc["extra_content"] = extra
-                part_order.append({"type": "tool_call", "index": tc_index})
                 if indexer:
                     indexer.record_tool_call(candidate_index, tc_index)
                 tool_call_deltas.append(tc)
@@ -609,35 +552,6 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
         elif not reasoning_text and openai_finish_reason is None:
             delta_payload["content"] = ""
 
-        google_extra = {}
-        if indexer:
-            metadata_to_emit, order_to_emit = indexer.topology(candidate_index)
-        else:
-            metadata_to_emit, order_to_emit = ordinary_metadata, part_order
-
-        # Emit cumulative topology on every later chunk (including the final STOP)
-        # so standard OpenAI SSE aggregation—which replaces extension objects—keeps
-        # the complete cross-chunk Part order and every ordinary signature.
-        cumulative_signature = None
-        cumulative_signature_kind = None
-        for item in reversed(metadata_to_emit):
-            if item.get("thought_signature"):
-                cumulative_signature = item["thought_signature"]
-                cumulative_signature_kind = item.get("kind")
-                break
-        if cumulative_signature:
-            google_extra["thought_signature"] = cumulative_signature
-            google_extra["thought_signature_part"] = cumulative_signature_kind
-        elif ordinary_signature:
-            google_extra.update((thought_signature_extra(
-                ordinary_signature, ordinary_signature_kind) or {}).get("google", {}))
-        if metadata_to_emit:
-            google_extra["ordinary_parts"] = metadata_to_emit
-        if order_to_emit:
-            google_extra["part_order"] = order_to_emit
-        if google_extra:
-            delta_payload["extra_content"] = {"google": google_extra}
-    
     if not delta_payload and openai_finish_reason is None:
         delta_payload["content"] = ""
 
@@ -726,63 +640,6 @@ async def _chunk_openai_response_dict_for_sse(
 
     yield "data: [DONE]\n\n"
 
-def _prepend_prefill(openai_dict: Dict[str, Any], prefill_text: str) -> Dict[str, Any]:
-    """把预填充文本拼回到最终输出开头（预填充智能兼容用，带重叠去重）。"""
-    if not prefill_text:
-        return openai_dict
-    try:
-        # P2-3：n>1 时每个 choice 都要拼回预填充，旧实现处理完第一个就 break
-        for choice in (openai_dict.get("choices") or []):
-            msg = choice.get("message")
-            if not isinstance(msg, dict) or msg.get("tool_calls"):
-                continue
-            existing = msg.get("content") or ""
-            msg["content"] = prefill_text + strip_prefill_overlap(prefill_text, existing)
-    except Exception:
-        pass
-    return openai_dict
-
-
-def _dedup_sse_chunk_content(sse_line: str, deduper: PrefillDeduper, force_flush: bool = False) -> Optional[str]:
-    """真流式预填充去重：改写单条 SSE chunk 的 delta.content。
-
-    - 去重器工作期间，正文会先被攒下（返回 None 表示该 chunk 可整条跳过）；
-      判定完成后原样透传，零额外延迟。
-    - force_flush=True 或 chunk 带 finish_reason 时，把攒着的文本一并放出，
-      避免正文落在 finish 之后（部分客户端在 finish 后停止读取）。
-    """
-    if deduper.done and not force_flush:
-        return sse_line
-    try:
-        payload = json.loads(sse_line[len("data: "):].strip())
-        choices = payload.get("choices") or []
-        if not choices:
-            return sse_line
-        choice = choices[0]
-        delta = choice.get("delta") or {}
-        content = delta.get("content")
-        has_finish = bool(choice.get("finish_reason"))
-
-        out = deduper.feed(content) if content else ""
-        if has_finish or force_flush:
-            out += deduper.flush()
-
-        if out:
-            delta["content"] = out
-            choice["delta"] = delta
-            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-        # 没有可放出的正文：若 chunk 还有其他信息（角色/思考/finish 等）则去掉 content 保留其余
-        if content is not None:
-            delta.pop("content", None)
-        if delta or has_finish:
-            choice["delta"] = delta
-            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-        return None  # 纯 content 且被暂存 → 整条跳过
-    except Exception:
-        return sse_line
-
-
 async def gemini_fake_stream_generator(
     gemini_client_instance: Any,
     model_for_api_call: str,
@@ -790,7 +647,6 @@ async def gemini_fake_stream_generator(
     gen_config_dict_for_api_call: Dict[str, Any],
     request_obj: OpenAIRequest,
     is_auto_attempt: bool,
-    prefill_text: str = "",
     fastapi_request: Optional[Any] = None,
 ):
     print(f"🌊 [假流式] 已开始调用 Gemini 模型 {model_for_api_call}，客户端请求模型名为 {request_obj.model}。")
@@ -872,11 +728,10 @@ async def gemini_fake_stream_generator(
 
         if raw_gemini_response is None:
             raise last_error or ValueError("上游未返回任何响应（重试已耗尽）。")
-        
+
         _record_usage(raw_gemini_response)
 
         openai_response_dict = convert_to_openai_format(raw_gemini_response, request_obj.model)
-        _prepend_prefill(openai_response_dict, prefill_text)
 
         if hasattr(raw_gemini_response, "prompt_feedback") and \
            hasattr(raw_gemini_response.prompt_feedback, "block_reason") and \
@@ -936,7 +791,6 @@ async def execute_gemini_call(
     request_obj: OpenAIRequest,
     is_auto_attempt: bool = False,
     fastapi_request: Optional[Any] = None,
-    prefill_text: str = "",
     fallback_model: Optional[str] = None,
     fallback_client_factory: Optional[Callable[[], Any]] = None,
 ):
@@ -975,7 +829,7 @@ async def execute_gemini_call(
             return StreamingResponse(
                 gemini_fake_stream_generator(
                     current_client, model_to_call, actual_prompt_for_call,
-                    gen_config_dict, request_obj, is_auto_attempt, prefill_text=prefill_text,
+                    gen_config_dict, request_obj, is_auto_attempt,
                     fastapi_request=fastapi_request,
                 ), media_type="text/event-stream"
             )
@@ -1001,15 +855,8 @@ async def execute_gemini_call(
                             config=gen_config_dict
                         )
 
-                        # 预填充智能兼容：把预填充文本作为回复开头先发出（仅一次）；
-                        # 同时启用流式去重器，模型若复述预填充开头会被自动裁掉（n>1 时不启用）。
                         # 每次 attempt 都重置 tool_calls 序号（重试会重发整轮）
                         tool_indexer = ToolCallIndexer()
-                        deduper = PrefillDeduper(prefill_text) if (prefill_text and (request_obj.n or 1) == 1) else None
-                        if prefill_text and not has_yielded:
-                            has_yielded = True
-                            _pf = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"role": "assistant", "content": prefill_text}, "finish_reason": None}]}
-                            yield f"data: {json.dumps(_pf)}\n\n"
 
                         final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
 
@@ -1024,18 +871,7 @@ async def execute_gemini_call(
                                 sse_chunk = convert_chunk_to_openai(
                                     chunk_item_call, request_obj.model, response_id_for_stream, ci,
                                     indexer=tool_indexer)
-                                if deduper is not None:
-                                    sse_chunk = _dedup_sse_chunk_content(sse_chunk, deduper)
-                                    if sse_chunk is None:
-                                        continue  # 正文暂存于去重器，跳过空 chunk
                                 yield sse_chunk
-
-                        # 去重器可能还攒着开头文本（上游没发 finish chunk 的场景）
-                        if deduper is not None and not deduper.done:
-                            tail = deduper.flush()
-                            if tail:
-                                _tail = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}]}
-                                yield f"data: {json.dumps(_tail, ensure_ascii=False)}\n\n"
 
                         if final_p_tk > 0 or final_c_tk > 0:
                             stats.add_tokens(final_p_tk, final_c_tk)
@@ -1050,6 +886,7 @@ async def execute_gemini_call(
                             })
 
                         yield "data: [DONE]\n\n"
+                        return
                         return
 
                     except asyncio.CancelledError:
@@ -1196,5 +1033,4 @@ async def execute_gemini_call(
         _record_usage(response_obj_call)
 
         openai_response_content = convert_to_openai_format(response_obj_call, request_obj.model)
-        _prepend_prefill(openai_response_content, prefill_text)
         return JSONResponse(content=openai_response_content)

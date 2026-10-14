@@ -90,17 +90,13 @@ def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_imag
     return thinking_config
 
 
-def _prefill_log(mode: str, prefill_text: str) -> str:
-    """按模式说明预填充被怎么处理了——三种模式的差别对使用者影响很大。"""
-    n = len(prefill_text)
+def _prefill_log(mode: str) -> str:
+    """按模式说明预填充被怎么处理了。"""
     if mode == "keep_turn":
-        return (f"🩹 [预填充兼容] 预填充（{n} 字）保留为 model 轮次，其后补一句续写推动语；"
-                "输出会把它拼回开头。")
+        return "🩹 [预填充兼容] 预填充保留为 model 轮次，其后补一句续写推动语。"
     if mode == "minimal":
-        return ("🩹 [预填充兼容] 仅补占位 user 保证不报错；预填充**不会**拼回输出开头"
-                "（预设的思考开标签可能因此缺失，酒馆正则会抓不到）。")
-    return (f"🩹 [预填充兼容] 预填充（{n} 字）已并入末尾 user 消息作为续写指令，并将拼回输出开头。"
-            "若预填充停在半截词/半截标签且模型接不上，可试试「保留模型轮次」。")
+        return "🩹 [预填充兼容] 仅补占位 user 保证不报错。"
+    return "🩹 [预填充兼容] 预填充已并入末尾 user 消息作为续写指令。"
 
 
 _ENDPOINT_LOGGED = False
@@ -240,7 +236,6 @@ class ExpressSDKUpstream(BaseUpstream):
         # - 2.5 及更早（允许 model 结尾）：原生透传，模型直接续写；
         # - 3.x（拒绝 model 结尾）：转成续写指令；
         # - 两者都会把预填充文本拼回输出开头（带去重）。
-        prefill_text = ""
         prefill_active = False
         # 控制台注入（轻量前端用；两个字段都留空时是空操作）。
         # 必须在 apply_prefill_compat 之前，注入后的消息与前端自发预填充同形。
@@ -259,17 +254,16 @@ class ExpressSDKUpstream(BaseUpstream):
 
         _prefill_mode = app_state.get_setting("prefill_mode", app_config.DEFAULT_SETTINGS["prefill_mode"])
         if _prefill_mode != "off":
-            new_msgs, prefill_text, prefill_active = apply_prefill_compat(
+            new_msgs, prefill_active = apply_prefill_compat(
                 request_obj.messages, _prefill_mode,
                 allow_model_last=not profile["requires_user_last_turn"],
                 instruction_template=_prefill_tpl(_inj_settings.get("prefill_instruction", ""), is_image_model),
-                cot_guard=bool(_inj_settings.get("prefill_cot_guard", True)) and not is_image_model,
             )
             if new_msgs is not request_obj.messages:
                 request_obj = request_obj.model_copy(update={"messages": new_msgs})
-                print(_prefill_log(_prefill_mode, prefill_text))
-            elif prefill_text:
-                print(f"🩹 [预填充兼容] 该模型支持 model 结尾，预填充原生透传（{len(prefill_text)} 字），模型将直接续写。")
+                print(_prefill_log(_prefill_mode))
+            elif prefill_active:
+                print("🩹 [预填充兼容] 该模型支持 model 结尾，预填充原生透传，模型将直接续写。")
             else:
                 # 没检测到预填充也要说一声：很多人以为整个预设就是预填充，
                 # 实际只有「最后一条 assistant 消息」才算。没有它，压制原生思考也不会触发。
@@ -308,7 +302,7 @@ class ExpressSDKUpstream(BaseUpstream):
 
         return await execute_gemini_call(
             client_to_use, model_to_call, prompt_func, gen_config_dict, request_obj,
-            fastapi_request=fastapi_request, prefill_text=prefill_text,
+            fastapi_request=fastapi_request,
             # 钉定路径万一不对（Project ID 与 Key 不同项目、该区域没有此模型），
             # 自动退回裸模型名重试一次。
             fallback_model=(base_model_name if model_to_call != base_model_name else None),

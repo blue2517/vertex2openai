@@ -31,8 +31,6 @@ from message_processing import (
     _create_safety_ratings_html,
     apply_console_injection,
     apply_prefill_compat,
-    strip_prefill_overlap,
-    PrefillDeduper,
     openai_content_to_wire_parts,
     _coerce_tool_response,
     resolve_tool_call_signature,
@@ -149,17 +147,13 @@ def _prefill_tpl(user_template: str, is_image_model: bool) -> str:
     return DEFAULT_IMAGE_PREFILL_NUDGE if is_image_model else ""
 
 
-def _prefill_log(mode: str, prefill_text: str) -> str:
-    """按模式说明预填充被怎么处理了——三种模式的差别对使用者影响很大。"""
-    n = len(prefill_text)
+def _prefill_log(mode: str) -> str:
+    """按模式说明预填充被怎么处理了。"""
     if mode == "keep_turn":
-        return (f"🩹 [预填充兼容] 预填充（{n} 字）保留为 model 轮次，其后补一句续写推动语；"
-                "输出会把它拼回开头。")
+        return "🩹 [预填充兼容] 预填充保留为 model 轮次，其后补一句续写推动语。"
     if mode == "minimal":
-        return ("🩹 [预填充兼容] 仅补占位 user 保证不报错；预填充**不会**拼回输出开头"
-                "（预设的思考开标签可能因此缺失，酒馆正则会抓不到）。")
-    return (f"🩹 [预填充兼容] 预填充（{n} 字）已并入末尾 user 消息作为续写指令，并将拼回输出开头。"
-            "若预填充停在半截词/半截标签且模型接不上，可试试「保留模型轮次」。")
+        return "🩹 [预填充兼容] 仅补占位 user 保证不报错。"
+    return "🩹 [预填充兼容] 预填充已并入末尾 user 消息作为续写指令。"
 
 
 def _is_retryable_error(error_msg: str) -> bool:
@@ -431,9 +425,6 @@ def _openai_tool_call(response_id: str, call_index: int, call: dict) -> dict:
         "type": "function",
         "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
     }
-    extra = thought_signature_extra(signature)
-    if extra:
-        payload["extra_content"] = extra
     return payload
 
 
@@ -1026,7 +1017,6 @@ def _make_openai_chunk(
     finish_reason: str = None,
     role: str = None,
     tool_calls: Optional[list[dict]] = None,
-    extra_content: Optional[dict] = None,
 ) -> str:
     delta = {}
     if role:
@@ -1037,8 +1027,6 @@ def _make_openai_chunk(
         delta["reasoning_content"] = reasoning_content
     if tool_calls is not None:
         delta["tool_calls"] = tool_calls
-    if extra_content is not None:
-        delta["extra_content"] = extra_content
 
     chunk = {
         "id": response_id,
@@ -1351,7 +1339,6 @@ class CookieProxyUpstream(BaseUpstream):
 
         # ===== 3.5 预填充智能兼容（按控制台模式 + 模型能力；新模型自动生效）=====
         _profile = mc.get_profile(base_model_name)
-        prefill_text = ""
         prefill_active = False
         # 控制台注入（轻量前端用；两个字段都留空时是空操作）。
         # 原生工具往返不能插入 assistant 预填充，否则会破坏 FC/FR 拓扑。
@@ -1371,17 +1358,16 @@ class CookieProxyUpstream(BaseUpstream):
 
         _prefill_mode = app_state.get_setting("prefill_mode", app_config.DEFAULT_SETTINGS["prefill_mode"])
         if _prefill_mode != "off":
-            _new_msgs, prefill_text, prefill_active = apply_prefill_compat(
+            _new_msgs, prefill_active = apply_prefill_compat(
                 request_obj.messages, _prefill_mode,
                 allow_model_last=not _profile["requires_user_last_turn"],
                 instruction_template=_prefill_tpl(_inj_settings.get("prefill_instruction", ""), _profile["is_image"]),
-                cot_guard=bool(_inj_settings.get("prefill_cot_guard", True)) and not _profile["is_image"],
             )
             if _new_msgs is not request_obj.messages:
                 request_obj = request_obj.model_copy(update={"messages": _new_msgs})
-                print(_prefill_log(_prefill_mode, prefill_text))
-            elif prefill_text:
-                print(f"🩹 [预填充兼容] 该模型支持 model 结尾，预填充原生透传（{len(prefill_text)} 字），模型将直接续写。")
+                print(_prefill_log(_prefill_mode))
+            elif prefill_active:
+                print("🩹 [预填充兼容] 该模型支持 model 结尾，预填充原生透传，模型将直接续写。")
             else:
                 # 没检测到预填充也要说一声：很多人以为整个预设就是预填充，
                 # 实际只有「最后一条 assistant 消息」才算。没有它，压制原生思考也不会触发。
@@ -1409,13 +1395,7 @@ class CookieProxyUpstream(BaseUpstream):
         cookie_debug = bool(app_state.get_setting("debug_outbound", False)
                             or app_state.get_setting("cookie_debug", False))
 
-        # batchGraphql(Studio) 会忽略 includeThoughts=false（真机验证），因此当解析出的思考配置
-        # 要求不回传思考时，由本通道在响应侧主动剥离思考块。生图无思考，strip 恒 False。
         _eff_settings = app_state.get_effective_settings(base_model_name)
-        _tk = mc.resolve_thinking(base_model_name, request_obj, _eff_settings, prefill_active=prefill_active)
-        strip_thoughts = bool(_tk.get("mode") and not _tk.get("include_thoughts", True))
-        if strip_thoughts and cookie_debug:
-            print("🔎 [Studio 调试] 已启用响应侧思考剥离（batchGraphql 不支持 includeThoughts=false）。")
 
         # 打印请求日志
         msg_count = len(request_obj.messages)
@@ -1444,8 +1424,6 @@ class CookieProxyUpstream(BaseUpstream):
                     yield "data: [DONE]\n\n"
                     return
                 full_text = res.get("full_text") or ""
-                if prefill_text:
-                    full_text = prefill_text + strip_prefill_overlap(prefill_text, full_text)
                 if res.get("reasoning_text"):
                     yield _make_openai_chunk(response_id, model_display, reasoning_content=res["reasoning_text"])
                 # 关键：整张图作为单个 chunk 发出，绝不分块
@@ -1505,26 +1483,20 @@ class CookieProxyUpstream(BaseUpstream):
                         got_thought = False    # 是否收到过思考
                         got_tool_call = False
                         tool_call_index = 0
-                        stream_ordinary_metadata = []
-                        stream_part_order = []
                         should_retry = False
                         error_to_raise = None
                         usage_meta = None
                         finish_raw = None
                         blocked_msg = None
                         sampler = _RawSampler()
-                        deduper = PrefillDeduper(prefill_text)
 
                         # 消费实时生成器（原始事件 → 此处格式化为 OpenAI chunk）
                         async for status, data in _execute_stream_request_generator(
                             client, req_headers, body, sampler=sampler,
                             fallback_body=fallback_body,
                         ):
-                            # 思考剥离：batchGraphql 忽略 includeThoughts，这里按解析出的配置主动丢弃思考块
                             if status == "thought":
                                 got_thought = True
-                                if strip_thoughts:
-                                    continue  # 不建连、不输出，等真正的正文
 
                             if status == "function_call":
                                 if not has_yielded_to_client:
@@ -1533,58 +1505,29 @@ class CookieProxyUpstream(BaseUpstream):
                                     has_yielded_to_client = True
                                 tool_payload = _openai_tool_call(response_id, tool_call_index, data)
                                 tool_payload["index"] = tool_call_index
-                                stream_part_order.append({"type": "tool_call", "index": tool_call_index})
                                 yield _make_openai_chunk(response_id, model_display, tool_calls=[tool_payload])
                                 tool_call_index += 1
                                 got_tool_call = True
 
                             elif status == "thought_signature":
-                                signature = _signature_bytes_from_wire(data.get("value"))
-                                extra = thought_signature_extra(signature, data.get("part_kind"))
-                                if extra:
-                                    if stream_ordinary_metadata:
-                                        stream_ordinary_metadata[-1]["thought_signature"] = _encode_wire_signature(signature)
-                                    elif data.get("part_kind") == "signature_only":
-                                        stream_part_order.append({"type": "ordinary", "index": 0})
-                                        stream_ordinary_metadata.append(
-                                            ordinary_part_metadata("signature_only", "", signature))
-                                    google = extra.setdefault("google", {})
-                                    if stream_ordinary_metadata:
-                                        google["ordinary_parts"] = list(stream_ordinary_metadata)
-                                    if got_tool_call:
-                                        google["part_order"] = list(stream_part_order)
-                                    if not has_yielded_to_client:
-                                        yield _make_openai_chunk(response_id, model_display, role="assistant")
-                                        has_yielded_to_client = True
-                                    yield _make_openai_chunk(response_id, model_display, extra_content=extra)
+                                pass
 
                             elif status in ("text", "thought", "image", "api_error_text"):
                                 if not has_yielded_to_client:
                                     print(f"⚡ [Studio] {base_model_name} | 连接建立，正在实时流式输出...")
                                     yield _make_openai_chunk(response_id, model_display, role="assistant")
                                     has_yielded_to_client = True
-                                    # 预填充智能兼容：先把预填充文本作为回复开头发出
-                                    if prefill_text:
-                                        yield _make_openai_chunk(response_id, model_display, content=prefill_text)
 
                                 if status == "thought":
-                                    stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
-                                    stream_ordinary_metadata.append(ordinary_part_metadata("thought", data, None))
                                     yield _make_openai_chunk(response_id, model_display, reasoning_content=data)
                                 elif status == "api_error_text":
                                     yield _make_openai_chunk(response_id, model_display, content=f"\n[Studio API 错误] {data}")
                                 elif status == "image":
                                     got_text = True
-                                    stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
-                                    stream_ordinary_metadata.append(ordinary_part_metadata("text", data, None))
                                     yield _make_openai_chunk(response_id, model_display, content=data)
-                                else:  # text（经过预填充去重器）
+                                else:  # text
                                     got_text = True
-                                    out = deduper.feed(data)
-                                    if out:
-                                        stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
-                                        stream_ordinary_metadata.append(ordinary_part_metadata("text", out, None))
-                                        yield _make_openai_chunk(response_id, model_display, content=out)
+                                    yield _make_openai_chunk(response_id, model_display, content=data)
 
                             elif status == "finish":
                                 finish_raw = data
@@ -1651,30 +1594,9 @@ class CookieProxyUpstream(BaseUpstream):
                         if not has_yielded_to_client:
                             yield _make_openai_chunk(response_id, model_display, role="assistant")
                             has_yielded_to_client = True
-                            if prefill_text:
-                                yield _make_openai_chunk(response_id, model_display, content=prefill_text)
-
-                        # 预填充去重器里可能还攒着开头的一小段（短回复场景）
-                        tail = deduper.flush()
-                        if tail:
-                            stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
-                            stream_ordinary_metadata.append(ordinary_part_metadata("text", tail, None))
-                            yield _make_openai_chunk(response_id, model_display, content=tail)
 
                         if got_text or got_tool_call:
                             stats.add_success()
-                            if got_tool_call and stream_ordinary_metadata:
-                                google = {
-                                    "ordinary_parts": list(stream_ordinary_metadata),
-                                    "part_order": list(stream_part_order),
-                                }
-                                last_signed = next((item for item in reversed(stream_ordinary_metadata)
-                                                    if item.get("thought_signature")), None)
-                                if last_signed:
-                                    google["thought_signature"] = last_signed["thought_signature"]
-                                    google["thought_signature_part"] = last_signed["kind"]
-                                yield _make_openai_chunk(
-                                    response_id, model_display, extra_content={"google": google})
                             yield _make_openai_chunk(
                                 response_id, model_display,
                                 finish_reason="tool_calls" if got_tool_call else _map_finish_reason(finish_raw))
@@ -1684,7 +1606,7 @@ class CookieProxyUpstream(BaseUpstream):
                             if blocked_msg:
                                 detail += f"；promptFeedback 拦截：{blocked_msg}"
                             desc = "只返回了思考、未返回正文" if got_thought else "未返回任何内容"
-                            hint = (_THINKING_RUNAWAY_HINT if (got_thought and not strip_thoughts) else _NO_BODY_HINT)
+                            hint = (_THINKING_RUNAWAY_HINT if got_thought else _NO_BODY_HINT)
                             stats.add_error()
                             print(f"❌ [Studio] {base_model_name} | 上游{desc}（{detail}）")
                             print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
@@ -1779,9 +1701,6 @@ class CookieProxyUpstream(BaseUpstream):
                     reasoning_text = ""
                     safety_html = ""
                     tool_calls = []
-                    ordinary_metadata = []
-                    part_order = []
-                    message_extra = None
                     api_error = None
                     usage_meta = None
                     finish_raw = None
@@ -1800,28 +1719,14 @@ class CookieProxyUpstream(BaseUpstream):
                         for event_type, data in _extract_from_results(obj):
                             if event_type == "text":
                                 full_text += data
-                                part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
-                                ordinary_metadata.append(ordinary_part_metadata("text", data, None))
                             elif event_type == "thought":
-                                reasoning_text += data   # 先收集（供诊断判断），输出时按 strip 决定是否附带
-                                part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
-                                ordinary_metadata.append(ordinary_part_metadata("thought", data, None))
+                                reasoning_text += data
                             elif event_type == "image":
                                 full_text += data
-                                part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
-                                ordinary_metadata.append(ordinary_part_metadata("text", data, None))
                             elif event_type == "function_call":
-                                part_order.append({"type": "tool_call", "index": len(tool_calls)})
                                 tool_calls.append(_openai_tool_call(response_id, len(tool_calls), data))
                             elif event_type == "thought_signature":
-                                sig = _signature_bytes_from_wire(data.get("value"))
-                                if sig:
-                                    message_extra = thought_signature_extra(sig, data.get("part_kind"))
-                                    if ordinary_metadata:
-                                        ordinary_metadata[-1]["thought_signature"] = _encode_wire_signature(sig)
-                                    elif data.get("part_kind") == "signature_only":
-                                        part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
-                                        ordinary_metadata.append(ordinary_part_metadata("signature_only", "", sig))
+                                pass
                             elif event_type == "finish":
                                 finish_raw = data
                             elif event_type == "safety":
@@ -1849,9 +1754,6 @@ class CookieProxyUpstream(BaseUpstream):
                     elapsed = time.time() - start_time
 
                     if got_output:
-                        # 预填充智能兼容：去重后把预填充文本拼回输出开头
-                        if prefill_text and got_text:
-                            full_text = prefill_text + strip_prefill_overlap(prefill_text, full_text)
                         finish_reason = "tool_calls" if tool_calls else _map_finish_reason(finish_raw)
                         stats.add_success()
                         print(f"✅ [Studio] {base_model_name} | {len(full_text)} 字符 | {elapsed:.1f}s")
@@ -1861,7 +1763,7 @@ class CookieProxyUpstream(BaseUpstream):
                         if blocked_msg:
                             detail += f"；promptFeedback 拦截：{blocked_msg}"
                         desc = "只返回了思考、未返回正文" if reasoning_text else "未返回任何内容"
-                        hint = (_THINKING_RUNAWAY_HINT if (reasoning_text and not strip_thoughts) else _NO_BODY_HINT)
+                        hint = (_THINKING_RUNAWAY_HINT if reasoning_text else _NO_BODY_HINT)
                         stats.add_error()
                         print(f"❌ [Studio] {base_model_name} | 上游{desc}（{detail}）| {elapsed:.1f}s")
                         print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
@@ -1873,19 +1775,10 @@ class CookieProxyUpstream(BaseUpstream):
 
                     content_value = full_text + safety_html
                     message_obj = {"role": "assistant", "content": content_value if content_value else None}
-                    if reasoning_text and not strip_thoughts:   # strip：batchGraphql 忽略 includeThoughts，输出侧剥离
+                    if reasoning_text:
                         message_obj["reasoning_content"] = reasoning_text
                     if tool_calls:
                         message_obj["tool_calls"] = tool_calls
-                    if ordinary_metadata:
-                        if message_extra is None:
-                            message_extra = {"google": {}}
-                        google = message_extra.setdefault("google", {})
-                        google["ordinary_parts"] = ordinary_metadata
-                        if tool_calls:
-                            google["part_order"] = part_order
-                    if message_extra:
-                        message_obj["extra_content"] = message_extra
 
                     return JSONResponse(content={
                         "id": response_id,

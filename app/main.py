@@ -651,13 +651,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div class="pt-1 border-t border-neutral-100"></div>
           <div class="text-xs font-semibold text-neutral-500 pt-1">预填充</div>
 
-          <div class="flex items-center justify-between gap-3"><span class="text-sm">思维链守卫<span class="helpq" onclick="hlp(this,'h_cotg')">?</span></span><label class="switch"><input type="checkbox" id="prefill_cot_guard"><span class="slider"></span></label></div>
-          <div id="h_cotg" class="helpbox">
-            解决<b>“预设思维链经常不写、直接出正文”</b>：预填充只是把话头停在 <code>&lt;思维链标签&gt;</code> 上，<b>没有任何一句话告诉模型必须先完成思考</b>，模型于是常常跳过思考直接写正文，前端正则就抓不到思维链。<br>
-            打开后，代理会自动识别预填充里<b>未闭合的开标签</b>，在续写指令末尾追加一条硬性要求：先逐条写完该标签内的思考、用对应闭合标签收尾，然后才写正文。<br>
-            没检测到未闭合标签时（例如预填充只是普通句子）本项不做任何事；生图模型不适用。<br>
-            <b>仍不稳定时</b>：把「原生思考控制」从“关闭原生思考”改为“强制用上方档位 + low”再对比——压到 minimal 会让模型倾向“直接给答案”，可能连带跳过预设要求的长思考。
-          </div>
           <div>
             <div class="flex items-center justify-between gap-3"><span class="text-sm">预填充兼容模式<span class="helpq" onclick="hlp(this,'h_pfm')">?</span></span>
               <select id="prefill_mode" class="inp" style="width:150px"><option value="smart">智能（默认）</option><option value="keep_turn">保留模型轮次</option><option value="minimal">最小</option><option value="off">关闭</option></select>
@@ -704,7 +697,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let CAPS = {}, chart = null, curAR = "";
 let GLOBAL_SETTINGS = {}, OVERRIDES = {};
-const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction','image_system_instruction','inject_prefill_for_image','sampling_policy','prefill_cot_guard'];
+const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction','image_system_instruction','inject_prefill_for_image','sampling_policy'];
 const COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
 
 function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1800); }
@@ -875,7 +868,7 @@ async function loadParams(){
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
     ['native_thinking_mode','thinking_g3_level','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','resumable_ttl_seconds','resumable_max_streams'].forEach(k=>setV(k,s[k]));
-    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','resumable_enabled'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','resumable_enabled'].forEach(k=>setV(k,s[k]));
     // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
       if(s.hide_thoughts) setV('native_thinking_mode','off');
@@ -927,7 +920,6 @@ async function saveModelOverride(){
     image_system_instruction:$('image_system_instruction').checked,
     inject_prefill_for_image:$('inject_prefill_for_image').checked,
     sampling_policy:$('sampling_policy').value,
-    prefill_cot_guard:$('prefill_cot_guard').checked,
   };
   if(m==='__global__'){
     // 全局默认作用域：写进全局设置，而不是任何模型的专属值
