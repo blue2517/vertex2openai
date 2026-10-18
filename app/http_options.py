@@ -1,15 +1,14 @@
 from typing import Optional
 from google.genai import types
 import config as app_config
+from network_proxy import get_proxy_client_args
 
 
 def get_http_options(
     base_url: Optional[str] = None,
 ) -> Optional[types.HttpOptions]:
     """构造 google-genai HTTP 选项：代理、自定义证书、base_url 与请求头。"""
-    client_args = {}
-    if app_config.PROXY_URL:
-        client_args["proxy"] = app_config.PROXY_URL
+    client_args = get_proxy_client_args()
     if app_config.SSL_CERT_FILE:
         client_args["verify"] = app_config.SSL_CERT_FILE
 

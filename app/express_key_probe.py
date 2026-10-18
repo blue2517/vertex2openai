@@ -23,6 +23,7 @@ import httpx
 
 import config as app_config
 from runtime_state import app_state
+from network_proxy import get_proxy_client_args
 
 # 调模型的正确 URL（Express 全局端点格式），{model} 处填一个不存在的模型名来探测
 GENERATE_CONTENT_URL = (
@@ -33,9 +34,7 @@ PROBE_TIMEOUT_SECONDS = 15.0
 
 
 def _client_args() -> dict:
-    args = {"timeout": PROBE_TIMEOUT_SECONDS}
-    if app_config.PROXY_URL:
-        args["proxy"] = app_config.PROXY_URL
+    args = {"timeout": PROBE_TIMEOUT_SECONDS, **get_proxy_client_args()}
     if app_config.SSL_CERT_FILE:
         args["verify"] = app_config.SSL_CERT_FILE
     return args

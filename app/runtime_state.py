@@ -43,7 +43,7 @@ class AppState:
         except Exception as e:
             print(f"⚠️ [状态管理器] 无法读取持久化配置文件，已自动降级为内存模式: {e}")
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
         """原子写：先写同目录临时文件再 os.replace（同一文件系统内是原子操作）。"""
         try:
             target_dir = os.path.dirname(STATE_FILE) or "."
@@ -65,8 +65,10 @@ class AppState:
                 os.chmod(STATE_FILE, 0o600)   # 里面有完整 Google Cookie
             except OSError:
                 pass
+            return True
         except Exception as e:
             print(f"⚠️ [状态管理器] 无法保存状态到磁盘: {e}")
+            return False
 
     def reload(self) -> None:
         """显式从磁盘重载（外部改了文件时用）。"""
@@ -104,6 +106,49 @@ class AppState:
     def get_project_id(self) -> str:
         with self._lock:
             return self._state.get("google_project_id", "")
+
+    # ---------- 全局出网代理（独立保存，避免通用设置接口返回认证信息） ----------
+
+    def get_network_proxy(self) -> dict:
+        with self._lock:
+            stored = self._state.get("network_proxy")
+            stored = stored if isinstance(stored, dict) else {}
+            mode = stored.get("mode", "environment")
+            if mode not in ("environment", "custom", "direct", "pool"):
+                mode = "environment"
+            url = stored.get("url", "")
+            url = url if isinstance(url, str) else ""
+            pool = []
+            for item in stored.get("pool", []) if isinstance(stored.get("pool"), list) else []:
+                if not isinstance(item, dict):
+                    continue
+                if not all(isinstance(item.get(k), str) and item[k] for k in ("id", "name", "url")):
+                    continue
+                pool.append({k: item[k] for k in ("id", "name", "url")})
+            active_id = stored.get("active_id", "")
+            active_id = active_id if isinstance(active_id, str) else ""
+            # 老版单代理无需重新输入认证信息；读时兼容，首次保存时落盘。
+            if "pool" not in stored and url:
+                pool = [{"id": "legacy-custom", "name": "原自定义代理", "url": url}]
+                active_id = "legacy-custom"
+            return {"mode": mode, "url": url, "pool": pool, "active_id": active_id}
+
+    def set_network_proxy(self, mode: str, url: str) -> None:
+        self.update_network_proxy(lambda conf: {**conf, "mode": mode, "url": url})
+
+    def update_network_proxy(self, updater) -> dict:
+        """在同一锁内读取、修改、持久化，避免代理列表并发编辑丢失条目。"""
+        with self._lock:
+            previous = self._state.get("network_proxy")
+            updated = updater(self.get_network_proxy())
+            self._state["network_proxy"] = copy.deepcopy(updated)
+            if not self._save():
+                if previous is None:
+                    self._state.pop("network_proxy", None)
+                else:
+                    self._state["network_proxy"] = previous
+                raise OSError("代理配置保存失败，请检查状态目录权限和剩余空间。")
+            return copy.deepcopy(updated)
 
     # ---------- Express API Key（多账号，可热编辑） ----------
     # 记录形态：{"key":..., "project_id":..., "project_source":"auto|manual|", 
@@ -241,10 +286,53 @@ class AppState:
                 return copy.deepcopy(app_config.DEFAULT_SETTINGS[key])
             return default
 
+    @staticmethod
+    def _validate_studio_read_timeout_seconds(value) -> int:
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not 1 <= value <= 3600 or int(value) != value):
+            raise ValueError("Studio 读取超时须为 1–3600 的整数（秒）。")
+        return int(value)
+
+    def get_studio_read_timeout_seconds(self) -> int:
+        """读取经过校验的秒数，兼容旧配置及手工修改后的无效值。"""
+        default = app_config.DEFAULT_SETTINGS["studio_read_timeout_seconds"]
+        try:
+            return self._validate_studio_read_timeout_seconds(
+                self.get_setting("studio_read_timeout_seconds", default))
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _validate_disconnect_grace_seconds(value) -> int:
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not 0 <= value <= 300 or int(value) != value):
+            raise ValueError("重连宽限须为 0–300 的整数（秒）。")
+        return int(value)
+
+    def get_disconnect_grace_seconds(self) -> int:
+        if self.get_setting("continue_on_disconnect", False) is not True:
+            return 0
+        try:
+            return self._validate_disconnect_grace_seconds(
+                self.get_setting("disconnect_grace_seconds", 5))
+        except ValueError:
+            return 5
+
     def update_settings(self, patch: dict) -> dict:
         """合并更新设置，只接受已知键，返回更新后的完整设置。"""
         if not isinstance(patch, dict):
             return self.get_settings()
+        # 先校验再写入；无效超时值应拒绝整份 patch，避免其它字段被部分保存。
+        if "studio_read_timeout_seconds" in patch:
+            patch = dict(patch)
+            patch["studio_read_timeout_seconds"] = self._validate_studio_read_timeout_seconds(
+                patch["studio_read_timeout_seconds"])
+        if "continue_on_disconnect" in patch and not isinstance(patch["continue_on_disconnect"], bool):
+            raise ValueError("断连后等待重连须为布尔值。")
+        if "disconnect_grace_seconds" in patch:
+            patch = dict(patch)
+            patch["disconnect_grace_seconds"] = self._validate_disconnect_grace_seconds(
+                patch["disconnect_grace_seconds"])
         with self._lock:
             current = self._state.get("settings")
             current = dict(current) if isinstance(current, dict) else {}

@@ -3,7 +3,11 @@ import os
 import secrets
 import threading
 import time
+from typing import Literal
 from fastapi import FastAPI, Depends, Request, HTTPException
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -22,6 +26,10 @@ from model_loader import get_express_models
 from cookie_auth import validate_cookie
 import express_key_probe
 from resumable import resumable_store
+import network_proxy
+from request_lifecycle import DisconnectMiddleware, shutdown_jobs
+from api_errors import create_openai_error_response, error_type_for_status
+from token_counting import warm_tokenizer
 
 express_key_manager = ExpressKeyManager()
 
@@ -43,6 +51,8 @@ async def _probe_express_projects_on_startup() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from model_loader import refresh_models_config_cache
+    # Validate the bundled vocabulary once; no tokenizer network downloads at runtime.
+    await asyncio.to_thread(warm_tokenizer)
     print("🚀 [服务启动] agentplatform2api 适配器已启动（Express API Key / Cookie 直连 双通道）。")
 
     # S-1：默认口令 + 公开托管 + 明文 Cookie 是很危险的组合，必须让人看见。
@@ -77,9 +87,29 @@ async def lifespan(app: FastAPI):
         for _t in (_probe_task, _sweeper_task):
             if not _t.done():
                 _t.cancel()
+        await shutdown_jobs()
         resumable_store.cancel_all_pumps()
 
 app = FastAPI(title="agentplatform2api", lifespan=lifespan)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def api_http_error(request: Request, error: StarletteHTTPException):
+    if not request.url.path.startswith("/v1/"):
+        return await http_exception_handler(request, error)
+    return JSONResponse(status_code=error.status_code, headers=error.headers,
+                        content=create_openai_error_response(
+                            error.status_code, str(error.detail), error_type_for_status(error.status_code)))
+
+
+@app.exception_handler(RequestValidationError)
+async def api_validation_error(request: Request, error: RequestValidationError):
+    if not request.url.path.startswith("/v1/"):
+        return await request_validation_exception_handler(request, error)
+    details = error.errors()[0] if error.errors() else {}
+    payload = create_openai_error_response(422, "请求参数无效：" + details.get("msg", "格式错误"), "invalid_request_error")
+    payload["error"]["param"] = ".".join(str(part) for part in details.get("loc", ()) if part != "body") or None
+    return JSONResponse(status_code=422, content=payload)
 
 app.add_middleware(
     CORSMiddleware,
@@ -100,7 +130,7 @@ async def stats_tracker_middleware(request: Request, call_next):
         stats.increment_total()
         try:
             response = await call_next(request)
-            if response.status_code >= 400:
+            if response.status_code >= 400 and response.status_code != 499:
                 stats.add_error()
             return response
         except Exception as e:
@@ -352,7 +382,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="w-36 h-36"><canvas id="donut"></canvas></div>
       </div>
       <div class="card p-5 md:col-span-2">
-        <div class="lbl mb-4">Token 算力消耗 <span class="text-neutral-400" style="text-transform:none;font-weight:400">· 仅标准 Express 通道计入（Cookie 直连接口不回传用量）</span></div>
+        <div class="lbl mb-4">Token 用量 <span class="text-neutral-400" style="text-transform:none;font-weight:400">· Express 上游用量 + Cookie 上游或本地分词估算（本地不含媒体 token）</span></div>
         <div class="space-y-4">
           <div><div class="flex justify-between text-sm mb-1"><span class="text-neutral-600">Prompt（输入）</span><span id="t-prompt" class="val font-semibold">0</span></div><div class="w-full bg-neutral-100 rounded-full h-1.5"><div class="bg-black h-1.5 rounded-full" style="width:70%"></div></div></div>
           <div><div class="flex justify-between text-sm mb-1"><span class="text-neutral-600">Completion（输出）</span><span id="t-comp" class="val font-semibold">0</span></div><div class="w-full bg-neutral-100 rounded-full h-1.5"><div class="bg-neutral-400 h-1.5 rounded-full" style="width:45%"></div></div></div>
@@ -375,6 +405,66 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <input type="radio" name="mode" value="web_proxy" class="mt-1" onchange="updateMode('web_proxy')">
           <div><div class="font-medium text-sm">Cookie 直连反代</div><div class="text-xs text-neutral-500 mt-0.5">用控制台 Cookie 调 batchGraphql</div></div>
         </label>
+      </div>
+    </div>
+    <!-- 全局出网代理：与上方认证通道独立 -->
+    <div class="card p-5 mb-4">
+      <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
+        <div>
+          <div class="text-sm font-semibold">出网代理</div>
+          <div class="text-xs text-neutral-500 mt-0.5">Express / Cookie 两条通道、模型清单与远程图片共用；保存后新请求立即生效</div>
+        </div>
+        <span id="proxy-status" class="pill" style="text-transform:none">读取中</span>
+      </div>
+      <label class="lbl block mb-2" for="proxy-mode">连接方式</label>
+      <select id="proxy-mode" class="inp mb-3" onchange="proxyModeChanged()" disabled>
+        <option value="environment">跟随环境变量（PROXY_URL）</option>
+        <option value="custom">自定义代理</option>
+        <option value="pool">代理池（手动选择）</option>
+        <option value="direct">直接连接（忽略环境代理）</option>
+      </select>
+      <div id="proxy-pool-choice" class="hidden mb-3">
+        <label class="lbl block mb-2" for="proxy-pool-select">选择已保存的代理</label>
+        <select id="proxy-pool-select" class="inp" onchange="$('proxy-result').textContent=''" disabled></select>
+      </div>
+      <div id="proxy-custom" class="hidden">
+        <label class="lbl block mb-2" for="proxy-url">代理地址</label>
+        <div class="flex items-center gap-2 mb-2">
+          <input id="proxy-url" type="password" autocomplete="new-password" spellcheck="false" class="inp log flex-1 min-w-0" placeholder="socks5://用户名:密码@主机:端口" oninput="$('proxy-result').textContent=''" disabled>
+          <label class="flex items-center gap-1 text-xs text-neutral-500 whitespace-nowrap"><input id="proxy-show" type="checkbox" onchange="$('proxy-url').type=this.checked?'text':'password'" disabled>显示输入</label>
+        </div>
+        <p class="text-xs text-neutral-500 mb-3">支持 HTTP / HTTPS / SOCKS5 / SOCKS5H；特殊字符请使用 URL 编码。留空保留已保存代理，首次设置时可沿用 PROXY_URL。密码仅在输入时展示，保存后只显示掩码。</p>
+      </div>
+      <p id="proxy-effective" class="text-xs text-neutral-500 mb-3 break-all" role="status">正在读取代理配置…</p>
+      <div class="flex items-center justify-between flex-wrap gap-2">
+        <p class="text-xs text-neutral-500">测试当前表单，不会保存；已有请求保持原连接。</p>
+        <div class="flex gap-2">
+          <button id="proxy-test" class="px-3 py-2 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="testNetworkProxy()" disabled>测试连接</button>
+          <button id="proxy-save" class="btn px-4 py-2 text-sm" onclick="saveNetworkProxy()" disabled>保存代理</button>
+        </div>
+      </div>
+      <p id="proxy-result" class="text-xs mt-3 break-all" role="status" aria-live="polite"></p>
+      <div class="border-t border-neutral-100 mt-4 pt-4">
+        <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
+          <div class="text-sm font-semibold">已保存的代理 <span id="proxy-pool-count" class="pill" style="text-transform:none">0 个</span></div>
+          <button id="proxy-pool-current" class="px-3 py-1.5 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="importCurrentProxy()" disabled>将当前代理加入列表</button>
+        </div>
+        <p class="text-xs text-neutral-500 mb-3">命名后保存多个地址，点「使用」即可切换，无需再次填写密码。仅手动选择，不自动轮换；正在进行的请求保持原连接。</p>
+        <div id="proxy-pool-list" class="space-y-2 mb-3"></div>
+        <div class="border border-neutral-200 rounded-lg p-3">
+          <div id="proxy-entry-heading" class="text-sm font-medium mb-2">添加代理</div>
+          <label class="lbl block mb-1" for="proxy-entry-name">名称</label>
+          <input id="proxy-entry-name" maxlength="80" class="inp mb-2" placeholder="例如：美国 A、日本 B" disabled>
+          <label class="lbl block mb-1" for="proxy-entry-url">代理地址</label>
+          <input id="proxy-entry-url" type="password" autocomplete="new-password" spellcheck="false" class="inp log mb-2" placeholder="socks5://用户名:密码@主机:端口" disabled>
+          <div class="flex items-center justify-between gap-2 flex-wrap">
+            <label class="flex items-center gap-1 text-xs text-neutral-500"><input id="proxy-entry-show" type="checkbox" onchange="$('proxy-entry-url').type=this.checked?'text':'password'" disabled>显示本次输入</label>
+            <div class="flex gap-2">
+              <button id="proxy-entry-cancel" class="hidden px-3 py-1.5 text-sm rounded-lg border border-neutral-300" onclick="cancelProxyEdit()" disabled>取消编辑</button>
+              <button id="proxy-entry-save" class="btn px-3 py-1.5 text-sm" onclick="saveProxyEntry()" disabled>添加到代理池</button>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
     <!-- Express API Key 列表（多账号，热编辑） -->
@@ -412,7 +502,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <span class="text-xs text-neutral-500">保存后自动校验是否包含 SAPISID</span>
         <button class="btn px-4 py-2 text-sm" onclick="saveCookie()">保存并激活</button>
       </div>
-      <p class="text-xs text-neutral-500 mt-3 leading-relaxed">💡 Cookie 通常较为持久（可维持数周甚至更久，取决于账号会话是否有效）；仅当出现 Permission Denied 等权限错误时再重新获取粘贴即可，并非只有 1–2 小时。</p>
     </div>
   </section>
 
@@ -458,7 +547,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <option value="off">关闭原生思考（角色扮演推荐）</option>
             <option value="console">强制用上方档位（忽略前端）</option>
           </select>
-          <p class="text-xs text-neutral-500 mt-2 leading-relaxed">🎭 <b>跑角色扮演预设、想让预设自带的思维链接管时，选“关闭原生思考”。</b>只想对某个模型这么设，就用上方的“保存为该模型专属”。<br>• <b>跟随请求</b>：用前端发来的 <code>reasoning_effort</code>；SillyTavern 等常发 <code>xhigh</code> → 高强度原生思考。<br>• <b>关闭原生思考</b>：忽略前端参数，把档位压到<span id="ntm-floor">该模型最低档</span>，并<b>不返回思考</b>。⚠️ 实测 Studio(batchGraphql) 会忽略 includeThoughts，故本项在压档位的同时于响应侧<b>剥离思考块</b>——重预设下这是避免“只有思考、没有正文”的关键。<br>• <b>强制用上方档位</b>：忽略前端，用你在上面选的档位（返回思考）。<br>（预填充预设另见“开关 &amp; 预填充”卡片的压制开关。）</p>
+          <p class="text-xs text-neutral-500 mt-2 leading-relaxed">🎭 <b>跑角色扮演预设、想让预设自带的思维链接管时，选“关闭原生思考”。</b>只想对某个模型这么设，就用上方的“保存为该模型专属”。<br>• <b>跟随请求</b>：用前端发来的 <code>reasoning_effort</code>；SillyTavern 等常发 <code>xhigh</code> → 高强度原生思考。<br>• <b>关闭原生思考</b>：忽略前端参数，把档位压到<span id="ntm-floor">该模型最低档</span>，并<b>不返回思考</b>。⚠️ 实测 Studio(batchGraphql) 会忽略 includeThoughts，故本项在压档位的同时于响应侧<b>剥离思考块</b>——重预设下这是避免“只有思考、没有正文”的关键。<br>• <b>强制用上方档位</b>：忽略前端，用你在上面选的档位（返回思考）。<br></p>
         </div>
       </div>
 
@@ -475,15 +564,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
         <p id="image-note" class="text-xs text-neutral-500 mt-2"></p>
         <div class="space-y-3 mt-3 pt-3 border-t border-neutral-100">
-          <div class="text-xs text-neutral-400">以下两项仅对生图模型有意义，可按模型专属保存</div>
+          <div class="text-xs text-neutral-400">以下设置仅对生图模型有意义，可按模型专属保存</div>
           <div>
             <div class="flex items-center justify-between"><span class="text-sm">生图下发 system 指令<span class="helpq" onclick="hlp(this,'h_isi')">?</span></span><label class="switch"><input type="checkbox" id="image_system_instruction"><span class="slider"></span></label></div>
             <div id="h_isi" class="helpbox">关闭时（默认）生图模型会<b>丢弃 system 提示词</b>——你写的画风、构图要求全部不生效。开启后 system 会随生图请求一起下发。<br>实测对照（system=“纯黑白线稿，只有线条”，user=“画一只猫”）：<b>关 → 彩色写实照片；开 → 黑白线稿</b>。默认关只是为了不改变旧行为，<b>用生图建议打开</b>。</div>
           </div>
-          <div>
-            <div class="flex items-center justify-between"><span class="text-sm">生图也注入预填充<span class="helpq" onclick="hlp(this,'h_ipf')">?</span></span><label class="switch"><input type="checkbox" id="inject_prefill_for_image"><span class="slider"></span></label></div>
-            <div id="h_ipf" class="helpbox">默认关：下面“注入预填充”的内容<b>不会</b>发给生图模型。<br>预填充对生图其实有<b>很强的引导力</b>——实测同一句“画一只猫”，预填充承诺“纯黑白钢笔线稿”就真的输出线稿，不加则是彩色写实照片。想用它引导画风或做破限，就打开。<br><b>注意</b>：角色扮演用的预填充（例如思考块开标签）落到生图请求上，可能让模型改吐一段文字而不出图。建议配合“保存为该模型专属”，给生图模型单独配一段合适的预填充。<br>生图模型会自动改用一句<b>要图片</b>的续写指令（否则模型会把“继续往下写”理解成继续写文字，实测会吐字符画）；若你在下面自定义了“续写指令模板”，则以你的为准——生图用时记得写明“直接输出图片”。</div>
-          </div>
+
         </div>
       </div>
 
@@ -508,7 +594,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
       <!-- 控制台注入（可按模型覆盖） -->
       <div class="card p-5">
-        <div class="text-sm font-semibold mb-3">注入与续写 <span class="text-xs font-normal text-neutral-400">（留空＝不启用 / 用内置默认；均支持按模型专属）</span></div>
+        <div class="text-sm font-semibold mb-3">附加 system 指令 <span class="text-xs font-normal text-neutral-400">（留空＝不启用；支持按模型专属）</span></div>
         <div class="space-y-3">
 
           <div>
@@ -516,22 +602,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <textarea id="inject_system_instruction" rows="2" class="inp log" placeholder="留空 = 不注入"></textarea>
             <div id="h_injs" class="helpbox">追加到客户端 system 之<b>后</b>，两条通道都生效。<br>给 <b>RikkaHub 这类轻量前端</b>用：它们没有酒馆的预设系统，每开一个新对话都要重设系统提示。填在这里就是<b>所有前端、所有对话通用</b>。<br><b>酒馆用户请留空</b>——预设已经管了 system，这里再加会和预设打架，而且 <code>{{getvar::xx}}</code> 这类宏在代理侧<b>不会被解析</b>。</div>
           </div>
-          <div>
-            <div class="lbl mb-1">注入预填充<span class="helpq" onclick="hlp(this,'h_injp')">?</span></div>
-            <textarea id="inject_prefill" rows="2" class="inp log" placeholder="留空 = 不注入"></textarea>
-            <div id="h_injp" class="helpbox">
-              客户端<b>没有发送</b>预填充时，代理自动补一条 assistant 消息，然后按上面的“预填充兼容模式”处理。<br>
-              轻量前端<b>从不发送预填充</b>，等于完全用不上破限最强的那个杠杆，连“预填充时压制原生思考”也永远不会触发（3.6-flash 上更容易出现“只有思考没正文”）。填在这里就能补上。<br>
-              内容通常很短：一句开场白 + 思考块的开标签即可，别塞大段规则（规则请放上面的 system 框）。<br>
-              <b>四条护栏，避免和现有功能冲突</b>：① 客户端已自带预填充（酒馆）→ 跳过，不覆盖；② 请求带函数调用 → 跳过；③ 生图模型 → 默认跳过（可用上面的“生图也注入预填充”放行）；④ 留空 → 完全不启用。<br>
-              <b>只填内容还不够</b>：填完必须点保存——点“保存全局设置”＝对所有模型生效；点上方“保存为该模型专属”＝只对当前所选模型生效。（生图模型还需额外打开上面的“生图也注入预填充”开关，那个开关只是放行，内容仍取自这里。）<br>强烈建议按模型分开配：生图要的是画风描述，角色扮演要的是思考块开标签，两者内容完全不同；问答用的模型则应留空（否则每条回复开头都会多出这段文字，原生思考也会被压制、影响答题深度）。
-            </div>
-          </div>
-          <div>
-            <div class="lbl mb-1">续写指令模板<span class="helpq" onclick="hlp(this,'h_pfi')">?</span></div>
-            <textarea id="prefill_instruction" rows="2" class="inp log" placeholder="留空 = 使用内置默认"></textarea>
-            <div id="h_pfi" class="helpbox">留空即用内置默认，一般不用改。<br><b>「智能」模式</b>下它是那句续写指令，预填充文本会附在它后面；<b>「保留模型轮次」模式</b>下它就是末尾那句推动语。<br>若「保留模型轮次」老是重复开标签，可以把这里改得更短更像催促（例如只填 <code>继续</code>），减少“新一轮”的暗示。<br><b>与生图的关系</b>：留空时，生图模型会自动换用一句“直接输出图片”的指令；<b>一旦你在这里填了内容，生图模型也会用你填的这句</b>——若那句写的是“接着往下写”，生图会吐字符画而不是图片。所以给生图模型请用<b>“保存为该模型专属”</b>单独配一句（例如“直接输出图片，不要任何文字”），别让文本模型的模板串过去。</div>
-          </div>
+
+
         </div>
       </div>
 
@@ -612,9 +684,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- 重试 -->
+      <!-- 超时与重试 -->
       <div class="card p-5">
-        <div class="text-sm font-semibold mb-3">重试与退避</div>
+        <div class="text-sm font-semibold mb-3">超时、重试与退避</div>
+        <div class="mb-3">
+          <label for="studio_read_timeout_seconds" class="lbl mb-1 block">Studio 读取超时(秒)<span class="helpq" onclick="hlp(this,'h_studio_timeout');event.preventDefault()">?</span></label>
+          <input id="studio_read_timeout_seconds" type="number" min="1" max="3600" step="1" class="inp" placeholder="180">
+          <div id="h_studio_timeout" class="helpbox">仅作用于 Studio/Cookie 通道，文本流式、非流式和生图共用。默认 <b>180 秒</b>，可填 <b>1–3600</b> 的整数。限制的是等待首段或下一段上游响应数据的时间，而非整次生成的总时长。点击“保存全局设置”后对新请求立即生效；非流式超时返回 504 并结束本次请求。客户端或外层反向代理的超时需相应留足。</div>
+        </div>
         <div class="grid grid-cols-2 gap-3">
           <div><div class="lbl mb-1">最大重试次数</div><input id="retry_max" type="number" class="inp"></div>
           <div><div class="lbl mb-1">退避间隔(秒)</div><input id="retry_backoff_seconds" type="number" step="0.5" class="inp"></div>
@@ -623,14 +700,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
       <!-- 开关 -->
       <div class="card p-5">
-        <div class="text-sm font-semibold mb-3">开关 & 预填充</div>
+        <div class="text-sm font-semibold mb-3">开关</div>
         <div class="space-y-3">
           <div class="flex items-center justify-between"><span class="text-sm">假流式（fake streaming）</span><label class="switch"><input type="checkbox" id="fake_streaming"><span class="slider"></span></label></div>
           <div class="flex items-center justify-between"><span class="text-sm">假流式心跳间隔(秒)</span><input id="fake_streaming_interval" type="number" step="0.5" class="inp" style="width:90px"></div>
           <div>
             <div class="flex items-center justify-between"><span class="text-sm">弱网续传（服务端缓冲）<span class="helpq" onclick="hlp(this,'h_rsm')">?</span></span><label class="switch"><input type="checkbox" id="resumable_enabled"><span class="slider"></span></label></div>
-            <div id="h_rsm" class="helpbox">反代收到 Google 的完整回复后先放进服务端缓冲区再吐给前端；前端断线可凭 <code>Last-Event-ID</code> 或 <code>?resume_from=</code> 续传，也可轮询 <code>/v1/resumable/{id}</code> 拉分片。关掉则回到原有直通行为。</div>
+            <div id="h_rsm" class="helpbox">服务端缓存已收到的响应，凭 <code>Last-Event-ID</code> 或 <code>?resume_from=</code> 续传，也可轮询 <code>/v1/resumable/{id}</code> 拉分片。缓存与断连策略独立：默认最后一个调用方离开即取消上游；需要跨断线继续生成时，开启下面的重连宽限。</div>
           </div>
+          <div>
+            <div class="flex items-center justify-between"><span class="text-sm">断连后等待重连<span class="helpq" onclick="hlp(this,'h_disconnect')">?</span></span><label class="switch"><input type="checkbox" id="continue_on_disconnect"><span class="slider"></span></label></div>
+            <div id="h_disconnect" class="helpbox">默认关闭：最后一个调用方断开即取消上游调用及重试。开启后，仅在弱网续传模式下等待下面的宽限时长，期间同一请求重连可接续；到期仍无调用方则取消。同一任务有多个调用方时，仅最后一个离开才开始计时。显式取消接口会跳过宽限立即停止。保存后对新任务生效。</div>
+          </div>
+          <div class="flex items-center justify-between"><label for="disconnect_grace_seconds" class="text-sm">重连宽限(秒)</label><input id="disconnect_grace_seconds" type="number" min="0" max="300" step="1" class="inp" style="width:90px" placeholder="5"></div>
           <div class="flex items-center justify-between"><span class="text-sm">续传缓冲保留时长(秒)</span><input id="resumable_ttl_seconds" type="number" step="60" class="inp" style="width:90px"></div>
           <div class="flex items-center justify-between"><span class="text-sm">续传缓冲数量上限</span><input id="resumable_max_streams" type="number" step="10" class="inp" style="width:90px"></div>
           <div class="flex items-center justify-between"><span class="text-sm">多 Key 轮询（round-robin）</span><label class="switch"><input type="checkbox" id="roundrobin"><span class="slider"></span></label></div>
@@ -649,33 +731,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 
           <div class="pt-1 border-t border-neutral-100"></div>
-          <div class="text-xs font-semibold text-neutral-500 pt-1">预填充</div>
 
-          <div>
-            <div class="flex items-center justify-between gap-3"><span class="text-sm">预填充兼容模式<span class="helpq" onclick="hlp(this,'h_pfm')">?</span></span>
-              <select id="prefill_mode" class="inp" style="width:150px"><option value="smart">智能（默认）</option><option value="keep_turn">保留模型轮次</option><option value="minimal">最小</option><option value="off">关闭</option></select>
-            </div>
-            <div id="h_pfm" class="helpbox">
-              <b>什么是预填充</b>：请求里<b>最后一条 assistant 消息</b>（酒馆预设里通常是最底部那条“助手”条目，内容多为思维链的开标签）。它替模型写好了回复开头，模型只能顺着往下写——这是破限最强的杠杆，也用来顶掉原生思维链。预设里那些 system 条目<b>不是</b>预填充。<br>
-              <b>为什么需要兼容</b>：Gemini 3.x 拒绝以 assistant 结尾的请求（400），必须改造成 user 结尾。<br><br>
-              <b>智能（默认）</b>：删掉那条 assistant，把它的文字并进最后一条 user。模型视角＝“用户给了我一段参考文字”。输出干净（实测开闭标签各 1 个），但模型没有“说过”这句话，破限杠杆最弱。<br>
-              <b>保留模型轮次</b>：assistant 原样留着，后面补一句很短的 user 推动语。模型视角＝“这是我自己写了一半的”，破限杠杆保留。代价是模型容易当成新一轮、<b>把开标签再写一遍</b>（实测 3/3）。<br>
-              <b>最小</b>：只补占位 user 保证不报错，<b>不把预填充拼回输出</b>——思考开标签会缺失，前端正则可能抓不到。<br>
-              <b>关闭</b>：原样发出，3.x 直接 400；而且代理检测不到预填充，思考压制也不会触发。<br><br>
-              2.5 及更早的模型不受影响，走的是<b>原生透传</b>，效果等同老式预填充。
-            </div>
-          </div>
-          <div>
-            <div class="flex items-center justify-between"><span class="text-sm">预填充时压制原生思考<span class="helpq" onclick="hlp(this,'h_pst')">?</span></span><label class="switch"><input type="checkbox" id="prefill_suppress_thinking"><span class="slider"></span></label></div>
-            <div id="h_pst" class="helpbox">检测到预填充时，把模型的<b>原生思维链压到最低并不回传</b>，让预设自带的思维链接管（写作效果通常更好，也避免“只有思考没有正文”）。<br>3.x 压到最低档（无法完全关闭），2.5-flash 预算 0 全关，2.5-pro 降到 128。<br><b>只在请求真的带预填充时才触发</b>；若你的预设把思维链写在 system 里、没有 assistant 条目，请改用上方“思考强度”卡片的“关闭原生思考”。</div>
-          </div>
+
+
 
         </div>
       </div>
     </div>
 
     <div class="flex items-center justify-end gap-3 mt-4">
-      <span class="text-xs text-neutral-500">只保存 ② 区（图压缩 / 重试 / 假流式 / 调试开关）；① 区请用上方那个保存按钮</span>
+      <span class="text-xs text-neutral-500">只保存 ② 区（图压缩 / 超时 / 重试 / 假流式 / 调试开关）；① 区请用上方那个保存按钮</span>
       <button class="btn px-5 py-2.5 text-sm" onclick="saveSettings()">保存全局设置</button>
     </div>
   </section>
@@ -697,7 +762,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let CAPS = {}, chart = null, curAR = "";
 let GLOBAL_SETTINGS = {}, OVERRIDES = {};
-const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction','image_system_instruction','inject_prefill_for_image','sampling_policy'];
+const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','image_system_instruction','sampling_policy'];
 const COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
 
 function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1800); }
@@ -768,6 +833,172 @@ async function loadRuntime(){
     }
     if(s.google_project_id) $('project-input').value=s.google_project_id;
   }catch(e){}
+}
+
+/* ---------- 出网代理（仅回显掩码，空输入保留原认证信息） ---------- */
+let PROXY_STATE = null;
+let PROXY_BUSY = false, PROXY_EDIT_ID = '';
+function escapeProxyHTML(value){
+  return String(value||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function setProxyBusy(busy){
+  PROXY_BUSY=busy;
+  const locked=busy||!PROXY_STATE;
+  ['proxy-test','proxy-save','proxy-mode','proxy-entry-name','proxy-entry-url','proxy-entry-show','proxy-entry-save','proxy-entry-cancel'].forEach(id=>{$(id).disabled=locked;});
+  const mode=$('proxy-mode').value;
+  $('proxy-url').disabled=locked||mode!=='custom'; $('proxy-show').disabled=locked||mode!=='custom';
+  $('proxy-pool-select').disabled=locked||mode!=='pool'||!(PROXY_STATE?.pool||[]).length;
+  $('proxy-pool-current').disabled=locked||!PROXY_STATE?.enabled||!!PROXY_STATE?.current_in_pool;
+  $('proxy-pool-list').querySelectorAll('button').forEach(b=>{b.disabled=locked||b.dataset.locked==='1';});
+}
+function proxyModeChanged(){
+  const mode=$('proxy-mode').value, custom=mode==='custom';
+  $('proxy-custom').classList.toggle('hidden',!custom);
+  $('proxy-pool-choice').classList.toggle('hidden',mode!=='pool');
+  setProxyBusy(PROXY_BUSY);
+  $('proxy-result').textContent='';
+}
+function renderProxyPool(s){
+  const pool=s.pool||[], selected=pool.some(p=>p.id===s.active_id)?s.active_id:(pool[0]?.id||'');
+  $('proxy-pool-count').textContent=pool.length+' 个';
+  $('proxy-pool-select').innerHTML=pool.length?pool.map(p=>`<option value="${escapeProxyHTML(p.id)}">${escapeProxyHTML(p.name)} · ${escapeProxyHTML(p.url_masked)}</option>`).join(''):'<option value="">请先添加代理</option>';
+  $('proxy-pool-select').value=selected;
+  $('proxy-pool-list').innerHTML=pool.length?pool.map(p=>{
+    const id=escapeProxyHTML(p.id), locked=p.active?'1':'0';
+    return `<div class="border ${p.active?'border-emerald-300':'border-neutral-200'} rounded-lg p-3">
+      <div class="flex items-start justify-between flex-wrap gap-2">
+        <div class="min-w-0 flex-1"><div class="text-sm font-medium break-all">${escapeProxyHTML(p.name)}${p.active?' <span class="text-xs text-emerald-600">当前使用</span>':''}</div><div class="text-xs text-neutral-500 break-all mt-1">${escapeProxyHTML(p.url_masked)}</div></div>
+        <div class="flex gap-2 flex-wrap">
+          <button data-proxy-action="use" data-proxy-id="${id}" data-locked="${locked}" ${p.active?'disabled':''} class="btn px-3 py-1.5 text-xs">${p.active?'已启用':'使用'}</button>
+          <button data-proxy-action="test" data-proxy-id="${id}" class="px-2 py-1.5 text-xs rounded-lg border border-neutral-300">测试</button>
+          <button data-proxy-action="edit" data-proxy-id="${id}" class="px-2 py-1.5 text-xs rounded-lg border border-neutral-300">编辑</button>
+          <button data-proxy-action="delete" data-proxy-id="${id}" data-locked="${locked}" ${p.active?'disabled title="先切换后删除"':''} class="px-2 py-1.5 text-xs rounded-lg border border-rose-200 text-rose-600">删除</button>
+        </div>
+      </div><p id="proxy-pool-result-${id}" class="text-xs mt-2 break-all" role="status" aria-live="polite"></p>
+    </div>`;
+  }).join(''):'<p class="text-xs text-neutral-500">列表为空，可在下方添加，或将当前代理加入列表。</p>';
+  $('proxy-pool-list').onclick=event=>{
+    const button=event.target.closest('button[data-proxy-action]');
+    if(!button||button.disabled||PROXY_BUSY) return;
+    const id=button.dataset.proxyId, action=button.dataset.proxyAction;
+    if(action==='use') activateProxyEntry(id);
+    if(action==='test') testProxyEntry(id);
+    if(action==='edit') editProxyEntry(id);
+    if(action==='delete') deleteProxyEntry(id);
+  };
+}
+function renderNetworkProxy(s){
+  PROXY_STATE=s;
+  $('proxy-mode').value=s.mode;
+  $('proxy-url').value='';
+  $('proxy-url').type='password';
+  $('proxy-show').checked=false;
+  const saved=s.custom_url_masked||s.environment_url_masked;
+  $('proxy-url').placeholder=saved ? ('留空沿用 '+saved) : 'socks5://用户名:密码@主机:端口';
+  $('proxy-status').textContent={environment:'跟随环境',custom:'自定义代理',direct:'直接连接',pool:'代理池'}[s.mode]||s.mode;
+  const active=(s.pool||[]).find(p=>p.active);
+  $('proxy-effective').textContent='当前生效：'+(active?(active.name+' · '):'')+(s.effective_url_masked||(s.mode==='environment'?'跟随运行环境（未设置 PROXY_URL）':'直接连接'));
+  renderProxyPool(s);
+  proxyModeChanged();
+}
+async function loadNetworkProxy(){
+  try{
+    const r=await fetch('/api/proxy',{cache:'no-store'});
+    const d=await r.json();
+    if(!r.ok) throw new Error(d.detail||'代理配置读取失败');
+    renderNetworkProxy(d);
+  }catch(e){ $('proxy-status').textContent='读取失败'; $('proxy-effective').textContent='代理配置读取失败，请刷新页面重试。'; }
+}
+function networkProxyPayload(){
+  const mode=$('proxy-mode').value;
+  return {mode,proxy_url:mode==='custom'?($('proxy-url').value.trim()||null):null,proxy_id:mode==='pool'?($('proxy-pool-select').value||null):null};
+}
+async function proxyFetch(url,method,payload){
+  const options={method,headers:{'Content-Type':'application/json'}};
+  if(payload!==undefined) options.body=JSON.stringify(payload);
+  const r=await fetch(url,options), d=await r.json();
+  if(!r.ok) throw new Error(typeof d.detail==='string'?d.detail:'代理操作失败');
+  return d;
+}
+function proxyResult(message,ok=true,id=''){
+  const target=(id?$('proxy-pool-result-'+id):null)||$('proxy-result');
+  target.className='text-xs mt-3 break-all '+(ok?'text-emerald-600':'text-rose-600');
+  target.textContent=message;
+}
+async function submitNetworkProxy(test){
+  if(!PROXY_STATE||PROXY_BUSY) return;
+  const button=$(test?'proxy-test':'proxy-save'), label=button.textContent;
+  const payload=networkProxyPayload();
+  setProxyBusy(true);
+  button.textContent=test?'测试中…':'保存中…';
+  $('proxy-result').textContent='';
+  try{
+    const d=await proxyFetch(test?'/api/proxy/test':'/api/proxy','POST',payload);
+    if(test){
+      proxyResult(d.message+' '+d.elapsed_ms+' ms'+(d.proxy_url_masked?' · '+d.proxy_url_masked:''),d.ok);
+    }else{
+      renderNetworkProxy(d);
+      proxyResult('代理已保存，新请求立即生效，无需重启服务。');
+      toast('代理设置已保存');
+    }
+  }catch(e){ proxyResult(e.message||'网络请求失败',false); }
+  finally{
+    button.textContent=label;
+    setProxyBusy(false);
+  }
+}
+function testNetworkProxy(){ return submitNetworkProxy(true); }
+function saveNetworkProxy(){ return submitNetworkProxy(false); }
+function cancelProxyEdit(){
+  PROXY_EDIT_ID=''; $('proxy-entry-name').value=''; $('proxy-entry-url').value='';
+  $('proxy-entry-url').type='password'; $('proxy-entry-show').checked=false;
+  $('proxy-entry-url').placeholder='socks5://用户名:密码@主机:端口';
+  $('proxy-entry-heading').textContent='添加代理'; $('proxy-entry-save').textContent='添加到代理池';
+  $('proxy-entry-cancel').classList.toggle('hidden',true);
+}
+function editProxyEntry(id){
+  if(PROXY_BUSY) return;
+  const entry=(PROXY_STATE?.pool||[]).find(p=>p.id===id); if(!entry) return;
+  PROXY_EDIT_ID=id; $('proxy-entry-name').value=entry.name; $('proxy-entry-url').value='';
+  $('proxy-entry-url').type='password'; $('proxy-entry-show').checked=false;
+  $('proxy-entry-url').placeholder='留空保留 '+entry.url_masked;
+  $('proxy-entry-heading').textContent='编辑代理（地址留空保持原认证信息）';
+  $('proxy-entry-save').textContent='保存修改'; $('proxy-entry-cancel').classList.toggle('hidden',false);
+  $('proxy-entry-name').focus();
+}
+async function proxyPoolAction(url,method,payload,message,id='',test=false){
+  if(!PROXY_STATE||PROXY_BUSY) return false;
+  setProxyBusy(true);
+  if(test) proxyResult('测试中…',true,id);
+  try{
+    const d=await proxyFetch(url,method,payload);
+    if(test){ proxyResult(d.message+' '+d.elapsed_ms+' ms',d.ok,id); }
+    else{ renderNetworkProxy(d); proxyResult(message); toast(message); }
+    return true;
+  }catch(e){ proxyResult(e.message||'网络请求失败',false,id); return false; }
+  finally{ setProxyBusy(false); }
+}
+async function saveProxyEntry(){
+  const editing=PROXY_EDIT_ID;
+  const payload={name:$('proxy-entry-name').value.trim(),proxy_url:$('proxy-entry-url').value.trim()||null};
+  if(!payload.name){ proxyResult('请填写代理名称。',false); return; }
+  if(await proxyPoolAction('/api/proxy/pool'+(editing?'/'+encodeURIComponent(editing):''),editing?'PUT':'POST',payload,editing?'代理已更新':'代理已加入列表')) cancelProxyEdit();
+}
+async function importCurrentProxy(){
+  await proxyPoolAction('/api/proxy/pool/current','POST',{name:$('proxy-entry-name').value.trim()||'当前代理'},'当前代理已加入列表');
+}
+function activateProxyEntry(id){
+  return proxyPoolAction('/api/proxy','POST',{mode:'pool',proxy_id:id,proxy_url:null},'已切换代理，新请求立即生效');
+}
+function testProxyEntry(id){
+  return proxyPoolAction('/api/proxy/test','POST',{mode:'pool',proxy_id:id,proxy_url:null},'',id,true);
+}
+async function deleteProxyEntry(id){
+  const entry=(PROXY_STATE?.pool||[]).find(p=>p.id===id);
+  if(!entry||PROXY_BUSY||!confirm('删除代理“'+entry.name+'”？')) return;
+  if(await proxyPoolAction('/api/proxy/pool/'+encodeURIComponent(id),'DELETE',undefined,'代理已删除')){
+    if(PROXY_EDIT_ID===id) cancelProxyEdit();
+  }
 }
 
 /* ---------- Express Key 列表（多账号，热编辑） ---------- */
@@ -867,8 +1098,8 @@ async function loadParams(){
     const s=await (await fetch('/api/settings')).json();
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
-    ['native_thinking_mode','thinking_g3_level','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','resumable_ttl_seconds','resumable_max_streams'].forEach(k=>setV(k,s[k]));
-    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','resumable_enabled'].forEach(k=>setV(k,s[k]));
+    ['native_thinking_mode','thinking_g3_level','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','studio_read_timeout_seconds','disconnect_grace_seconds','fake_streaming_interval','inject_system_instruction','sampling_policy','express_location','resumable_ttl_seconds','resumable_max_streams'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','image_system_instruction','resumable_enabled','continue_on_disconnect'].forEach(k=>setV(k,s[k]));
     // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
       if(s.hide_thoughts) setV('native_thinking_mode','off');
@@ -915,10 +1146,7 @@ async function saveModelOverride(){
     default_top_p:numOrNull('default_top_p'),
     default_max_tokens:numOrNull('default_max_tokens'),
     inject_system_instruction:$('inject_system_instruction').value,
-    inject_prefill:$('inject_prefill').value,
-    prefill_instruction:$('prefill_instruction').value,
     image_system_instruction:$('image_system_instruction').checked,
-    inject_prefill_for_image:$('inject_prefill_for_image').checked,
     sampling_policy:$('sampling_policy').value,
   };
   if(m==='__global__'){
@@ -1019,6 +1247,18 @@ async function saveSettings(){
   // 只保存 ② 全局设置区（基础设施项）。
   // ① 按模型参数不在这里保存——那些字段显示的是"当前所选模型"的生效值，
   // 一起提交会把某个模型的专属值（比如生图的注入内容）写成全局默认。
+  const studioTimeout=numOr('studio_read_timeout_seconds',180);
+  if(!Number.isInteger(studioTimeout)||studioTimeout<1||studioTimeout>3600){
+    toast('Studio 读取超时须为 1–3600 的整数（秒）。');
+    $('studio_read_timeout_seconds').focus();
+    return;
+  }
+  const disconnectGrace=numOr('disconnect_grace_seconds',5);
+  if(!Number.isInteger(disconnectGrace)||disconnectGrace<0||disconnectGrace>300){
+    toast('重连宽限须为 0–300 的整数（秒）。');
+    $('disconnect_grace_seconds').focus();
+    return;
+  }
   const patch={
     img_compress_enabled:$('img_compress_enabled').checked,
     img_compress_max_dim:numOr('img_compress_max_dim',1536),
@@ -1026,16 +1266,17 @@ async function saveSettings(){
     img_compress_quality:numOr('img_compress_quality',85),
     retry_max:numOr('retry_max',10),
     retry_backoff_seconds:numOr('retry_backoff_seconds',5),
+    studio_read_timeout_seconds:studioTimeout,
     fake_streaming:$('fake_streaming').checked,
     fake_streaming_interval:numOr('fake_streaming_interval',1),
     roundrobin:$('roundrobin').checked,
     safety_score:$('safety_score').checked,
     cookie_debug:$('cookie_debug').checked,
     debug_outbound:$('debug_outbound').checked,
-    prefill_mode:$('prefill_mode').value,
     express_location:$('express_location').value,
-    prefill_suppress_thinking:$('prefill_suppress_thinking').checked,
     resumable_enabled:$('resumable_enabled').checked,
+    continue_on_disconnect:$('continue_on_disconnect').checked,
+    disconnect_grace_seconds:disconnectGrace,
     resumable_ttl_seconds:numOr('resumable_ttl_seconds',1800),
     resumable_max_streams:numOr('resumable_max_streams',200),
   };
@@ -1048,12 +1289,12 @@ async function saveSettings(){
     });
   }
   const scope = overriding
-    ? '将保存全局的基础设施项（图压缩/重试/假流式/预填充/思考控制开关等）。\n当前所选模型有专属思考/生图/采样参数，不会被改动。'
+    ? '将保存全局的基础设施项（图压缩/重试/假流式/思考控制开关等）。\n当前所选模型有专属思考/生图/采样参数，不会被改动。'
     : '将保存为全局默认，影响所有【未设置专属参数】的模型。\n已设专属参数的模型不受影响。';
   if(!confirm(scope + '\n\n确定保存全局设置吗？')) return;
   try{
     const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
-    if(r.ok){ GLOBAL_SETTINGS=await r.json(); toast(overriding?'已保存全局(基础设施)设置；该模型的思考/生图/采样为专属值，未改全局':'全局设置已保存'); }
+    if(r.ok){ GLOBAL_SETTINGS=await r.json(); setV('studio_read_timeout_seconds',GLOBAL_SETTINGS.studio_read_timeout_seconds); toast(overriding?'已保存全局(基础设施)设置；该模型的思考/生图/采样为专属值，未改全局':'全局设置已保存'); }
     else toast('保存失败');
   }catch(e){ toast('❌ 网络请求失败'); }
 }
@@ -1080,7 +1321,7 @@ $('project-input').addEventListener('input',e=>{ const v=e.target.value.trim(); 
 $('image_aspect_ratio').addEventListener('change', e=>{ curAR=e.target.value; });
 
 /* init */
-fetchStats(); setInterval(fetchStats,3000); loadRuntime(); loadParams(); loadExpressKeys();
+fetchStats(); setInterval(fetchStats,3000); loadRuntime(); loadParams(); loadExpressKeys(); loadNetworkProxy();
 </script>
 </body>
 </html>
@@ -1145,6 +1386,74 @@ class ModeSetting(BaseModel):
     mode: str
 
 
+class NetworkProxySetting(BaseModel):
+    mode: Literal["environment", "custom", "direct", "pool"]
+    proxy_url: str | None = None
+    proxy_id: str | None = None
+
+
+class ProxyPoolEntrySetting(BaseModel):
+    name: str
+    proxy_url: str | None = None
+
+
+class ProxyPoolCurrentSetting(BaseModel):
+    name: str = "当前代理"
+
+
+def _proxy_action_response(action, *args, **kwargs):
+    try:
+        status = action(*args, **kwargs)
+    except network_proxy.ProxyEntryNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except OSError:
+        raise HTTPException(status_code=500, detail="代理配置保存失败，请检查状态目录权限和剩余空间。") from None
+    return JSONResponse(content=status, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/proxy")
+async def get_network_proxy_api(_auth: bool = Depends(require_auth)):
+    return JSONResponse(content=network_proxy.get_proxy_status(), headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/proxy")
+async def save_network_proxy_api(body: NetworkProxySetting, _auth: bool = Depends(require_auth)):
+    return _proxy_action_response(network_proxy.save_proxy_config, body.mode, body.proxy_url, body.proxy_id)
+
+
+@app.post("/api/proxy/pool")
+async def add_proxy_pool_entry_api(body: ProxyPoolEntrySetting, _auth: bool = Depends(require_auth)):
+    return _proxy_action_response(network_proxy.add_proxy_entry, body.name, body.proxy_url)
+
+
+@app.post("/api/proxy/pool/current")
+async def import_current_proxy_api(body: ProxyPoolCurrentSetting, _auth: bool = Depends(require_auth)):
+    return _proxy_action_response(network_proxy.add_proxy_entry, body.name, use_current=True)
+
+
+@app.put("/api/proxy/pool/{proxy_id}")
+async def edit_proxy_pool_entry_api(proxy_id: str, body: ProxyPoolEntrySetting, _auth: bool = Depends(require_auth)):
+    return _proxy_action_response(network_proxy.edit_proxy_entry, proxy_id, body.name, body.proxy_url)
+
+
+@app.delete("/api/proxy/pool/{proxy_id}")
+async def delete_proxy_pool_entry_api(proxy_id: str, _auth: bool = Depends(require_auth)):
+    return _proxy_action_response(network_proxy.delete_proxy_entry, proxy_id)
+
+
+@app.post("/api/proxy/test")
+async def test_network_proxy_api(body: NetworkProxySetting, _auth: bool = Depends(require_auth)):
+    try:
+        result = await network_proxy.test_proxy_connection(body.mode, body.proxy_url, body.proxy_id)
+    except network_proxy.ProxyEntryNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    return JSONResponse(content=result, headers={"Cache-Control": "no-store"})
+
+
 @app.get("/api/settings/runtime")
 async def get_runtime_settings(_auth: bool = Depends(require_auth)):
     cookie = app_state.get_google_cookie()
@@ -1177,7 +1486,10 @@ async def update_settings_api(request: Request, _auth: bool = Depends(require_au
         patch = {}
     if not isinstance(patch, dict):
         return JSONResponse(status_code=400, content={"error": "请求体必须是 JSON 对象。"})
-    updated = app_state.update_settings(patch)
+    try:
+        updated = app_state.update_settings(patch)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
     return JSONResponse(content=updated)
 
 
@@ -1367,3 +1679,4 @@ async def stream_logs_endpoint(request: Request, _auth: bool = Depends(require_a
 
 app.include_router(models_api.router)
 app.include_router(chat_api.router)
+app.add_middleware(DisconnectMiddleware)

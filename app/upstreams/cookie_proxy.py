@@ -24,13 +24,12 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from models import OpenAIRequest, normalize_content_part
 from upstreams.base import BaseUpstream
 from runtime_state import app_state
+from network_proxy import get_proxy_client_args
 import config as app_config
 import model_capabilities as mc
 from message_processing import (
-    DEFAULT_IMAGE_PREFILL_NUDGE,
     _create_safety_ratings_html,
     apply_console_injection,
-    apply_prefill_compat,
     openai_content_to_wire_parts,
     _coerce_tool_response,
     resolve_tool_call_signature,
@@ -40,7 +39,9 @@ from message_processing import (
     _requires_signature,
 )
 from logger import stats
+from token_counting import CookieUsageCounter
 from api_helpers import get_retry_settings
+from api_errors import UpstreamError, upstream_error, error_payload, error_response, error_sse
 from signature_store import SignatureRecord, SignatureState, signature_store
 from schema_validation import SchemaValidationError, validate_request_schemas
 
@@ -64,57 +65,6 @@ RETRYABLE_KEYWORDS = [
     "internal error",
 ]
 
-# Cookie 过期/权限失效的错误关键词（不可重试，需要刷新 Cookie）
-COOKIE_EXPIRED_KEYWORDS = [
-    "permission",
-    "denied",
-    "aiplatform.endpoints.predict",
-    "not authorized",
-    "unauthenticated",
-    "login required",
-    "session expired",
-    "invalid credentials",
-]
-
-# **项目级**问题的关键词：错的不是 Cookie，是 Project ID / 计费 / 项目权限。
-# 必须比 COOKIE_EXPIRED_KEYWORDS 先判，否则 "Permission ... denied on resource
-# //aiplatform.googleapis.com/projects/xxx" 会被当成"Cookie 过期"，
-# 让人反复重取 Cookie 却永远好不了（实测踩过）。
-PROJECT_ERROR_KEYWORDS = [
-    "requires billing",
-    "billing to be enabled",
-    "billing account",
-    "has not been used in project",
-    "is not found and cannot be used",
-    "project not found",
-    "invalid argument",
-]
-
-PROJECT_ERROR_HINT = (
-    "\n\n💡 这看起来是**项目层面**的问题，不是 Cookie 失效，重取 Cookie 无用。请依次检查：\n"
-    "1) 控制台里的 Project ID 是否填对（要用你能在 Agent Platform Studio 里正常出文的那个项目）；\n"
-    "2) 该项目是否已**开启计费**（Google 对这条接口要求计费账号；未开启会报 requires billing）；\n"
-    "3) 当前登录的 Google 账号对该项目是否有权限（换项目或换账号试试）。"
-)
-
-
-def _is_project_error(error_msg: str) -> bool:
-    """是否为项目/计费/权限类错误（与 Cookie 失效区分开）。"""
-    lower = (error_msg or "").lower()
-    if any(kw in lower for kw in PROJECT_ERROR_KEYWORDS):
-        return True
-    # "Permission 'aiplatform.endpoints.predict' denied on resource ...projects/xxx"
-    # 这种同时命中 cookie 关键词，但既可能是 Cookie 没登录、也可能是项目没权限，
-    # 只要错误里点名了具体项目资源，就按项目问题给出更有用的指引。
-    return ("projects/" in lower or "project #" in lower) and "denied" in lower
-
-COOKIE_REFRESH_HINT = (
-    "\n\n💡 Cookie 通常较为持久（只要不退出登录/改密码/被 Google 主动失效，可维持数周甚至更久）；"
-    "仅当确实出现权限错误时才需更新。"
-    "重新获取：电脑浏览器打开 console.cloud.google.com，F12 → Network，"
-    "复制任意请求的 Cookie 头（或用 Cookie-Editor 导出），到大盘粘贴保存。"
-)
-
 # “只有思考没有正文”的可操作提示：多为原生思考在高强度下跑飞/被截断（尤其酒馆预设 + 前端恒发 xhigh）。
 _THINKING_RUNAWAY_HINT = (
     "这通常是原生思考在高强度下跑飞或被截断（前端如 SillyTavern 常发 reasoning_effort=xhigh，"
@@ -135,37 +85,98 @@ def _safety_html_if_enabled(ratings: Any) -> str:
     return _create_safety_ratings_html(ratings)
 
 
-def _prefill_tpl(user_template: str, is_image_model: bool) -> str:
-    """选用续写指令：生图模型在用户未自定义时改用要图片的那句。
-
-    通用模板说的是"从断点处无缝往下写"，生图模型会老老实实继续写**文本**，
-    结果吐出一段字符画而不是图片（实测复现）。用户填了自定义模板则以用户的为准。
-    """
-    tpl = (user_template or "").strip()
-    if tpl:
-        return tpl
-    return DEFAULT_IMAGE_PREFILL_NUDGE if is_image_model else ""
-
-
-def _prefill_log(mode: str) -> str:
-    """按模式说明预填充被怎么处理了。"""
-    if mode == "keep_turn":
-        return "🩹 [预填充兼容] 预填充保留为 model 轮次，其后补一句续写推动语。"
-    if mode == "minimal":
-        return "🩹 [预填充兼容] 仅补占位 user 保证不报错。"
-    return "🩹 [预填充兼容] 预填充已并入末尾 user 消息作为续写指令。"
-
-
 def _is_retryable_error(error_msg: str) -> bool:
     """判断错误是否可重试（429 限流类）"""
     lower = error_msg.lower()
     return any(kw in lower for kw in RETRYABLE_KEYWORDS)
 
 
-def _is_cookie_expired_error(error_msg: str) -> bool:
-    """判断是否为 Cookie 过期/权限失效错误"""
-    lower = error_msg.lower()
-    return any(kw in lower for kw in COOKIE_EXPIRED_KEYWORDS)
+def _is_retryable_exception(error: Exception) -> bool:
+    """Transport failures have stable types; their messages need not say timeout."""
+    if upstream_error(error).status_code in (401, 403):
+        return False
+    if isinstance(error, httpx.RequestError):
+        # Certificate/configuration failures do not improve by resending a POST.
+        if "certificate verify failed" in str(error).lower().replace("_", " "):
+            return False
+        return isinstance(error, (
+            httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError,
+        ))
+    message = str(error).lower()
+    return _is_retryable_error(message) or "timeout" in message
+
+
+class _StudioStreamTrace:
+    """Per-generation diagnostics, without headers, prompt text or session values."""
+
+    def __init__(self, model: str, response_id: str, started: float):
+        self.label = f"{model} | 请求={response_id.rsplit('-', 1)[-1]}"
+        self.started = started
+        self.attempts = 0
+        self.has_headers = False
+        self.received_bytes = 0
+        self.objects = 0
+        self.kinds: set[str] = set()
+        self.first_packet: Optional[float] = None
+        self.first_output: Optional[float] = None
+
+    def begin_attempt(self):
+        self.attempts += 1
+        self.has_headers = False
+        self.received_bytes = 0
+        self.objects = 0
+        self.kinds.clear()
+
+    def received_headers(self):
+        self.has_headers = True
+
+    def received_packet(self):
+        if self.first_packet is None:
+            self.first_packet = time.monotonic() - self.started
+            print(f"📦 [Studio] {self.label} | 首包耗时 {self.first_packet:.2f}s")
+
+    def observe_event(self, kind: str):
+        labels = {"text": "正文", "thought": "思考", "image": "图片", "function_call": "工具调用"}
+        if kind not in labels:
+            return
+        self.kinds.add(kind)
+        elapsed = time.monotonic() - self.started
+        if self.first_output is None:
+            self.first_output = elapsed
+            print(f"⚡ [Studio] {self.label} | 首字耗时 {elapsed:.2f}s（{labels[kind]}）")
+
+    def summary(self) -> str:
+        packet = "未到达" if self.first_packet is None else f"{self.first_packet:.2f}s"
+        first = "未到达" if self.first_output is None else f"{self.first_output:.2f}s"
+        return (f"上游请求={self.attempts} | 响应头={'已收' if self.has_headers else '未收'}"
+                f" | 本次接收={self.received_bytes}B/{self.objects}JSON"
+                f" | 思考={'有' if 'thought' in self.kinds else '无'}"
+                f" | 正文={'有' if 'text' in self.kinds else '无'}"
+                f" | 工具={'有' if 'function_call' in self.kinds else '无'}"
+                f" | 首包={packet} | 首字={first}"
+                f" | 总耗时 {time.monotonic() - self.started:.2f}s")
+
+    def transport_failure(self, error: Exception):
+        stage = "读取响应体" if self.has_headers else "等待响应头"
+        print(f"⚠️ [Studio] {self.label} | 异常={type(error).__name__}"
+              f" | 阶段={stage} | {self.summary()}")
+
+
+class _FirstPacketStream(httpx.AsyncByteStream):
+    """Observe the first non-empty body read before decompression/UTF-8 decoding."""
+
+    def __init__(self, stream: httpx.AsyncByteStream, trace: _StudioStreamTrace):
+        self.stream = stream
+        self.trace = trace
+
+    async def __aiter__(self):
+        async for chunk in self.stream:
+            if chunk:
+                self.trace.received_packet()
+            yield chunk
+
+    async def aclose(self):
+        await self.stream.aclose()
 
 
 # ========== requestContext 模板 ==========
@@ -197,16 +208,14 @@ def _build_request_context(project_id: str) -> dict:
 
 # ========== 思考配置（委托中心能力模块，转 batchGraphql 的 camelCase） ==========
 
-def _build_thinking_config(model_name: str, request: OpenAIRequest,
-                           prefill_active: bool = False) -> Optional[dict]:
+def _build_thinking_config(model_name: str, request: OpenAIRequest) -> Optional[dict]:
     """
     按模型能力档案 + 控制台设置 + 单次请求构建 thinkingConfig：
     - Gemini 3 及以上（含生图模型）：thinkingLevel（MINIMAL/LOW/MEDIUM/HIGH，生图默认 HIGH）
     - 其它：None
-    prefill_active=True 时按控制台开关压制思考（见 mc.resolve_thinking）。
     """
     settings = app_state.get_effective_settings(model_name)
-    t = mc.resolve_thinking(model_name, request, settings, prefill_active=prefill_active)
+    t = mc.resolve_thinking(model_name, request, settings)
     if t.get("mode") == "level":
         return {"thinkingLevel": t["level"].upper(), "includeThoughts": t.get("include_thoughts", True)}
     if t.get("mode") == "budget":
@@ -641,19 +650,17 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
 
 async def build_batch_graphql_body_async(project_id: str, model_name: str,
                                          request: OpenAIRequest,
-                                         prefill_active: bool = False,
                                          force_search: bool = False,
                                          native_tools: bool = True) -> dict:
     """在线程里构建请求体：内部有远程图片下载与 PIL 压缩，不能阻塞事件循环（P1-2）。"""
     return await asyncio.to_thread(_build_batch_graphql_body, project_id, model_name,
-                                   request, prefill_active, force_search, native_tools)
+                                   request, force_search, native_tools)
 
 
 def _build_batch_graphql_body(
     project_id: str,
     model_name: str,
     request: OpenAIRequest,
-    prefill_active: bool = False,
     force_search: bool = False,
     native_tools: bool = True,
 ) -> dict:
@@ -680,7 +687,7 @@ def _build_batch_graphql_body(
         if img_cfg:
             gen_config["imageConfig"] = img_cfg
         # 生图思考档位：三模型默认 HIGH（用户决策 2026-10-13）
-        thinking_config = _build_thinking_config(model_name, request, prefill_active=prefill_active)
+        thinking_config = _build_thinking_config(model_name, request)
         if thinking_config:
             gen_config["thinkingConfig"] = thinking_config
         # Nano Banana 家族专属：media_resolution=HIGH（用户决策 2026-10-13）
@@ -705,7 +712,7 @@ def _build_batch_graphql_body(
             if mv is not None:
                 gen_config["maxOutputTokens"] = mv
 
-        thinking_config = _build_thinking_config(model_name, request, prefill_active=prefill_active)
+        thinking_config = _build_thinking_config(model_name, request)
         if thinking_config:
             gen_config["thinkingConfig"] = thinking_config
 
@@ -792,11 +799,14 @@ def _build_batch_graphql_body(
 
 # ========== batchGraphql 流式响应解析 ==========
 
-async def _iter_json_objects(response) -> AsyncGenerator[dict, None]:
+async def _iter_json_objects(response, trace: Optional[_StudioStreamTrace] = None) -> AsyncGenerator[dict, None]:
     buffer = ""
     async for chunk in response.aiter_text():
         if not chunk:
             continue
+        if trace is not None:
+            # Decoded UTF-8 body bytes, not compressed wire bytes or token usage.
+            trace.received_bytes += len(chunk.encode("utf-8"))
         buffer += chunk
 
         while True:
@@ -838,9 +848,12 @@ async def _iter_json_objects(response) -> AsyncGenerator[dict, None]:
             buffer = buffer[end + 1:]
 
             try:
-                yield json.loads(json_str)
+                obj = json.loads(json_str)
             except json.JSONDecodeError:
-                pass
+                continue
+            if trace is not None:
+                trace.objects += 1
+            yield obj
 
 
 # 会被安全/合规拦截的 finishReason（映射为 OpenAI content_filter）
@@ -993,18 +1006,19 @@ def _extract_from_results(obj: dict):
 
 # ========== token 用量映射 ==========
 
-def _map_usage(usage_meta: dict | None) -> dict:
-    """把 batchGraphql 的 usageMetadata 转成 OpenAI usage 字典。
+def _record_cookie_usage(result: dict):
+    usage, info = result["usage"], result["usage_metadata"]
+    stats.add_tokens(usage["prompt_tokens"], usage["completion_tokens"], count_success=False)
+    source = "上游" if not info["estimated"] else "本地分词估算" if info["source"] == "local_tokenizer" else "上游与本地补计"
+    scope = "（仅文本与工具，未含媒体 token）" if info.get("contains_media") else ""
+    print(f"💰 [Studio 用量] 提示词: {usage['prompt_tokens']} | 思考与生成: {usage['completion_tokens']}"
+          f" | 总计: {usage['total_tokens']} Tokens | 来源: {source}{scope}")
 
-    注意：私有 batchGraphql 接口通常不回传用量（恒为 0），因此 Cookie 通道
-    不再打印 💰 统计行——大盘的 token 统计仅由标准（Express）通道计入；
-    Cookie 通道的成功数改由 stats.add_success() 单独计入。
-    """
-    usage_meta = usage_meta or {}
-    p = int(usage_meta.get("promptTokenCount", 0) or 0)
-    c = int(usage_meta.get("candidatesTokenCount", 0) or 0)
-    t = int(usage_meta.get("totalTokenCount", p + c) or (p + c))
-    return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": t}
+
+async def _finish_cookie_usage(counter: CookieUsageCounter, body: dict, usage_meta: dict | None) -> dict:
+    result = await asyncio.to_thread(counter.resolve, body, usage_meta)
+    _record_cookie_usage(result)
+    return result
 
 
 # ========== OpenAI SSE 格式化 ==========
@@ -1058,7 +1072,7 @@ async def _sleep_with_heartbeat(total_sec: float, hb_interval: float = 3.0):
         yield _sse_heartbeat()
 
 
-def _make_usage_chunk(response_id: str, model: str, usage: dict) -> str:
+def _make_usage_chunk(response_id: str, model: str, usage: dict, usage_metadata: dict = None) -> str:
     """OpenAI 风格的用量尾块（choices 为空，仅携带 usage）"""
     chunk = {
         "id": response_id,
@@ -1068,6 +1082,8 @@ def _make_usage_chunk(response_id: str, model: str, usage: dict) -> str:
         "choices": [],
         "usage": usage,
     }
+    if usage_metadata is not None:
+        chunk["usage_metadata"] = usage_metadata
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
@@ -1094,74 +1110,87 @@ async def _execute_stream_request_generator_once(
     headers: dict,
     body: dict,
     sampler: "_RawSampler | None" = None,
+    trace: Optional[_StudioStreamTrace] = None,
 ) -> AsyncGenerator[tuple[str, Any], None]:
     """
     异步生成器：真正实时地拉取数据，抛出**原始事件**（不做 SSE 格式化）：
     ("text"|"thought"|"image", str)、("finish", 原始finishReason)、("usage", dict)、
-    ("blocked", str)、("api_error_text", str)、("cookie_error"|"retryable_error"|"fatal_error", str)。
-    由消费方负责格式化成 OpenAI chunk（便于预填充去重与无正文诊断）。
+    ("blocked", str)、("api_error"|"cookie_error"|"retryable_error"|"fatal_error", UpstreamError)。
+    由消费方负责格式化成 OpenAI chunk 与无正文诊断。
     """
     has_content = False
+    if trace is not None:
+        trace.begin_attempt()
     try:
         async with client.stream("POST", BATCH_GRAPHQL_URL, headers=headers, json=body) as response:
+            if trace is not None:
+                trace.received_headers()
+                if response.is_stream_consumed:
+                    # Pre-buffered responses (e.g. an in-memory test transport).
+                    if response.content:
+                        trace.received_packet()
+                else:
+                    response.stream = _FirstPacketStream(response.stream, trace)
 
             # 1. 拦截 HTTP 状态码错误
             if response.status_code != 200:
                 error_text = await response.aread()
+                if trace is not None:
+                    trace.received_bytes += len(error_text)
                 error_msg = error_text.decode('utf-8', errors='replace')[:1000]
 
-                if response.status_code in (401, 403) or _is_cookie_expired_error(error_msg) \
-                        or _is_project_error(error_msg):
-                    hint = PROJECT_ERROR_HINT if _is_project_error(error_msg) else COOKIE_REFRESH_HINT
-                    yield "cookie_error", error_msg + hint
+                if response.status_code in (401, 403):
+                    yield "cookie_error", upstream_error(error_msg, response.status_code)
                     return
 
                 if _native_tool_error(error_msg):
-                    yield "native_tool_unsupported", error_msg
+                    yield "native_tool_unsupported", upstream_error(error_msg, response.status_code)
                     return
                 is_retryable = response.status_code in (429, 503, 500) or _is_retryable_error(error_msg)
-                yield "retryable_error" if is_retryable else "fatal_error", error_msg
+                yield "retryable_error" if is_retryable else "fatal_error", upstream_error(error_msg, response.status_code)
                 return
 
             # 2. 实时遍历并抛出流式 JSON 事件块
-            async for obj in _iter_json_objects(response):
+            async for obj in _iter_json_objects(response, trace):
                 if sampler is not None:
                     sampler.add(obj)
                 for event_type, data in _extract_from_results(obj):
-                    if event_type in ("text", "thought", "image", "function_call", "thought_signature"):
+                    if event_type in ("text", "thought", "image", "function_call"):
                         has_content = True
+                        if trace is not None:
+                            trace.observe_event(event_type)
                         yield event_type, data
 
-                    elif event_type in ("finish", "usage", "blocked", "safety"):
+                    elif event_type in ("finish", "usage", "blocked", "safety", "thought_signature"):
                         yield event_type, data
 
                     elif event_type == "error":
                         err_msg = data.get("message", str(data)) if isinstance(data, dict) else str(data)
+                        error = upstream_error(data)
 
-                        # 在还没发送任何有效数据前遇到错误，尝试走顶层重试
+                        # Authentication/permission errors are terminal, before all retry/fallback rules.
+                        if error.status_code in (401, 403):
+                            yield "cookie_error" if not has_content else "api_error", error
+                            return
                         if _native_tool_error(err_msg) and not has_content:
                             yield "native_tool_unsupported", err_msg
                             return
-                        if (_is_cookie_expired_error(err_msg) or _is_project_error(err_msg)) \
-                                and not has_content:
-                            hint = PROJECT_ERROR_HINT if _is_project_error(err_msg) else COOKIE_REFRESH_HINT
-                            yield "cookie_error", err_msg + hint
-                            return
-                        if _is_retryable_error(err_msg) and not has_content:
-                            yield "retryable_error", err_msg
+                        if (error.status_code in (429, 500, 503) or _is_retryable_error(err_msg)) and not has_content:
+                            yield "retryable_error", error
                             return
 
-                        # 如果流已经开始输出才发生错误，直接作为文本信息告知前端
-                        yield "api_error_text", err_msg
+                        yield "api_error", error
+                        return
 
     except Exception as e:
-        err_msg = str(e)
-        is_retryable = _is_retryable_error(err_msg) or "timeout" in err_msg.lower()
+        error = upstream_error(e)
+        if trace is not None:
+            trace.transport_failure(e)
+        is_retryable = _is_retryable_exception(e)
         if not has_content:
-            yield "retryable_error" if is_retryable else "fatal_error", err_msg
+            yield "retryable_error" if is_retryable else "fatal_error", error
         else:
-            # 数据传输中途断开
-            yield "api_error_text", f"连接中断: {err_msg}"
+            yield "api_error", error
 
 
 async def _execute_stream_request_generator(
@@ -1171,9 +1200,10 @@ async def _execute_stream_request_generator(
     sampler: "_RawSampler | None" = None,
     fallback_body: Any = None,
     fallback_state: Optional[dict] = None,
+    trace: Optional[_StudioStreamTrace] = None,
 ) -> AsyncGenerator[tuple[str, Any], None]:
     """Execute native tools, lazily degrading after one clear protocol rejection."""
-    async for status, data in _execute_stream_request_generator_once(client, headers, body, sampler):
+    async for status, data in _execute_stream_request_generator_once(client, headers, body, sampler, trace):
         if status != "native_tool_unsupported":
             yield status, data
             continue
@@ -1187,7 +1217,7 @@ async def _execute_stream_request_generator(
             resolved_fallback = await resolved_fallback
         print("⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；本次及后续重试固定降级为文本工具观测。")
         async for fallback_status, fallback_data in _execute_stream_request_generator_once(
-                client, headers, resolved_fallback, sampler):
+                client, headers, resolved_fallback, sampler, trace):
             yield fallback_status, fallback_data
         return
 
@@ -1197,7 +1227,7 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
     """非流式地完整取回一次响应（供生图假流式复用）。返回 dict。"""
     for attempt in range(retry_max + 1):
         if await fastapi_request.is_disconnected():
-            return {"kind": "error", "message": "客户端已断开连接。"}
+            return {"kind": "error", **error_payload(UpstreamError(499, "客户端已断开连接。"))}
         try:
             body = await build_batch_graphql_body_async(
                 project_id, base_model_name, request_obj)
@@ -1211,12 +1241,13 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
                 await asyncio.sleep(backoff_sec)
                 continue
             if response.status_code != 200:
-                return {"kind": "error", "message": f"HTTP {response.status_code}: {response.text[:300]}"}
+                return {"kind": "error", **error_payload(upstream_error(response.text, response.status_code))}
 
             full_text, reasoning_text, api_error, usage_meta = "", "", None, None
             finish_raw, blocked_msg = None, None
             safety_html = ""
             sampler = _RawSampler()
+            usage_counter = CookieUsageCounter()
 
             class _F:
                 def __init__(self, t): self._t = t
@@ -1225,6 +1256,7 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
             async for obj in _iter_json_objects(_F(response.text)):
                 sampler.add(obj)
                 for et, data in _extract_from_results(obj):
+                    usage_counter.observe(et, data)
                     if et == "text":
                         full_text += data
                     elif et == "thought":
@@ -1238,19 +1270,17 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
                     elif et == "blocked":
                         blocked_msg = data
                     elif et == "usage":
-                        usage_meta = data
+                        usage_meta = {**(usage_meta or {}), **data}
                     elif et == "error":
-                        em = data.get("message", str(data)) if isinstance(data, dict) else str(data)
-                        if _is_retryable_error(em) and attempt < retry_max:
-                            api_error = em
-                            break
-                        full_text += f"\n[错误] {em}"
+                        api_error = upstream_error(data)
 
-            if api_error and attempt < retry_max:
-                stats.add_retry()
-                print(f"⚠️ [Studio] 生图 429/限流（尝试 {attempt+1}），{backoff_sec}s 后重试...")
-                await asyncio.sleep(backoff_sec)
-                continue
+            if api_error:
+                if api_error.status_code in (429, 500, 503) and attempt < retry_max:
+                    stats.add_retry()
+                    print(f"⚠️ [Studio] 生图上游繁忙（尝试 {attempt+1}），{backoff_sec}s 后重试...")
+                    await asyncio.sleep(backoff_sec)
+                    continue
+                return {"kind": "error", **error_payload(api_error)}
 
             if not full_text.strip():
                 # 无正文：给出可见的诊断信息，而不是静默空回复
@@ -1258,19 +1288,23 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
                 if blocked_msg:
                     detail += f"；promptFeedback 拦截：{blocked_msg}"
                 print(f"🔎 [Studio 诊断] 生图无正文（{detail}）。原始响应样本：\n{sampler.dump()}")
-                return {"kind": "error", "message": f"上游未返回图片/正文（{detail}）。已在日志记录原始响应样本。"}
+                filtered = bool(blocked_msg) or ((finish_raw or "").upper() in _FINISH_FILTERED)
+                error = UpstreamError(400 if filtered else 502, "上游拦截了请求。" if filtered else "上游未返回图片或正文。",
+                                      code="content_filter" if filtered else "empty_response")
+                return {"kind": "error", **error_payload(error)}
 
+            usage_result = await asyncio.to_thread(usage_counter.resolve, body, usage_meta)
             return {"kind": "ok", "full_text": full_text + safety_html, "reasoning_text": reasoning_text,
-                    "finish_reason": _map_finish_reason(finish_raw), "usage_meta": usage_meta}
+                    "finish_reason": _map_finish_reason(finish_raw), "usage_result": usage_result}
         except Exception as e:
-            em = str(e)
-            if (_is_retryable_error(em) or "timeout" in em.lower()) and attempt < retry_max:
+            error = upstream_error(e)
+            if _is_retryable_exception(e) and attempt < retry_max:
                 stats.add_retry()
-                print(f"⚠️ [Studio] 生图异常（尝试 {attempt+1}）：{em[:80]}，{backoff_sec}s 后重试...")
+                print(f"⚠️ [Studio] 生图异常={type(e).__name__}（尝试 {attempt+1}）：{error}，{backoff_sec}s 后重试...")
                 await asyncio.sleep(backoff_sec)
                 continue
-            return {"kind": "error", "message": f"batchGraphql proxy error: {em}"}
-    return {"kind": "error", "message": "重试多次仍失败。"}
+            return {"kind": "error", **error_payload(upstream_error(e))}
+    return {"kind": "error", **error_payload(UpstreamError(502, "上游重试已耗尽。"))}
 
 
 # ========== 主代理类 ==========
@@ -1285,34 +1319,32 @@ class CookieProxyUpstream(BaseUpstream):
         try:
             validate_request_schemas(request_obj)
         except SchemaValidationError as exc:
-            return JSONResponse(status_code=400, content={
-                "error": {"message": str(exc), "type": "invalid_request_error", "code": 400}
-            })
+            return error_response(UpstreamError(400, str(exc), "invalid_request_error"))
 
         # ===== 1. 验证认证 =====
         cookie_str = _get_cookie_string()
         if not cookie_str:
-            return JSONResponse(status_code=401, content={"error": {"message": (
+            return error_response(UpstreamError(401, (
                 "未配置 Google Cookie。\n"
                 "请在大盘控制台中粘贴 Cookie 和 Project ID，\n"
                 "或设置环境变量 GOOGLE_COOKIE 和 GOOGLE_PROJECT_ID。"
-            ), "type": "auth_error"}})
+            ), "authentication_error"))
 
         project_id = _get_project_id()
         if not project_id:
-            return JSONResponse(status_code=400, content={"error": {"message": (
+            return error_response(UpstreamError(400, (
                 "未配置 Google Cloud Project ID。\n"
                 "请在大盘中填写，或设置环境变量 GOOGLE_PROJECT_ID。\n"
                 "可从 Studio URL 中获取：...?project=YOUR_PROJECT_ID"
-            ), "type": "config_error"}})
+            ), "invalid_request_error"))
 
         # ===== 2. 构建请求头 =====
         headers = build_headers(cookie_str)
         if not headers:
-            return JSONResponse(status_code=401, content={"error": {"message": (
+            return error_response(UpstreamError(401, (
                 "Cookie 中未找到 SAPISID，无法计算认证头。\n"
                 "请确保 Cookie 来自已登录的 console.cloud.google.com 页面。"
-            ), "type": "auth_error"}})
+            ), "authentication_error"))
 
         # ===== 2.5 工具流量处理：原生函数调用 =====
         _tool_info = classify_tool_traffic(request_obj.messages, request_obj.tools)
@@ -1337,60 +1369,48 @@ class CookieProxyUpstream(BaseUpstream):
         if base_model_name.endswith("-search"):
             base_model_name = base_model_name[:-len("-search")]
 
-        # ===== 3.5 预填充智能兼容（按控制台模式 + 模型能力；新模型自动生效）=====
         _profile = mc.get_profile(base_model_name)
-        prefill_active = False
-        # 控制台注入（轻量前端用；两个字段都留空时是空操作）。
-        # 原生工具往返不能插入 assistant 预填充，否则会破坏 FC/FR 拓扑。
         _inj_settings = app_state.get_effective_settings(base_model_name)
-        _injected, _inj_notes = apply_console_injection(
-            request_obj.messages,
-            system_text=_inj_settings.get("inject_system_instruction", ""),
-            prefill_text=_inj_settings.get("inject_prefill", ""),
-            has_tools=bool(_tool_info["declared"] or _tool_info["history"]),
-            is_image_model=_profile["is_image"],
-            allow_image_prefill=bool(_inj_settings.get("inject_prefill_for_image", False)),
-        )
-        for _n in _inj_notes:
-            print(_n)
-        if _injected is not request_obj.messages:
-            request_obj = request_obj.model_copy(update={"messages": _injected})
-
-        _prefill_mode = app_state.get_setting("prefill_mode", app_config.DEFAULT_SETTINGS["prefill_mode"])
-        if _prefill_mode != "off":
-            _new_msgs, prefill_active = apply_prefill_compat(
-                request_obj.messages, _prefill_mode,
-                allow_model_last=not _profile["requires_user_last_turn"],
-                instruction_template=_prefill_tpl(_inj_settings.get("prefill_instruction", ""), _profile["is_image"]),
-            )
-            if _new_msgs is not request_obj.messages:
-                request_obj = request_obj.model_copy(update={"messages": _new_msgs})
-                print(_prefill_log(_prefill_mode))
-            elif prefill_active:
-                print("🩹 [预填充兼容] 该模型支持 model 结尾，预填充原生透传，模型将直接续写。")
-            else:
-                # 没检测到预填充也要说一声：很多人以为整个预设就是预填充，
-                # 实际只有「最后一条 assistant 消息」才算。没有它，压制原生思考也不会触发。
-                print("ℹ️ [预填充兼容] 未检测到预填充（请求最后一条不是 assistant 消息）。"
-                      "预设里的思维链指令属于 system/user 条目，不是预填充；"
-                      "若要用预设思维链顶掉原生思考，需在预设末尾放一条 assistant 条目（通常是思考块的开标签）。")
-            if prefill_active and app_state.get_setting("prefill_suppress_thinking", True):
-                print("🧠 [预填充兼容] 已按模型压制原生思考（可在控制台关闭），让预设思维链接管。")
+        # Only explicit console system instructions may add a message.
+        injected, notes = apply_console_injection(
+            request_obj.messages, system_text=_inj_settings.get("inject_system_instruction", ""))
+        for note in notes:
+            print(note)
+        if injected is not request_obj.messages:
+            request_obj = request_obj.model_copy(update={"messages": injected})
 
         # ===== 4. HTTP 客户端配置 =====
         client_kwargs = {
-            "timeout": httpx.Timeout(connect=30.0, read=180.0, write=30.0, pool=10.0),
+            "timeout": httpx.Timeout(
+                connect=30.0, read=app_state.get_studio_read_timeout_seconds(),
+                write=30.0, pool=10.0),
             "follow_redirects": True,
+            **get_proxy_client_args(),
         }
-        if app_config.PROXY_URL:
-            client_kwargs["proxy"] = app_config.PROXY_URL
+        if app_config.SSL_CERT_FILE:
+            client_kwargs["verify"] = app_config.SSL_CERT_FILE
 
         # 重试配置（控制台可调）；语义与 Express 通道统一：总尝试次数 = retry_max + 1
         retry_max, backoff_sec = get_retry_settings()
 
         is_stream = request_obj.stream
         response_id = f"chatcmpl-studio-{int(time.time())}-{uuid.uuid4().hex[:8]}"
-        start_time = time.time()
+        start_time = time.monotonic()
+        request_label = f"{base_model_name} | 请求={response_id.rsplit('-', 1)[-1]}"
+        job_id = getattr(getattr(fastapi_request, "job", None), "id", None)
+        if job_id:
+            request_label += f" | 任务={job_id}"
+
+        def nonstream_failure(error):
+            error = upstream_error(error)
+            status = error.status_code
+            icon = "🔑" if status in (401, 403) else "❌"
+            reason = "认证/权限失败" if status in (401, 403) else error_payload(error)["error"]["message"]
+            if "本次请求已结束" not in reason:
+                reason += "，本次请求已结束。"
+            print(f"{icon} [Studio] {request_label} | HTTP {status} | {reason}"
+                  f" | 总耗时 {time.monotonic() - start_time:.2f}s")
+            return error_response(error)
         want_usage = _wants_usage(request_obj)
         cookie_debug = bool(app_state.get_setting("debug_outbound", False)
                             or app_state.get_setting("cookie_debug", False))
@@ -1399,7 +1419,8 @@ class CookieProxyUpstream(BaseUpstream):
 
         # 打印请求日志
         msg_count = len(request_obj.messages)
-        print(f"→ [Studio] {base_model_name} | {msg_count} 条消息 | {'流式' if is_stream else '非流式'}")
+        print(f"→ [Studio] {request_label}"
+              f" | {msg_count} 条消息 | {'流式' if is_stream else '非流式'}")
 
         is_image = _profile["is_image"]
 
@@ -1415,32 +1436,32 @@ class CookieProxyUpstream(BaseUpstream):
                     project_id, base_model_name, request_obj, headers, client_kwargs,
                     retry_max, backoff_sec, fastapi_request,
                 )
-                yield _make_openai_chunk(response_id, model_display, role="assistant")
                 if res.get("kind") != "ok":
                     stats.add_error()
-                    print(f"❌ [Studio] 生图失败 | {res.get('message', '')[:150]}")
-                    yield _make_openai_chunk(response_id, model_display, content=f"[Studio 错误] {res.get('message', '生图失败')}")
-                    yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
+                    print(f"❌ [Studio] 生图失败 | {res.get('error', {})}")
+                    yield error_sse(res)
                     yield "data: [DONE]\n\n"
                     return
+                yield _make_openai_chunk(response_id, model_display, role="assistant")
                 full_text = res.get("full_text") or ""
                 if res.get("reasoning_text"):
                     yield _make_openai_chunk(response_id, model_display, reasoning_content=res["reasoning_text"])
                 # 关键：整张图作为单个 chunk 发出，绝不分块
                 yield _make_openai_chunk(response_id, model_display, content=full_text or " ")
+                _record_cookie_usage(res["usage_result"])
                 stats.add_success()
-                usage = _map_usage(res.get("usage_meta"))
                 if want_usage:
-                    yield _make_usage_chunk(response_id, model_display, usage)
+                    yield _make_usage_chunk(response_id, model_display, **res["usage_result"])
                 yield _make_openai_chunk(response_id, model_display, finish_reason=res.get("finish_reason", "stop"))
                 yield "data: [DONE]\n\n"
-                print(f"✅ [Studio] {base_model_name} | 生图假流式完成")
+                print(f"✅ [Studio] {base_model_name} | 生图假流式完成 | 总耗时 {time.monotonic() - start_time:.2f}s")
             return StreamingResponse(image_fake_stream(), media_type="text/event-stream")
 
         # ========== 流式处理（彻底解决 60s 超时的真·流式机制） ==========
         if is_stream:
             async def stream_generator():
-                nonlocal start_time
+                trace = _StudioStreamTrace(base_model_name, response_id, start_time)
+                trace.label = request_label
 
                 # 立即吐一个心跳，尽快建立连接（避免首个上游调用较慢/429 时前端久等无字节）
                 yield _sse_heartbeat()
@@ -1455,11 +1476,11 @@ class CookieProxyUpstream(BaseUpstream):
                     use_native_tools = not native_fallback_state["latched"]
                     if use_native_tools:
                         body = await build_batch_graphql_body_async(
-                            project_id, base_model_name, request_obj, prefill_active=prefill_active,
+                            project_id, base_model_name, request_obj,
                             force_search=force_builtin_search)
                     else:
                         body = await build_batch_graphql_body_async(
-                            project_id, base_model_name, request_obj, prefill_active=prefill_active,
+                            project_id, base_model_name, request_obj,
                             force_search=force_builtin_search, native_tools=False)
                     fallback_body = None
                     if native_custom_tools and use_native_tools:
@@ -1467,11 +1488,12 @@ class CookieProxyUpstream(BaseUpstream):
                         # until the native schema is actually rejected. Invoking
                         # this factory also latches degraded mode across retries.
                         async def fallback_body():
+                            nonlocal body
                             native_fallback_state["latched"] = True
-                            return await build_batch_graphql_body_async(
+                            body = await build_batch_graphql_body_async(
                                 project_id, base_model_name, request_obj,
-                                prefill_active=prefill_active,
                                 force_search=force_builtin_search, native_tools=False)
+                            return body
                     req_headers = build_headers(_get_cookie_string()) or headers
                     if cookie_debug:
                         print(f"🔎 [Studio 调试] 出站 generationConfig: "
@@ -1489,18 +1511,19 @@ class CookieProxyUpstream(BaseUpstream):
                         finish_raw = None
                         blocked_msg = None
                         sampler = _RawSampler()
+                        usage_counter = CookieUsageCounter()
 
                         # 消费实时生成器（原始事件 → 此处格式化为 OpenAI chunk）
                         async for status, data in _execute_stream_request_generator(
                             client, req_headers, body, sampler=sampler,
-                            fallback_body=fallback_body,
+                            fallback_body=fallback_body, trace=trace,
                         ):
+                            usage_counter.observe(status, data)
                             if status == "thought":
                                 got_thought = True
 
                             if status == "function_call":
                                 if not has_yielded_to_client:
-                                    print(f"⚡ [Studio] {base_model_name} | 连接建立，正在实时流式输出...")
                                     yield _make_openai_chunk(response_id, model_display, role="assistant")
                                     has_yielded_to_client = True
                                 tool_payload = _openai_tool_call(response_id, tool_call_index, data)
@@ -1512,16 +1535,13 @@ class CookieProxyUpstream(BaseUpstream):
                             elif status == "thought_signature":
                                 pass
 
-                            elif status in ("text", "thought", "image", "api_error_text"):
+                            elif status in ("text", "thought", "image"):
                                 if not has_yielded_to_client:
-                                    print(f"⚡ [Studio] {base_model_name} | 连接建立，正在实时流式输出...")
                                     yield _make_openai_chunk(response_id, model_display, role="assistant")
                                     has_yielded_to_client = True
 
                                 if status == "thought":
                                     yield _make_openai_chunk(response_id, model_display, reasoning_content=data)
-                                elif status == "api_error_text":
-                                    yield _make_openai_chunk(response_id, model_display, content=f"\n[Studio API 错误] {data}")
                                 elif status == "image":
                                     got_text = True
                                     yield _make_openai_chunk(response_id, model_display, content=data)
@@ -1537,18 +1557,22 @@ class CookieProxyUpstream(BaseUpstream):
                                 if _sh:
                                     yield _make_openai_chunk(response_id, model_display, content=_sh)
                             elif status == "usage":
-                                usage_meta = data
+                                usage_meta = {**(usage_meta or {}), **data}
                             elif status == "blocked":
                                 blocked_msg = data
 
                             # 如果属于 Cookie 权限错误
                             elif status == "cookie_error":
-                                if not has_yielded_to_client:
-                                    yield _make_openai_chunk(response_id, model_display, role="assistant")
                                 stats.add_error()
-                                print(f"🔑 [Studio] 权限错误: {data[:150]}")
-                                yield _make_openai_chunk(response_id, model_display, content=f"[Studio 权限错误] {data}")
-                                yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
+                                print(f"🔑 [Studio] {trace.label} | HTTP {upstream_error(data).status_code} | 认证/权限失败，本次请求已结束。")
+                                yield error_sse(data)
+                                yield "data: [DONE]\n\n"
+                                return
+
+                            elif status in ("api_error", "api_error_text"):
+                                stats.add_error()
+                                print(f"❌ [Studio] {trace.label} | 上游输出中断：{upstream_error(data)} | {trace.summary()}")
+                                yield error_sse(data)
                                 yield "data: [DONE]\n\n"
                                 return
 
@@ -1561,14 +1585,10 @@ class CookieProxyUpstream(BaseUpstream):
                                     break  # 跳出当前 async for，进入外部循环的 sleep 阶段
                                 else:
                                     # 如果已经开始了输出，或者错误不可重试，直接抛给前端结束
-                                    if not has_yielded_to_client:
-                                        yield _make_openai_chunk(response_id, model_display, role="assistant")
-
-                                    err_prefix = "不可重试错误" if status == "fatal_error" else "重试耗尽"
+                                    err_prefix = "请求终止" if status == "fatal_error" else "重试耗尽"
                                     stats.add_error()
-                                    print(f"❌ [Studio] {err_prefix} | {data[:150]}")
-                                    yield _make_openai_chunk(response_id, model_display, content=f"\n[Studio 错误] {data}")
-                                    yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
+                                    print(f"❌ [Studio] {trace.label} | {err_prefix}：{upstream_error(data)} | {trace.summary()}")
+                                    yield error_sse(data)
                                     yield "data: [DONE]\n\n"
                                     return
 
@@ -1580,14 +1600,14 @@ class CookieProxyUpstream(BaseUpstream):
                                 return
                             wait_sec = backoff_sec
                             stats.add_retry()
-                            print(f"⚠️ [Studio] 遇到可重试拥堵/限流: {error_to_raise[:80]}... {wait_sec}s 后进行第 {attempt+2} 次退避重试")
+                            print(f"⚠️ [Studio] {trace.label} | 首段输出前暂时失败：{upstream_error(error_to_raise)}"
+                                  f" | {wait_sec}s 后进行第 {attempt+2}/{retry_max+1} 次尝试 | {trace.summary()}")
                             # 退避等待期间持续吐心跳，保活前端连接（issue4：3.1-pro 频繁 429 长等待易被前端断开）
                             async for _hb in _sleep_with_heartbeat(wait_sec):
                                 if await fastapi_request.is_disconnected():
                                     print("ℹ️ [Studio] 客户端已断开连接，取消后续重试。")
                                     return
                                 yield _hb
-                            start_time = time.time()
                             continue
 
                         # ===== 正常收尾（修复旧版“空响应静默关流”，并显式暴露“只有思考没有正文”）=====
@@ -1596,6 +1616,7 @@ class CookieProxyUpstream(BaseUpstream):
                             has_yielded_to_client = True
 
                         if got_text or got_tool_call:
+                            usage_result = await _finish_cookie_usage(usage_counter, body, usage_meta)
                             stats.add_success()
                             yield _make_openai_chunk(
                                 response_id, model_display,
@@ -1610,22 +1631,21 @@ class CookieProxyUpstream(BaseUpstream):
                             stats.add_error()
                             print(f"❌ [Studio] {base_model_name} | 上游{desc}（{detail}）")
                             print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
-                            yield _make_openai_chunk(
-                                response_id, model_display,
-                                content=f"\n[Studio 提示] 上游{desc}（{detail}）。{hint}")
                             filtered = bool(blocked_msg) or ((finish_raw or "").upper() in _FINISH_FILTERED)
-                            yield _make_openai_chunk(response_id, model_display,
-                                                     finish_reason="content_filter" if filtered else "stop")
+                            print(f"🔎 [Studio 诊断] {hint}")
+                            yield error_sse(UpstreamError(
+                                400 if filtered else 502, "上游拦截了请求。" if filtered else f"上游{desc}。",
+                                code="content_filter" if filtered else "empty_response"))
+                            yield "data: [DONE]\n\n"
+                            return
 
-                        usage = _map_usage(usage_meta)
                         if want_usage:
-                            yield _make_usage_chunk(response_id, model_display, usage)
+                            yield _make_usage_chunk(response_id, model_display, **usage_result)
 
                         yield "data: [DONE]\n\n"
 
-                        elapsed = time.time() - start_time
                         if got_text or got_tool_call:
-                            print(f"✅ [Studio] {base_model_name} | 流式传输顺利完毕 | 耗时 {elapsed:.1f}s")
+                            print(f"✅ [Studio] {trace.label} | 流式传输顺利完毕 | {trace.summary()}")
                         return
 
             return StreamingResponse(stream_generator(), media_type="text/event-stream")
@@ -1636,19 +1656,16 @@ class CookieProxyUpstream(BaseUpstream):
             for attempt in range(retry_max + 1):
                 # 客户端已断开则立即停止，避免无谓的上游调用与重试
                 if await fastapi_request.is_disconnected():
-                    print("ℹ️ [Studio] 客户端已断开连接，停止非流式重试。")
-                    return JSONResponse(status_code=499, content={
-                        "error": {"message": "客户端已断开连接，请求已取消。", "type": "client_closed_request"}
-                    })
+                    return nonstream_failure(UpstreamError(499, "客户端已断开连接，请求已取消。", "request_cancelled"))
                 try:
                     use_native_tools = not native_fallback_state["latched"]
                     if use_native_tools:
                         body = await build_batch_graphql_body_async(
-                            project_id, base_model_name, request_obj, prefill_active=prefill_active,
+                            project_id, base_model_name, request_obj,
                             force_search=force_builtin_search)
                     else:
                         body = await build_batch_graphql_body_async(
-                            project_id, base_model_name, request_obj, prefill_active=prefill_active,
+                            project_id, base_model_name, request_obj,
                             force_search=force_builtin_search, native_tools=False)
                     fallback_body = None
                     if native_custom_tools and use_native_tools:
@@ -1659,7 +1676,6 @@ class CookieProxyUpstream(BaseUpstream):
                             native_fallback_state["latched"] = True
                             return await build_batch_graphql_body_async(
                                 project_id, base_model_name, request_obj,
-                                prefill_active=prefill_active,
                                 force_search=force_builtin_search, native_tools=False)
                     req_headers = build_headers(_get_cookie_string()) or headers
                     if cookie_debug:
@@ -1680,22 +1696,20 @@ class CookieProxyUpstream(BaseUpstream):
                             response = await client.post(
                                 BATCH_GRAPHQL_URL, headers=req_headers, json=resolved_fallback
                             )
+                            body = resolved_fallback
                             fallback_body = None
 
                     if response.status_code in (429, 503, 500):
                         if attempt < retry_max:
                             wait_sec = backoff_sec
                             stats.add_retry()
-                            print(f"⚠️ [Studio] HTTP {response.status_code} (尝试 {attempt+1}), {wait_sec}s 后重试...")
+                            print(f"⚠️ [Studio] {request_label} | HTTP {response.status_code}"
+                                  f" | 尝试 {attempt+1}/{retry_max+1}，{wait_sec}s 后重试...")
                             await asyncio.sleep(wait_sec)
                             continue
 
                     if response.status_code != 200:
-                        elapsed = time.time() - start_time
-                        print(f"❌ [Studio] {base_model_name} | HTTP {response.status_code} | {elapsed:.1f}s")
-                        return JSONResponse(status_code=response.status_code, content={
-                            "error": {"message": response.text[:500], "type": "upstream_error"}
-                        })
+                        return nonstream_failure(upstream_error(response.text, response.status_code))
 
                     full_text = ""
                     reasoning_text = ""
@@ -1706,6 +1720,7 @@ class CookieProxyUpstream(BaseUpstream):
                     finish_raw = None
                     blocked_msg = None
                     sampler = _RawSampler()
+                    usage_counter = CookieUsageCounter()
 
                     class _FakeResponse:
                         def __init__(self, text):
@@ -1717,6 +1732,7 @@ class CookieProxyUpstream(BaseUpstream):
                     async for obj in _iter_json_objects(fake_resp):
                         sampler.add(obj)
                         for event_type, data in _extract_from_results(obj):
+                            usage_counter.observe(event_type, data)
                             if event_type == "text":
                                 full_text += data
                             elif event_type == "thought":
@@ -1734,29 +1750,26 @@ class CookieProxyUpstream(BaseUpstream):
                             elif event_type == "blocked":
                                 blocked_msg = data
                             elif event_type == "usage":
-                                usage_meta = data
+                                usage_meta = {**(usage_meta or {}), **data}
                             elif event_type == "error":
-                                err_msg = data.get("message", str(data)) if isinstance(data, dict) else str(data)
-                                if _is_retryable_error(err_msg) and attempt < retry_max:
-                                    api_error = err_msg
-                                    break
-                                full_text += f"\n[错误] {err_msg}"
+                                api_error = upstream_error(data)
 
-                    if api_error and attempt < retry_max:
-                        wait_sec = backoff_sec
-                        stats.add_retry()
-                        print(f"⚠️ [Studio] 429/限流 (尝试 {attempt+1}): {api_error[:100]}, {wait_sec}s 后重试...")
-                        await asyncio.sleep(wait_sec)
-                        continue
+                    if api_error:
+                        if api_error.status_code in (429, 500, 503) and attempt < retry_max:
+                            wait_sec = backoff_sec
+                            stats.add_retry()
+                            print(f"⚠️ [Studio] {request_label} | 上游繁忙"
+                                  f" | 尝试 {attempt+1}/{retry_max+1}，{wait_sec}s 后重试...")
+                            await asyncio.sleep(wait_sec)
+                            continue
+                        return nonstream_failure(api_error)
 
                     got_text = bool(full_text.strip())
                     got_output = got_text or bool(tool_calls)
-                    elapsed = time.time() - start_time
+                    elapsed = time.monotonic() - start_time
 
                     if got_output:
                         finish_reason = "tool_calls" if tool_calls else _map_finish_reason(finish_raw)
-                        stats.add_success()
-                        print(f"✅ [Studio] {base_model_name} | {len(full_text)} 字符 | {elapsed:.1f}s")
                     else:
                         # 无正文（只有思考 / 完全空）：返回明确诊断而不是一个空格
                         detail = f"finishReason={finish_raw or '无'}"
@@ -1767,11 +1780,15 @@ class CookieProxyUpstream(BaseUpstream):
                         stats.add_error()
                         print(f"❌ [Studio] {base_model_name} | 上游{desc}（{detail}）| {elapsed:.1f}s")
                         print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
-                        full_text = f"[Studio 提示] 上游{desc}（{detail}）。{hint}"
                         filtered = bool(blocked_msg) or ((finish_raw or "").upper() in _FINISH_FILTERED)
-                        finish_reason = "content_filter" if filtered else "stop"
+                        print(f"🔎 [Studio 诊断] {hint}")
+                        return error_response(UpstreamError(
+                            400 if filtered else 502, "上游拦截了请求。" if filtered else f"上游{desc}。",
+                            code="content_filter" if filtered else "empty_response"))
 
-                    usage = _map_usage(usage_meta)
+                    usage_result = await _finish_cookie_usage(usage_counter, body, usage_meta)
+                    stats.add_success()
+                    print(f"✅ [Studio] {request_label} | 非流式完成 | 总耗时 {time.monotonic() - start_time:.2f}s")
 
                     content_value = full_text + safety_html
                     message_obj = {"role": "assistant", "content": content_value if content_value else None}
@@ -1790,29 +1807,38 @@ class CookieProxyUpstream(BaseUpstream):
                             "message": message_obj,
                             "finish_reason": finish_reason,
                         }],
-                        "usage": usage,
+                        **usage_result,
                     })
 
+                except httpx.TimeoutException as e:
+                    # 超时属于已知网络故障：明确结束本次请求，不进入通用重试或堆栈日志。
+                    if isinstance(e, httpx.ReadTimeout):
+                        reason = "读取上游响应超时"
+                    elif isinstance(e, httpx.ConnectTimeout):
+                        reason = "连接上游超时"
+                    elif isinstance(e, httpx.WriteTimeout):
+                        reason = "发送上游请求超时"
+                    elif isinstance(e, httpx.PoolTimeout):
+                        reason = "等待上游连接池超时"
+                    else:
+                        reason = "上游请求超时"
+                    message = f"{reason}，本次请求已结束。"
+                    return nonstream_failure(UpstreamError(504, message, "timeout"))
+
                 except Exception as e:
-                    err_msg = str(e)
-                    is_retryable = _is_retryable_error(err_msg) or "timeout" in err_msg.lower()
+                    error = upstream_error(e)
+                    is_retryable = _is_retryable_exception(e)
 
                     if is_retryable and attempt < retry_max:
                         wait_sec = backoff_sec
                         stats.add_retry()
-                        print(f"⚠️ [Studio] 异常 (尝试 {attempt+1}): {err_msg[:100]}, {wait_sec}s 后重试...")
+                        print(f"⚠️ [Studio] {request_label} | 异常={type(e).__name__}"
+                              f" | 尝试 {attempt+1}/{retry_max+1}：{error}，{wait_sec}s 后重试...")
                         await asyncio.sleep(wait_sec)
                         continue
 
-                    elapsed = time.time() - start_time
-                    print(f"❌ [Studio] {base_model_name} | 异常 | {elapsed:.1f}s: {err_msg[:150]}")
-                    traceback.print_exc()
-                    return JSONResponse(status_code=500, content={
-                        "error": {"message": f"batchGraphql proxy error: {err_msg}", "type": "proxy_error"}
-                    })
+                    if not isinstance(e, httpx.RequestError):
+                        traceback.print_exc()
+                    return nonstream_failure(error)
 
-            elapsed = time.time() - start_time
-            print(f"❌ [Studio] {base_model_name} | 重试 {retry_max} 次后仍失败 | {elapsed:.1f}s")
-            return JSONResponse(status_code=429, content={
-                "error": {"message": "请求被限流，已重试多次仍失败。请稍后再试。", "type": "rate_limit_error"}
-            })
+            return nonstream_failure(UpstreamError(429, "请求被限流，重试已耗尽。", "rate_limit_error"))

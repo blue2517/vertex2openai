@@ -5,14 +5,13 @@
 - 每个模型支持的思考方式（thinking_level / 无）与合法档位
 - 可用的采样参数集合（避免把不支持的参数发给模型导致 400）
 - 生图模型支持的宽高比与分辨率白名单
-- 是否要求最后一条消息为 user（Gemini 3.x 强制，否则 400 → 影响预填充）
 
 设计原则：**按家族模式识别，而非写死每个型号**，因此往 vertexModels.json 里新增模型 ID
 基本即插即用；未知/未来型号保守回退到“最新代（gemini-3）”档案。
 
 依据（2026-07 官方文档核实）：
 - thinking: ai.google.dev/gemini-api/docs/thinking
-- 3.6/3.5 开发指南（采样弃用 + 预填充 400 + 去 candidate_count）
+- 3.6/3.5 开发指南（采样弃用 + 去 candidate_count）
 - 生图: ai.google.dev/gemini-api/docs/image-generation ；Agent Platform 3-pro-image / 3-1-flash-image
 """
 
@@ -171,7 +170,7 @@ def get_profile(model_name: str) -> Dict[str, Any]:
             "image_aspect_ratios": ars,
             "image_sizes": sizes,
             "supports_search": True,
-            "requires_user_last_turn": True,
+
         }
 
     # ---- 文本 / 多模态 ----
@@ -210,7 +209,7 @@ def get_profile(model_name: str) -> Dict[str, Any]:
             "allowed_sampling": allowed,
             "sampling_advice": "deprecated" if temp_dep else "recommend_default",
             "supports_search": True,
-            "requires_user_last_turn": True,
+
         }
 
     # ---- 更早（2.0 / 1.5 等）：无思考、全采样、宽松 ----
@@ -220,7 +219,7 @@ def get_profile(model_name: str) -> Dict[str, Any]:
         "thinking_kind": None,
         "allowed_sampling": set(SAMPLING_KEYS) - PENALTY_KEYS,
         "supports_search": True,
-        "requires_user_last_turn": False,
+
     }
 
 
@@ -256,8 +255,7 @@ def _extra(request: Any, key: str) -> Any:
     return v
 
 
-def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
-                     prefill_active: bool = False) -> Dict[str, Any]:
+def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any]) -> Dict[str, Any]:
     """
     计算思考配置（中立结构，各通道再转成自己的线格式）。
     返回 {"mode": None} 或 {"mode":"level","level":..}
@@ -272,7 +270,6 @@ def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
       才是 Studio 下真正减少原生思考、避免重预设思考阶段被截断的关键（已真机验证）。**
     - "console"（强制控制台档位）：忽略前端 effort，用控制台/该模型专属档位（未设则模型默认），返回思考。
 
-    另外 prefill_suppress_thinking（默认开）：检测到预填充时等效走 "off" 压制路径。
     """
     prof = get_profile(model_name)
     if prof["thinking_kind"] is None:
@@ -291,8 +288,8 @@ def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
         else:
             mode = "request"
 
-    # suppress = 关闭原生思考（压到最低 + 隐藏 + 忽略前端）。预填充压制也走这条路。
-    suppress = bool(mode == "off" or (prefill_active and settings.get("prefill_suppress_thinking", True)))
+    # Only an explicit native-thinking setting may suppress reasoning.
+    suppress = mode == "off"
     ignore_client = bool(suppress or mode == "console")
 
     req_effort = None if ignore_client else _effort(request)

@@ -15,8 +15,7 @@ from api_helpers import (
     execute_gemini_call,
     create_openai_error_response,
 )
-from message_processing import (create_gemini_prompt, apply_prefill_compat,
-                                apply_console_injection, DEFAULT_IMAGE_PREFILL_NUDGE)
+from message_processing import create_gemini_prompt, apply_console_injection
 from http_options import get_http_options
 import model_capabilities as mc
 from runtime_state import app_state
@@ -48,24 +47,11 @@ def _normalize_model_name(model_name: str) -> tuple[str, bool, str | None]:
     return base_model_name, is_grounded_search, None
 
 
-def _prefill_tpl(user_template: str, is_image_model: bool) -> str:
-    """选用续写指令：生图模型在用户未自定义时改用要图片的那句。
-
-    通用模板说的是"从断点处无缝往下写"，生图模型会老老实实继续写**文本**，
-    结果吐出一段字符画而不是图片（实测复现）。用户填了自定义模板则以用户的为准。
-    """
-    tpl = (user_template or "").strip()
-    if tpl:
-        return tpl
-    return DEFAULT_IMAGE_PREFILL_NUDGE if is_image_model else ""
-
-
-def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_image_model: bool,
-                           prefill_active: bool = False) -> dict | None:
+def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_image_model: bool) -> dict | None:
     """按模型能力档案 + 控制台设置 + 单次请求构建思考配置（SDK 线格式）。
     生图模型同样下发 thinking_level（三模型默认 HIGH，用户决策 2026-10-13）。"""
     settings = app_state.get_effective_settings(base_model_name)
-    t = mc.resolve_thinking(base_model_name, request, settings, prefill_active=prefill_active)
+    t = mc.resolve_thinking(base_model_name, request, settings)
     if t.get("mode") is None:
         return None
 
@@ -88,15 +74,6 @@ def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_imag
         print(f"🔎 [出站调试] Express 通道 模型={base_model_name} thinkingConfig={thinking_config}")
 
     return thinking_config
-
-
-def _prefill_log(mode: str) -> str:
-    """按模式说明预填充被怎么处理了。"""
-    if mode == "keep_turn":
-        return "🩹 [预填充兼容] 预填充保留为 model 轮次，其后补一句续写推动语。"
-    if mode == "minimal":
-        return "🩹 [预填充兼容] 仅补占位 user 保证不报错。"
-    return "🩹 [预填充兼容] 预填充已并入末尾 user 消息作为续写指令。"
 
 
 _ENDPOINT_LOGGED = False
@@ -219,11 +196,15 @@ class ExpressSDKUpstream(BaseUpstream):
         # 多账号：location 钉定用**这个 Key 自己的**项目，而不是 Cookie 通道的全局项目
         model_to_call = resolve_express_model_path(base_model_name, _inj_settings,
                                                    key_project_id=key_record.get("project_id", ""))
+        # 每个请求固定一份连接配置，控制台切换代理不影响本次 location 兜底重试。
+        request_http_options = get_http_options()
         client_to_use = genai.Client(
             vertexai=True,
             api_key=express_api_key,
-            http_options=get_http_options(),
+            http_options=request_http_options,
         )
+        register_client = getattr(fastapi_request, "register_upstream_client", lambda client: client)
+        register_client(client_to_use)
         _log_resolved_endpoint(client_to_use)
         print(f"🌐 [上游端点] 使用官方 Gemini Express Mode SDK 调用模型 {base_model_name}。")
         if model_to_call != base_model_name:
@@ -232,50 +213,16 @@ class ExpressSDKUpstream(BaseUpstream):
         profile = mc.get_profile(base_model_name)
         is_image_model = profile["is_image"]
 
-        # 预填充智能兼容：按控制台模式 + 模型能力处理末尾 assistant 预填充（新模型自动生效）
-        # - 2.5 及更早（允许 model 结尾）：原生透传，模型直接续写；
-        # - 3.x（拒绝 model 结尾）：转成续写指令；
-        # - 两者都会把预填充文本拼回输出开头（带去重）。
-        prefill_active = False
-        # 控制台注入（轻量前端用；两个字段都留空时是空操作）。
-        # 必须在 apply_prefill_compat 之前，注入后的消息与前端自发预填充同形。
-        _injected, _inj_notes = apply_console_injection(
-            request_obj.messages,
-            system_text=_inj_settings.get("inject_system_instruction", ""),
-            prefill_text=_inj_settings.get("inject_prefill", ""),
-            has_tools=bool(getattr(request_obj, "tools", None)),
-            is_image_model=is_image_model,
-            allow_image_prefill=bool(_inj_settings.get("inject_prefill_for_image", False)),
-        )
-        for _n in _inj_notes:
-            print(_n)
-        if _injected is not request_obj.messages:
-            request_obj = request_obj.model_copy(update={"messages": _injected})
-
-        _prefill_mode = app_state.get_setting("prefill_mode", app_config.DEFAULT_SETTINGS["prefill_mode"])
-        if _prefill_mode != "off":
-            new_msgs, prefill_active = apply_prefill_compat(
-                request_obj.messages, _prefill_mode,
-                allow_model_last=not profile["requires_user_last_turn"],
-                instruction_template=_prefill_tpl(_inj_settings.get("prefill_instruction", ""), is_image_model),
-            )
-            if new_msgs is not request_obj.messages:
-                request_obj = request_obj.model_copy(update={"messages": new_msgs})
-                print(_prefill_log(_prefill_mode))
-            elif prefill_active:
-                print("🩹 [预填充兼容] 该模型支持 model 结尾，预填充原生透传，模型将直接续写。")
-            else:
-                # 没检测到预填充也要说一声：很多人以为整个预设就是预填充，
-                # 实际只有「最后一条 assistant 消息」才算。没有它，压制原生思考也不会触发。
-                print("ℹ️ [预填充兼容] 未检测到预填充（请求最后一条不是 assistant 消息）。"
-                      "预设里的思维链指令属于 system/user 条目，不是预填充；"
-                      "若要用预设思维链顶掉原生思考，需在预设末尾放一条 assistant 条目（通常是思考块的开标签）。")
-            if prefill_active and app_state.get_setting("prefill_suppress_thinking", True):
-                print("🧠 [预填充兼容] 已按模型压制原生思考（可在控制台关闭），让预设思维链接管。")
+        # Only explicit console system instructions may add a message.
+        injected, notes = apply_console_injection(
+            request_obj.messages, system_text=_inj_settings.get("inject_system_instruction", ""))
+        for note in notes:
+            print(note)
+        if injected is not request_obj.messages:
+            request_obj = request_obj.model_copy(update={"messages": injected})
 
         gen_config_dict = create_generation_config(request_obj)
-        thinking_config = _build_thinking_config(base_model_name, request_obj, is_image_model,
-                                                 prefill_active=prefill_active)
+        thinking_config = _build_thinking_config(base_model_name, request_obj, is_image_model)
         if thinking_config:
             gen_config_dict["thinking_config"] = thinking_config
 
@@ -307,10 +254,10 @@ class ExpressSDKUpstream(BaseUpstream):
             # 自动退回裸模型名重试一次。
             fallback_model=(base_model_name if model_to_call != base_model_name else None),
             fallback_client_factory=(
-                lambda: genai.Client(
+                lambda: register_client(genai.Client(
                     vertexai=True,
                     api_key=express_api_key,
-                    http_options=get_http_options(),
-                )
+                    http_options=request_http_options,
+                ))
             ),
         )

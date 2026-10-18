@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import List, Dict, Optional
 
 import config as app_config
+from network_proxy import get_proxy_client_args
 
 _model_cache: Optional[Dict[str, List[str]]] = None
 _cache_lock = asyncio.Lock()
@@ -61,9 +62,7 @@ async def fetch_and_parse_models_config() -> Optional[Dict[str, List[str]]]:
         if fallback_url not in urls_to_try:
             urls_to_try.append(fallback_url)
 
-    client_args = {"timeout": 20.0}
-    if app_config.PROXY_URL:
-        client_args["proxy"] = app_config.PROXY_URL
+    client_args = {"timeout": 20.0, **get_proxy_client_args()}
     if app_config.SSL_CERT_FILE:
         client_args["verify"] = app_config.SSL_CERT_FILE
 

@@ -10,6 +10,7 @@ from typing import List, Dict, Any, Optional, Tuple
 import config as app_config
 import model_capabilities as mc
 from runtime_state import app_state
+from network_proxy import get_proxy_client_args
 from signature_store import (
     signature_store,
     SKIP_VALIDATOR_SENTINEL,
@@ -326,187 +327,18 @@ def _coerce_tool_response(content: Any) -> Dict[str, Any]:
     return {"result": content}
 
 
-def _message_text(content: Any) -> str:
-    """从 OpenAIMessage.content（str 或分段 list）里提取纯文本。"""
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for p in content:
-            if isinstance(p, dict) and p.get("type") == "text":
-                parts.append(p.get("text", ""))
-            elif hasattr(p, "text") and isinstance(getattr(p, "text", None), str):
-                parts.append(p.text)
-        return "".join(parts)
-    return ""
-
-
-def _is_empty_message(msg: OpenAIMessage) -> bool:
-    if getattr(msg, "tool_calls", None):
-        return False
-    return not _message_text(msg.content).strip()
-
-
-DEFAULT_PREFILL_INSTRUCTION = (
-    "[继续输出] 下面是你这条回复已经写好的开头，请从断点处无缝继续，"
-    "不要重复开头内容，也不要添加任何前言、解释或标注："
-)
-
-
-# keep_turn 模式用的收尾指令。预填充留在 model 轮次里，这里只需要一句极短的推动，
-# 越短越不干扰预设本身。
-DEFAULT_KEEP_TURN_NUDGE = (
-    "[继续] 从你上一条的断点处无缝往下写，不要重复已写内容，不要任何前言或解释。"
-)
-
-
-# 生图模型专用的续写指令。通用那句是"从断点处无缝往下写"，模型会照办——
-# 继续写**文本**，于是吐出一段字符画而不是图片（实测）。生图必须明确要图。
-DEFAULT_IMAGE_PREFILL_NUDGE = (
-    "[继续] 按上面说的风格与要求，直接输出图片本身，不要输出任何文字描述或字符画。"
-)
-
-
-def apply_console_injection(
-    messages: List[OpenAIMessage],
-    system_text: str = "",
-    prefill_text: str = "",
-    has_tools: bool = False,
-    is_image_model: bool = False,
-    allow_image_prefill: bool = False,
-) -> Tuple[List[OpenAIMessage], List[str]]:
-    """把控制台配置的 system 指令 / 预填充注入到消息里。
-
-    面向 RikkaHub 这类轻量前端：它们没有酒馆的预设系统，尤其**从不发送
-    assistant 预填充**，因此在这些前端下预填充这个杠杆完全用不上，
-    "预填充时压制原生思考"也永远不会触发。
-
-    注入发生在 `apply_prefill_compat` **之前**，注入完的消息与"前端自己发了
-    预填充"完全同形，下游四种兼容模式原样复用，不引入新分支。
-
-    四条护栏（缺一个就会和现有功能打架）：
-      1. 客户端已经发了预填充 → 不注入，否则两段预填充叠一起（酒馆场景）；
-      2. 请求带 tools → 不注入，凭空多一个 model 轮次会打乱函数调用往返；
-      3. 生图模型 → 默认不注入预填充，除非 allow_image_prefill=True。
-         预填充对生图确有很强的引导力（实测：同一句"画一只猫"，预填充承诺
-         "纯黑白钢笔线稿"就真的输出线稿，不加则是彩色写实照片），但角色扮演
-         用的预填充落到生图请求上会让模型改吐文本，所以做成开关而非默认放行；
-      4. 两个字段都留空 → 整个函数是空操作。
-
-    返回 (新消息列表, 说明做了什么的日志行列表)。
-    """
-    notes: List[str] = []
+def apply_console_injection(messages: List[OpenAIMessage], system_text: str = "") -> Tuple[List[OpenAIMessage], List[str]]:
+    """Apply only an explicitly configured system instruction; never inspect message endings."""
     system_text = (system_text or "").strip()
-    prefill_text = (prefill_text or "").strip()
-    if not system_text and not prefill_text:
-        return messages, notes
-
-    new_msgs = list(messages or [])
-
-    if system_text:
-        # 追加在客户端 system 之后：越靠后越不容易被前面的内容淹没，
-        # 也保证前端自己的系统提示仍然在场。
-        insert_at = 0
-        for i, m in enumerate(new_msgs):
-            if m.role == "system":
-                insert_at = i + 1
-        new_msgs.insert(insert_at, OpenAIMessage(role="system", content=system_text))
-        notes.append(f"💉 [控制台注入] 已追加 system 指令（{len(system_text)} 字）。")
-
-    if prefill_text:
-        if has_tools:
-            notes.append("💉 [控制台注入] 请求带函数调用，已跳过预填充注入（避免打乱工具往返）。")
-        elif is_image_model and not allow_image_prefill:
-            notes.append("💉 [控制台注入] 生图模型，已跳过预填充注入"
-                         "（如需用预填充引导画风，请在控制台打开「生图也注入预填充」）。")
-        else:
-            idx = len(new_msgs) - 1
-            while idx >= 0 and _is_empty_message(new_msgs[idx]):
-                idx -= 1
-            client_has_prefill = (idx >= 0 and new_msgs[idx].role == "assistant"
-                                  and not getattr(new_msgs[idx], "tool_calls", None))
-            if client_has_prefill:
-                notes.append("💉 [控制台注入] 客户端已自带预填充，跳过注入（不覆盖前端预设）。")
-            else:
-                new_msgs = new_msgs[:idx + 1]
-                new_msgs.append(OpenAIMessage(role="assistant", content=prefill_text))
-                notes.append(f"💉 [控制台注入] 已注入预填充（{len(prefill_text)} 字），"
-                             "下面按预填充兼容模式处理。")
-
-    return new_msgs, notes
-
-
-def apply_prefill_compat(
-    messages: List[OpenAIMessage],
-    mode: str = "smart",
-    allow_model_last: bool = False,
-    instruction_template: str = "",
-) -> Tuple[List[OpenAIMessage], bool]:
-    """
-    预填充(prefill)兼容：Gemini 3.x 拒绝以 assistant/model 结尾的请求（400）。
-
-    - mode="off"：不处理（可能 400）。
-    - mode="minimal"：末尾非 user 时追加一个占位 user，仅保证不报错。
-    - mode="smart"：
-      * allow_model_last=True（模型允许以 model 轮次结尾，如 2.5 及更早）→ **原生透传**：
-        消息保持原样发给上游，模型直接续写末尾轮次；
-      * 否则（3.x 等）→ 把末尾 assistant 预填充取出，转成末尾 user 的“续写指令”
-        （模板可用 instruction_template 自定义，留空用内置默认）。
-    - mode="keep_turn"：
-      **保留** assistant 预填充作为 model 轮次，只在其后补一句极短的 user 推动语。
-      3.x 拒绝的是“以 model 轮次结尾”，并不禁止 model 轮次出现在中间。
-      2.5 系仍走原生透传，不受影响。
-
-    返回 (处理后的消息列表, 是否检测到预填充)。
-    第二项供“预填充时压制原生思考”等联动逻辑使用。
-    """
-    if not messages or mode == "off":
-        return messages, False
-
-    # 找到最后一条“非空”消息
-    idx = len(messages) - 1
-    while idx >= 0 and _is_empty_message(messages[idx]):
-        idx -= 1
-    if idx < 0:
-        return messages, False
-
-    last = messages[idx]
-    if last.role != "assistant" or getattr(last, "tool_calls", None):
-        return messages, False  # 已是 user 结尾 / 末尾是工具调用 → 无需处理
-
-    prefill = _message_text(last.content).strip()
-    if not prefill:
-        return messages, False
-
-    if mode == "minimal":
-        new_msgs = list(messages)
-        new_msgs.append(OpenAIMessage(role="user", content="(请继续)"))
-        return new_msgs, True
-
-    # 模型支持 model 结尾 → 原生预填充透传（不改消息，模型直接续写）
-    if allow_model_last:
-        return messages, True
-
-    if mode == "keep_turn":
-        # 保留预填充所在的 assistant 轮次，只补一句极短 user 推动语。
-        # 必须截到 idx+1：预填充后面可能还跟着空消息，带上它们会再次以非 user 结尾。
-        new_msgs = list(messages[:idx + 1])
-        nudge = (instruction_template or "").strip() or DEFAULT_KEEP_TURN_NUDGE
-        new_msgs.append(OpenAIMessage(role="user", content=nudge))
-        return new_msgs, True
-
-    # smart：丢弃末尾预填充 assistant（及其后的空消息），转成续写指令
-    new_msgs = list(messages[:idx])
-    intro = (instruction_template or "").strip() or DEFAULT_PREFILL_INSTRUCTION
-    instruction = f"{intro}\n\n{prefill}"
-    if new_msgs and new_msgs[-1].role == "user" and isinstance(new_msgs[-1].content, str):
-        merged = f"{new_msgs[-1].content}\n\n{instruction}"
-        new_msgs[-1] = OpenAIMessage(role="user", content=merged)
-    else:
-        new_msgs.append(OpenAIMessage(role="user", content=instruction))
-    return new_msgs, True
+    if not system_text:
+        return messages, []
+    new_messages = list(messages or [])
+    insert_at = 0
+    for index, message in enumerate(new_messages):
+        if message.role == "system":
+            insert_at = index + 1
+    new_messages.insert(insert_at, OpenAIMessage(role="system", content=system_text))
+    return new_messages, [f"💉 [控制台注入] 已追加 system 指令（{len(system_text)} 字）。"]
 
 
 def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") -> List[types.Content]:
@@ -768,9 +600,6 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
         else:
             merged_messages.append(msg)
 
-    if not merged_messages:
-        merged_messages.append(types.Content(role="user", parts=[types.Part.from_text(text="继续")]))
-
     return merged_messages
 
 # F-3：远程图片抓取的防护参数。
@@ -826,7 +655,8 @@ def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes,
     """
     from urllib.parse import urlparse
 
-    check_host = not app_config.PROXY_URL
+    proxy_args = get_proxy_client_args()
+    check_host = not proxy_args.get("proxy")
     try:
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https"):
@@ -834,9 +664,7 @@ def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes,
         if check_host and _is_blocked_host(parsed.hostname or ""):
             raise ValueError("目标地址指向内网/环回/链路本地，已拒绝")
 
-        client_args = {"timeout": timeout, "follow_redirects": False}
-        if app_config.PROXY_URL:
-            client_args["proxy"] = app_config.PROXY_URL
+        client_args = {"timeout": timeout, "follow_redirects": False, **proxy_args}
         if getattr(app_config, "SSL_CERT_FILE", None):
             client_args["verify"] = app_config.SSL_CERT_FILE
 
@@ -1005,7 +833,8 @@ def _convert_image_to_markdown(image_data: bytes, mime_type: str) -> str:
         return f"![Image]({data_url})"
     except Exception as e:
         print(f"⚠️ [图片处理] 将 Gemini 图片转换为 Markdown 失败：{e}")
-        return "[Image could not be displayed]"
+        from api_errors import UpstreamError
+        raise UpstreamError(502, "上游图片响应处理失败。") from e
 
 def parse_gemini_response_for_reasoning_and_content(gemini_response_candidate: Any) -> Tuple[str, str]:
     reasoning_text_parts = []

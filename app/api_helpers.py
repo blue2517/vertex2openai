@@ -23,6 +23,10 @@ from runtime_state import app_state
 
 # 引入报错重试统计器
 from logger import stats
+from request_lifecycle import cancel_and_wait
+from api_errors import (
+    UpstreamError, create_openai_error_response, extract_upstream_error, error_sse,
+)
 
 
 def _safety_score_enabled() -> bool:
@@ -146,47 +150,9 @@ class StreamingReasoningProcessor:
         return remaining_content, remaining_reasoning
     
 
-def create_openai_error_response(status_code: int, message: str, error_type: str) -> Dict[str, Any]:
-    safe_message = re.sub(r"([?&]key=)[^&\s'\"]+", r"\1***HIDDEN_API_KEY***", message)
-    return {
-        "error": {
-            "message": safe_message,
-            "type": error_type,
-            "code": status_code,
-            "param": None
-        }
-    }
-
-def extract_upstream_error(e: Exception) -> tuple[int, str]:
-    """从上游异常里尽力提取 (HTTP 状态码, 简明消息)。
-
-    google-genai 的 ClientError/ServerError 带 .code 与结构化 message；
-    其余异常回退 500 + 类名+摘要。用于把 404/403/400 等如实透传给客户端，
-    避免笼统的 500 Internal Server Error。
-    """
-    code = getattr(e, "code", None) or getattr(e, "status_code", None)
-    msg = str(e)
-    # 从形如 "{'error': {'code':404,'message':...}}" 的 message 里提取更干净的说明
-    try:
-        m = re.search(r"'message':\s*'([^']+)'", msg) or re.search(r'"message":\s*"([^"]+)"', msg)
-        if m:
-            msg = m.group(1)
-    except Exception:
-        pass
-    if not isinstance(code, int) or not (400 <= code <= 599):
-        low = str(e).lower()
-        if "not found" in low or "404" in low:
-            code = 404
-        elif "permission" in low or "403" in low or "denied" in low:
-            code = 403
-        elif "invalid" in low or "400" in low:
-            code = 400
-        else:
-            code = 500
-    return code, msg
-
-
 def is_retryable_exception(e):
+    if extract_upstream_error(e)[0] in (401, 403):
+        return False
     error_str = str(e).lower()
     if isinstance(e, httpx.HTTPStatusError) and e.response.status_code in [429, 503, 502]:
         return True
@@ -438,17 +404,35 @@ def make_usage_chunk(response_id: str, model: str, usage: dict) -> str:
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
+def _gemini_prompt_blocked(response: Any) -> bool:
+    reason = getattr(getattr(response, "prompt_feedback", None), "block_reason", None)
+    return bool(reason) and not str(getattr(reason, "name", reason)).upper().endswith("UNSPECIFIED")
+
+
+def _empty_gemini_error(response: Any) -> UpstreamError:
+    filtered = _gemini_prompt_blocked(response) or any(
+        str(getattr(getattr(candidate, "finish_reason", None), "name", getattr(candidate, "finish_reason", ""))).upper()
+        in {"SAFETY", "RECITATION", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY"}
+        for candidate in (getattr(response, "candidates", None) or [])
+    )
+    return UpstreamError(400 if filtered else 502,
+                         "上游拦截了请求。" if filtered else "上游未返回有效回复。",
+                         code="content_filter" if filtered else "empty_response")
+
+
 def is_gemini_response_valid(response: Any) -> bool:
     if response is None: return False
-    if hasattr(response, "text") and isinstance(response.text, str) and response.text.strip(): return True
     if hasattr(response, "candidates") and response.candidates:
         for cand in response.candidates:
-            if hasattr(cand, "text") and isinstance(cand.text, str) and cand.text.strip(): return True
             if hasattr(cand, "content") and hasattr(cand.content, "parts") and cand.content.parts:
                 for part in cand.content.parts:
+                    if getattr(part, "thought", False): continue
                     if getattr(part, "function_call", None) is not None: return True
                     if getattr(part, "inline_data", None) is not None: return True
+                    if getattr(part, "file_data", None) is not None: return True
                     if hasattr(part, "text") and isinstance(getattr(part, "text", None), str) and getattr(part, "text", "").strip(): return True
+            elif isinstance(getattr(cand, "text", None), str) and cand.text.strip(): return True
+    elif isinstance(getattr(response, "text", None), str) and response.text.strip(): return True
     return False
 
 
@@ -576,8 +560,8 @@ async def _chunk_openai_response_dict_for_sse(
     created_time = openai_response_dict.get("created", int(time.time()))
     
     choices = openai_response_dict.get("choices", [])
-    if not choices: 
-        yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'error'}]})}\n\n"
+    if not choices:
+        yield error_sse(UpstreamError(502, "上游未返回有效回复。", code="empty_response"))
         yield "data: [DONE]\n\n"
         return
 
@@ -733,14 +717,15 @@ async def gemini_fake_stream_generator(
 
         openai_response_dict = convert_to_openai_format(raw_gemini_response, request_obj.model)
 
-        if hasattr(raw_gemini_response, "prompt_feedback") and \
-           hasattr(raw_gemini_response.prompt_feedback, "block_reason") and \
-           raw_gemini_response.prompt_feedback.block_reason:
+        if _gemini_prompt_blocked(raw_gemini_response):
             block_message = f"Response blocked by Gemini safety filter: {raw_gemini_response.prompt_feedback.block_reason}"
             if hasattr(raw_gemini_response.prompt_feedback, "block_reason_message") and \
                raw_gemini_response.prompt_feedback.block_reason_message:
                 block_message += f" (Message: {raw_gemini_response.prompt_feedback.block_reason_message})"
-            raise ValueError(block_message)
+            raise UpstreamError(400, "上游拦截了请求。", code="content_filter")
+
+        if not is_gemini_response_valid(raw_gemini_response):
+            raise _empty_gemini_error(raw_gemini_response)
 
         async for chunk_sse in _chunk_openai_response_dict_for_sse(
             openai_response_dict=openai_response_dict
@@ -748,21 +733,17 @@ async def gemini_fake_stream_generator(
             yield chunk_sse
 
     except asyncio.CancelledError:
-        print(f"ℹ️ [客户端断开] 假流式响应期间客户端已断开，正在清理模型 {request_obj.model} 的后台任务。")
-        if "api_call_task" in locals() and not api_call_task.done():
-            api_call_task.cancel()
         raise
     except Exception as e_outer_gemini:
         err_msg_detail = f"Gemini 假流式生成器异常（模型：{request_obj.model}）：{type(e_outer_gemini).__name__} - {str(e_outer_gemini)}"
         print(f"❌ [API 错误响应] 假流发生器运行崩溃 (Model: {request_obj.model})。错误详情: {err_msg_detail}")
-        sse_err_msg_display = str(e_outer_gemini)
-        if len(sse_err_msg_display) > 512: sse_err_msg_display = sse_err_msg_display[:512] + "..."
-        err_resp_sse = create_openai_error_response(500, sse_err_msg_display, "server_error")
-        json_payload_error = json.dumps(err_resp_sse)
         if not is_auto_attempt:
-            yield f"data: {json_payload_error}\n\n"
+            yield error_sse(e_outer_gemini)
             yield "data: [DONE]\n\n"
         if is_auto_attempt: raise
+    finally:
+        if "api_call_task" in locals():
+            await cancel_and_wait(api_call_task)
             
 def is_location_pin_failure(err: Any) -> bool:
     """错误是否像"钉定的 projects/locations 路径不对"（而非模型或网络本身的问题）。
@@ -840,6 +821,7 @@ async def execute_gemini_call(
                 nonlocal model_to_call, current_client
                 max_retries, backoff_sec = get_retry_settings()
                 has_yielded = False  # 是否已向客户端输出过内容
+                got_output = False
                 # 立即吐一个 SSE 心跳，尽快建立连接（429 重试期间也保活，防前端超时中断）
                 yield ": keep-alive\n\n"
                 # 总尝试次数 = retry_max + 1，retry_max=0 时仍会请求一次
@@ -848,6 +830,7 @@ async def execute_gemini_call(
                     if await _client_gone():
                         print(f"ℹ️ [客户端断开] 真流式请求前检测到客户端已断开，停止调用模型 {model_to_call}。")
                         return
+                    stream_gen_obj = None
                     try:
                         stream_gen_obj = await current_client.aio.models.generate_content_stream(
                             model=model_to_call,
@@ -859,8 +842,13 @@ async def execute_gemini_call(
                         tool_indexer = ToolCallIndexer()
 
                         final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
+                        last_chunk = None
 
                         async for chunk_item_call in stream_gen_obj:
+                            last_chunk = chunk_item_call
+                            if _gemini_prompt_blocked(chunk_item_call):
+                                raise UpstreamError(400, "上游拦截了请求。", code="content_filter")
+                            got_output = got_output or is_gemini_response_valid(chunk_item_call)
                             if getattr(chunk_item_call, "usage_metadata", None):
                                 final_p_tk, final_c_tk, final_t_tk = _extract_usage(chunk_item_call)
 
@@ -872,6 +860,9 @@ async def execute_gemini_call(
                                     chunk_item_call, request_obj.model, response_id_for_stream, ci,
                                     indexer=tool_indexer)
                                 yield sse_chunk
+
+                        if not got_output:
+                            raise _empty_gemini_error(last_chunk)
 
                         if final_p_tk > 0 or final_c_tk > 0:
                             stats.add_tokens(final_p_tk, final_c_tk)
@@ -890,7 +881,6 @@ async def execute_gemini_call(
                         return
 
                     except asyncio.CancelledError:
-                        print(f"ℹ️ [客户端断开] 真流式响应期间客户端已断开，模型 {model_to_call} 的请求已安全终止。")
                         raise
                     except Exception as e_stream_call:
                         error_str = str(e_stream_call).lower()
@@ -898,9 +888,12 @@ async def execute_gemini_call(
                             "429" in error_str or "503" in error_str or "too many requests" in error_str
                             or "quota" in error_str or "resource exhausted" in error_str
                         )
+                        if extract_upstream_error(e_stream_call)[0] in (401, 403):
+                            is_retryable = False
 
                         # location 钉定路径不对 → 退回裸模型名再试一次（仅在还没输出内容时）
                         if (fallback_model and model_to_call != fallback_model
+                                and extract_upstream_error(e_stream_call)[0] not in (401, 403)
                                 and not has_yielded and is_location_pin_failure(e_stream_call)):
                             print(f"↩️ [上游端点] 钉定路径调用失败（{str(e_stream_call)[:80]}），"
                                   f"已退回默认路由 {fallback_model} 重试一次。"
@@ -935,17 +928,16 @@ async def execute_gemini_call(
 
                         err_msg_detail_stream = f"Gemini 流式请求异常（模型：{model_to_call}）：{type(e_stream_call).__name__} - {str(e_stream_call)}"
                         print(f"❌ [API 错误响应] 流式连接异常中断 (Model: {model_to_call})。错误详情: {err_msg_detail_stream}")
-                        s_err = str(e_stream_call); s_err = s_err[:1024]+"..." if len(s_err)>1024 else s_err
                         if is_auto_attempt:
                             raise e_stream_call
-                        # 已经输出过内容：不再重发错误体，只补结束标记，避免污染已有输出
-                        if has_yielded:
-                            yield "data: [DONE]\n\n"
-                        else:
-                            err_resp = create_openai_error_response(500, s_err, "server_error")
-                            yield f"data: {json.dumps(err_resp)}\n\n"
-                            yield "data: [DONE]\n\n"
+                        # 错误独立于 delta.content；已输出正文也必须报告失败。
+                        yield error_sse(e_stream_call)
+                        yield "data: [DONE]\n\n"
                         return
+                    finally:
+                        close = getattr(stream_gen_obj, "aclose", None)
+                        if close is not None:
+                            await close()
 
             return StreamingResponse(_gemini_real_stream_generator_inner(), media_type="text/event-stream")
     else: # Non-streaming
@@ -968,10 +960,10 @@ async def execute_gemini_call(
                 )
                 break
             except asyncio.CancelledError:
-                print(f"ℹ️ [客户端断开] 非流式响应期间客户端已断开，模型 {model_to_call} 的请求已安全终止。")
                 raise
             except Exception as e_call:
                 if (fallback_model and model_to_call != fallback_model
+                        and extract_upstream_error(e_call)[0] not in (401, 403)
                         and is_location_pin_failure(e_call)):
                     print(f"↩️ [上游端点] 钉定路径调用失败（{str(e_call)[:80]}），"
                           f"已退回默认路由 {fallback_model} 重试一次。"
@@ -998,14 +990,13 @@ async def execute_gemini_call(
                     502, "上游未返回任何响应（重试已耗尽）。", "upstream_error"),
             )
 
-        if hasattr(response_obj_call, "prompt_feedback") and \
-           hasattr(response_obj_call.prompt_feedback, "block_reason") and \
-           response_obj_call.prompt_feedback.block_reason:
+        if _gemini_prompt_blocked(response_obj_call):
             block_msg = f"Agent Platform 安全策略拦截了请求：{response_obj_call.prompt_feedback.block_reason}"
             if hasattr(response_obj_call.prompt_feedback,"block_reason_message") and \
                response_obj_call.prompt_feedback.block_reason_message:
                 block_msg+=f"（{response_obj_call.prompt_feedback.block_reason_message}）"
-            raise ValueError(block_msg)
+            print(f"❌ [上游拦截] {block_msg}")
+            raise UpstreamError(400, "上游拦截了请求。", code="content_filter")
 
         if not is_gemini_response_valid(response_obj_call):
             error_details = f"Agent Platform 非流式响应无有效内容，模型：{model_to_call}。"
@@ -1028,7 +1019,8 @@ async def execute_gemini_call(
                                     error_details += f"First part text: '{text_preview}'"
             else:
                 error_details += f"Response type: {type(response_obj_call).__name__}"
-            raise ValueError(error_details)
+            print(f"❌ [上游无有效内容] {error_details}")
+            raise _empty_gemini_error(response_obj_call)
 
         _record_usage(response_obj_call)
 

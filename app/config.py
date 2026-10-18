@@ -78,26 +78,13 @@ DEFAULT_SETTINGS = {
     # 两条通道统一走 api_helpers.get_retry_settings() 读取（会钳位到 0–50）。
     "retry_max": 10,
     "retry_backoff_seconds": 5,
+    # Studio/Cookie 通道等待首段或下一段响应数据的上限（秒），保存后对新请求生效。
+    "studio_read_timeout_seconds": 180,
     # 开关（初始值取环境变量）
     "fake_streaming": FAKE_STREAMING_ENABLED,
     "fake_streaming_interval": FAKE_STREAMING_INTERVAL_SECONDS,
     "roundrobin": ROUNDROBIN,
     "safety_score": SAFETY_SCORE,
-    # 预填充兼容模式: smart|minimal|off
-    # 默认 smart。两种模式的优劣**取决于预填充的结尾形态**，用某真实酒馆预设
-    # （预填充为一段完整句子 + 一个未闭合的思维链开标签）实测 gemini-3.6-flash × 3：
-    #   smart      重复开标签 0/3，思考语言正确 3/3   ← 真实预设的常见形态
-    #   keep_turn  重复开标签 3/3，思考语言正确 2/3
-    # 真实预设的预填充多以完整句子收尾（"…¡Allá voy!"），keep_turn 追加的 user
-    # 推动语会让模型当成新一轮，把开标签又写一遍；而该重复**去重逻辑抓不到**
-    # （预填充结尾与输出开头无重叠），最终输出里出现两个开标签，破坏前端正则。
-    # 仅当预填充停在半截 token（如 "<thinking>\n1."）时 keep_turn 才更优——
-    # 那种情况下 smart 会跑题且丢格式（合成用例实测 0/3）。
-    "prefill_mode": "smart",
-    # 预填充触发时压制原生思考（“卡思维链”核心开关）：
-    # 3.x 压到最低档（minimal/低于则 low）并关闭思考回传；2.5-flash 预算设 0 全关、2.5-pro 降到最低 128。
-    # 此路径会忽略前端 effort（预填充时优先）。
-    "prefill_suppress_thinking": True,
     # 原生思考控制（酒馆预设“卡原生思维链”核心）：
     #   request = 跟随前端 reasoning_effort（默认）
     #   off     = 关闭原生思考：压到该模型最低档 + 忽略前端 effort + 不回传思考
@@ -107,8 +94,6 @@ DEFAULT_SETTINGS = {
     # —— 以下两个为上一版布尔开关，保留仅作向后兼容（新 UI 用 native_thinking_mode）——
     "thinking_force_console": False,
     "hide_thoughts": False,
-    # smart 模式续写指令模板（留空=用内置默认；预填充文本会自动附在模板之后）
-    "prefill_instruction": "",
     # 出站参数调试：打印两条通道实际发出的 generationConfig / thinkingConfig。
     # 实机验证思考档位、采样裁剪是否生效时必开。
     # （旧键名 cookie_debug 保留为别名，只作用于 Cookie 通道的额外诊断）
@@ -120,14 +105,8 @@ DEFAULT_SETTINGS = {
     # 生图请求是否下发 system_instruction（默认关，保持既有行为）。
     # 官方未禁止生图模型使用系统指令，但旧代码一直剥离；打开前请先真机验证目标模型。
     "image_system_instruction": False,
-    # 轻量前端（RikkaHub 等）注入：留空 = 不启用，酒馆用户不受影响。
-    # 这两项解决的是"前端本身没有预设系统"的场景，见 message_processing.apply_console_injection。
+    # Explicit console system instruction; empty means no injection.
     "inject_system_instruction": "",
-    "inject_prefill": "",
-    # 生图模型是否也注入预填充。实测预填充对生图有很强的引导力
-    # （同一句"画一只猫"：无预填充→彩色写实照片；预填充承诺"纯黑白钢笔线稿"→真的输出线稿），
-    # 但角色扮演用的预填充落到生图请求上会让模型改吐文本，故默认关、按需开。
-    "inject_prefill_for_image": False,
     # 采样参数处理：auto=按版本自动判定 / deprecated=强制剥离 / allowed=强制保留。
     # 给"新出的模型版本号更小但已废弃采样"这类情况留的手动出口，免于改代码。
     "sampling_policy": "auto",
@@ -151,6 +130,8 @@ DEFAULT_SETTINGS = {
     # 弱网可靠传输（见 resumable.py）：服务端响应缓冲 + 序列号事件 + 断线重放/分片轮询。
     # 上游读取由后台泵任务驱动，与前端连接解绑；Google 的回复总能完整落缓冲。
     "resumable_enabled": True,            # 总开关；关掉则回到原有直通行为
+    "continue_on_disconnect": False,     # 默认最后一个调用方断开即取消上游
+    "disconnect_grace_seconds": 5,       # 开启等待重连后生效，0–300 秒
     "resumable_ttl_seconds": 1800,        # 已完成的缓冲保留时长（秒），超时清掉
     "resumable_max_streams": 200,         # 缓冲总数上限，超限淘汰最旧的已完成缓冲
     # 按模型单独保存的参数覆盖：{ "模型ID": { 键: 值, ... } }
@@ -159,7 +140,7 @@ DEFAULT_SETTINGS = {
 }
 
 # 允许按模型单独保存（覆盖全局默认）的参数键。
-# 其余为基础设施级（图压缩/重试/假流式/预填充/安全分/调试等），保持全局唯一。
+# 其余为基础设施级（图压缩/重试/假流式/安全分/调试等），保持全局唯一。
 PER_MODEL_KEYS = [
     "native_thinking_mode",
     "thinking_g3_level",
@@ -170,12 +151,6 @@ PER_MODEL_KEYS = [
     "default_max_tokens",
     # 注入项按模型区分很常见：只给跑角色扮演的模型开，问答模型保持干净。
     "inject_system_instruction",
-    "inject_prefill",
-    # 续写指令也必须能按模型分开：文本模型要"接着往下写"，生图模型要"直接输出图片"，
-    # 只有一份全局模板时，为文本调好的那句会让生图吐字符画。
-    "prefill_instruction",
-    # 这两个本就是"针对生图模型"的开关，作用域却是全局，用户按模型保存会落空。
     "image_system_instruction",
-    "inject_prefill_for_image",
     "sampling_policy",
 ]

@@ -12,7 +12,7 @@
 --------------------------------------
 1. **响应落缓冲**：每个请求在服务端建一个缓冲区，上游产出的每个 SSE 帧按到达顺序
    追加进去并分配**单调递增的序列号 seq**。上游的读取由一个**后台任务**驱动，
-   与前端连接完全解耦——前端断开不会取消它，Google 的回复总能被完整收下来。
+   与单个前端连接解耦；最后一个调用方离开后，按断连策略立即或在重连宽限到期后取消。
 2. **稳定请求 ID**：缓冲区的 id 优先取客户端请求头（X-Request-Id / Idempotency-Key），
    否则由「API Key + 请求体」哈希而来，因此**同一请求重发即命中同一缓冲区**。
 3. **断线续传**：
@@ -30,7 +30,7 @@
 回复的权威副本在服务端缓冲区里，且是**带序号的有序事件流**；前端连接只是这份副本的
 一个游标读者。抖动 → 读者慢一点，数据仍在缓冲里等它；断线 → 换一条连接从 `next`
 继续读，语义上等价于文件断点续传；前端整轮重发 → 命中同一缓冲区，得到同一份内容而
-不是新的一次生成。因此最终交付的内容与服务端收到的内容逐字节一致。
+不是新的一次生成。取消后的缓冲保留终止原因，下一次生成重新创建任务。
 """
 
 import asyncio
@@ -109,6 +109,7 @@ class ResumableBuffer:
         self.status_code: int = 200
         self.fully_delivered = False          # 是否已有读者完整读到终止帧
         self.readers = 0
+        self.job = None                     # GenerationJob：调用方租约与上游取消生命周期
         self._cond = asyncio.Condition()
 
     # ---------- 写入端（后台泵任务持有） ----------
@@ -122,6 +123,8 @@ class ResumableBuffer:
     async def finish(self, status: str = "done", error: Optional[str] = None,
                      payload: Optional[dict] = None, status_code: Optional[int] = None) -> None:
         async with self._cond:
+            if self.status == "cancelled" and status != "cancelled":
+                return
             self.status = status
             self.error = error
             if payload is not None:
@@ -195,6 +198,7 @@ class ResumableBuffer:
             "done": self.done,
             "fully_delivered": self.fully_delivered,
             "readers": self.readers,
+            "clients": len(self.job.clients) if self.job else 0,
             "created_at": self.created_at,
             "finished_at": self.finished_at,
             "age_seconds": round(time.time() - self.created_at, 1),
@@ -224,7 +228,7 @@ class ResumableStore:
             return buf
 
     async def create_if_absent(self, stream_id: str, model: str = "",
-                               kind: str = "stream") -> Tuple[ResumableBuffer, bool]:
+                               kind: str = "stream", reset_delivered: bool = False) -> Tuple[ResumableBuffer, bool]:
         """原子地「占位建缓冲」。返回 (缓冲区, 是否是本次新建的)。
 
         `get` → 调上游 → `create` 三步之间有竞态窗口：并发的同一请求会各打一次上游，
@@ -233,6 +237,12 @@ class ResumableStore:
         """
         async with self._lock:
             buf = self._buffers.get(stream_id)
+            if buf is not None and reset_delivered and (
+                buf.fully_delivered or buf.kind != kind or buf.status in ("cancelled", "error")
+                or (buf.job is not None and buf.job.cancelled.is_set())
+            ):
+                self._discard_locked(stream_id)
+                buf = None
             if buf is not None:
                 buf.last_access = time.time()
                 return buf, False
@@ -243,10 +253,27 @@ class ResumableStore:
 
     async def drop(self, stream_id: str) -> bool:
         async with self._lock:
-            task = self._pumps.pop(stream_id, None)
-            if task and not task.done():
-                task.cancel()
-            return self._buffers.pop(stream_id, None) is not None
+            buf = self._buffers.get(stream_id)
+            self._discard_locked(stream_id)
+        if buf is not None and buf.job is not None:
+            await buf.job.cancel("响应缓冲已清理，请求已取消。")
+        return buf is not None
+
+    def _discard_locked(self, stream_id: str):
+        task = self._pumps.pop(stream_id, None)
+        buf = self._buffers.pop(stream_id, None)
+        job = buf.job if buf is not None else None
+        if job is not None:
+            already_cancelled = job.cancelled.is_set()
+            if not already_cancelled and not job.produced.is_set():
+                job.reason = "响应缓冲已清理，请求已取消。"
+                job.cancelled.set()
+                if task is not None and not task.done():
+                    task.cancel()
+            if not already_cancelled and job.idle_task is not None:
+                job.idle_task.cancel()
+        elif task is not None and not task.done():
+            task.cancel()
 
     async def list_meta(self) -> List[dict]:
         async with self._lock:
@@ -255,7 +282,11 @@ class ResumableStore:
 
     def register_pump(self, stream_id: str, task: asyncio.Task) -> None:
         self._pumps[stream_id] = task
-        task.add_done_callback(lambda _t, sid=stream_id: self._pumps.pop(sid, None))
+
+        def forget(done):
+            if self._pumps.get(stream_id) is done:
+                self._pumps.pop(stream_id, None)
+        task.add_done_callback(forget)
 
     def cancel_all_pumps(self) -> None:
         """取消所有后台泵任务（服务停机时调用）。"""
@@ -274,10 +305,10 @@ class ResumableStore:
         for buf in finished:
             if len(self._buffers) <= limit:
                 return
-            self._buffers.pop(buf.id, None)
+            self._discard_locked(buf.id)
         while len(self._buffers) > limit:
             oldest = min(self._buffers.values(), key=lambda x: x.created_at)
-            self._buffers.pop(oldest.id, None)
+            self._discard_locked(oldest.id)
 
     async def sweep(self) -> int:
         """清掉超过 TTL 的已完成缓冲（有读者在读的不动）。"""
@@ -290,11 +321,11 @@ class ResumableStore:
                     continue
                 ref = buf.finished_at or buf.last_access
                 if buf.done and (now - ref) > ttl:
-                    self._buffers.pop(sid, None)
+                    self._discard_locked(sid)
                     removed += 1
                 elif not buf.done and (now - buf.created_at) > max(ttl * 4, 1800):
                     # 极端兜底：上游永不结束的僵尸缓冲
-                    self._buffers.pop(sid, None)
+                    self._discard_locked(sid)
                     removed += 1
             await self._evict_locked()
         if removed:
@@ -313,24 +344,6 @@ class ResumableStore:
 
 
 resumable_store = ResumableStore()
-
-
-class DetachedRequest:
-    """把上游调用与前端连接解绑的请求壳子。
-
-    上游代码用 `fastapi_request.is_disconnected()` 决定要不要放弃调用/重试。
-    弱网下前端连接随时会断，但**回复必须继续收完**放进缓冲区，所以这里恒返回 False；
-    其余属性（app.state、headers 等）原样透传给被包装的真实 Request。
-    """
-
-    def __init__(self, request: Any):
-        self._request = request
-
-    async def is_disconnected(self) -> bool:
-        return False
-
-    def __getattr__(self, item):
-        return getattr(self._request, item)
 
 
 def _as_text(chunk: Any) -> str:
@@ -355,6 +368,9 @@ async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any]) -
     每个 data 帧按落缓冲的顺序分配单调序列号并写入 `id:` 行，
     前端凭 Last-Event-ID / resume_from 续传时与这里的序号对齐。
     """
+    from api_errors import SSEErrorScanner, upstream_error, error_sse
+
+    scanner = SSEErrorScanner()
     try:
         async for chunk in body_iterator:
             text = _as_text(chunk)
@@ -364,20 +380,25 @@ async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any]) -
                 # 注释帧（旧心跳等）不是事件：不进缓冲、不占序号，保持 id == 下标
                 continue
             await buf.append(frame_with_id(buf.next_seq, text))
+            error = scanner.feed(text)
+            if error is not None:
+                await buf.append(frame_with_id(buf.next_seq, DONE_FRAME))
+                await buf.finish("error", error=str(error), status_code=error.status_code)
+                return
         if not buf.events or not buf.events[-1].strip().endswith("[DONE]"):
             await buf.append(frame_with_id(buf.next_seq, DONE_FRAME))
         await buf.finish("done")
         print(f"📦 [续传缓冲] {buf.id} 上游已读完，共 {len(buf.events)} 个事件已完整落缓冲。")
     except asyncio.CancelledError:
-        await buf.finish("error", error="上游读取任务被取消。")
+        # GenerationJob 统一记录 cancelled 状态及终止帧，不按上游错误重试。
         raise
     except Exception as e:
         msg = f"{type(e).__name__} - {e}"
         print(f"❌ [续传缓冲] {buf.id} 上游读取失败：{msg}")
-        err = {"error": {"message": str(e)[:1024], "type": "upstream_error", "code": 500}}
-        await buf.append(frame_with_id(buf.next_seq, f"data: {json.dumps(err, ensure_ascii=False)}\n\n"))
+        error = upstream_error(e)
+        await buf.append(frame_with_id(buf.next_seq, error_sse(error)))
         await buf.append(frame_with_id(buf.next_seq, DONE_FRAME))
-        await buf.finish("error", error=msg)
+        await buf.finish("error", error=str(error), status_code=error.status_code)
     finally:
         aclose = getattr(body_iterator, "aclose", None)
         if aclose:
@@ -395,9 +416,13 @@ async def sse_from_buffer(buf: ResumableBuffer, start_seq: int = 0) -> AsyncIter
     if start_seq > 0:
         print(f"↩️ [续传] {buf.id} 从事件 #{start_seq} 续传（缓冲区已有 {buf.next_seq} 个事件）。")
     delivered_done = False
-    async for _seq, frame in buf.iter_from(start_seq):
-        yield frame
-        if frame.strip().endswith("[DONE]"):
-            delivered_done = True
+    iterator = buf.iter_from(start_seq)
+    try:
+        async for _seq, frame in iterator:
+            yield frame
+            if frame.strip().endswith("[DONE]"):
+                delivered_done = True
+    finally:
+        await iterator.aclose()
     if delivered_done:
         buf.mark_delivered()
