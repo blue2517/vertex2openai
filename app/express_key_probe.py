@@ -23,7 +23,7 @@ import httpx
 
 import config as app_config
 from runtime_state import app_state
-from network_proxy import get_proxy_client_args
+from network_proxy import get_proxy_client_args, get_credential_proxy_args
 
 # 调模型的正确 URL（Express 全局端点格式），{model} 处填一个不存在的模型名来探测
 GENERATE_CONTENT_URL = (
@@ -33,8 +33,9 @@ PROBE_FAKE_MODEL = "vertex2openai-probe-nonexistent-model"
 PROBE_TIMEOUT_SECONDS = 15.0
 
 
-def _client_args() -> dict:
-    args = {"timeout": PROBE_TIMEOUT_SECONDS, **get_proxy_client_args()}
+def _client_args(record: dict | None = None) -> dict:
+    proxy_args = get_credential_proxy_args(record) if record is not None else get_proxy_client_args()
+    args = {"timeout": PROBE_TIMEOUT_SECONDS, **proxy_args}
     if app_config.SSL_CERT_FILE:
         args["verify"] = app_config.SSL_CERT_FILE
     return args
@@ -61,10 +62,11 @@ async def probe_project_id(key: str) -> Tuple[Optional[str], str]:
     url = GENERATE_CONTENT_URL.format(model=PROBE_FAKE_MODEL)
     body = {"contents": [{"role": "user", "parts": [{"text": "ping"}]}]}
     try:
-        async with httpx.AsyncClient(**_client_args()) as client:
+        record = next((r for r in app_state.get_express_keys() if r["key"] == key), {})
+        async with httpx.AsyncClient(**_client_args(record)) as client:
             resp = await client.post(url, params={"key": key}, json=body)
     except Exception as e:
-        return None, f"探测请求失败：{type(e).__name__} - {e}"
+        return None, f"探测请求失败：{type(e).__name__}，请检查凭证绑定的代理和网络。"
 
     text = resp.text or ""
     if resp.status_code == 404:

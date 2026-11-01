@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import secrets
 import threading
@@ -24,6 +25,7 @@ import model_capabilities as mc
 from model_loader import get_express_models
 
 from cookie_auth import validate_cookie
+from cookie_credentials import cookie_credential_manager
 import express_key_probe
 from resumable import resumable_store
 import network_proxy
@@ -69,6 +71,7 @@ async def lifespan(app: FastAPI):
     # 多账号 Express Key：环境变量只做**一次性**初始导入，之后以控制台保存的列表为准。
     # （用户在控制台把列表清空并保存后，这里不会再把环境变量里的 Key 复种回来。）
     app_state.import_env_express_keys_once(config.VERTEX_EXPRESS_API_KEY_VAL)
+    app_state.import_cookie_credentials_once(config.GOOGLE_COOKIE, config.GOOGLE_PROJECT_ID)
     if express_key_manager.get_total_keys() > 0:
         print(f"✅ [密钥配置] 已加载 {express_key_manager.get_total_keys()} 个 Express API Key。")
     else:
@@ -412,7 +415,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
         <div>
           <div class="text-sm font-semibold">出网代理</div>
-          <div class="text-xs text-neutral-500 mt-0.5">Express / Cookie 两条通道、模型清单与远程图片共用；保存后新请求立即生效</div>
+          <div class="text-xs text-neutral-500 mt-0.5">默认出口；Cookie / Key 可单独覆盖，模型清单沿用全局配置。保存后新请求立即生效</div>
         </div>
         <span id="proxy-status" class="pill" style="text-transform:none">读取中</span>
       </div>
@@ -449,7 +452,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div class="text-sm font-semibold">已保存的代理 <span id="proxy-pool-count" class="pill" style="text-transform:none">0 个</span></div>
           <button id="proxy-pool-current" class="px-3 py-1.5 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="importCurrentProxy()" disabled>将当前代理加入列表</button>
         </div>
-        <p class="text-xs text-neutral-500 mb-3">命名后保存多个地址，点「使用」即可切换，无需再次填写密码。仅手动选择，不自动轮换；正在进行的请求保持原连接。</p>
+        <p class="text-xs text-neutral-500 mb-3">命名后保存多个地址，点「使用」切换全局出口；也可在下方凭证列表独立绑定。正在进行的请求保持原连接。</p>
         <div id="proxy-pool-list" class="space-y-2 mb-3"></div>
         <div class="border border-neutral-200 rounded-lg p-3">
           <div id="proxy-entry-heading" class="text-sm font-medium mb-2">添加代理</div>
@@ -472,7 +475,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
         <div>
           <div class="text-sm font-semibold">Express API Key 列表<span class="helpq" onclick="hlp(this,'h_keys')">?</span></div>
-          <div class="text-xs text-neutral-500 mt-0.5">多个谷歌账号的 Key 可一起放这里，按「多 Key 轮询」开关随机或轮询使用</div>
+          <div class="text-xs text-neutral-500 mt-0.5">多个账号按「多凭证轮询」开关随机或轮询使用；每条可独立绑定代理</div>
         </div>
         <div class="flex items-center gap-2">
           <span id="keys-count" class="pill" style="text-transform:none">0 个</span>
@@ -494,14 +497,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
 
     <div id="cookie-box" class="card p-5 hidden">
-      <div class="lbl mb-2">Google Cookie（含 HttpOnly 字段）</div>
-      <textarea id="cookie-input" rows="3" class="inp log mb-3" placeholder="粘贴 console.cloud.google.com 的完整 Cookie（支持 Cookie-Editor 导出的 JSON / Header String，自动解析）"></textarea>
-      <div class="lbl mb-2">Google Cloud Project ID</div>
-      <input id="project-input" class="inp mb-3" placeholder="可直接粘贴含 ?project=xxx 的整条 URL，自动提取">
-      <div class="flex items-center justify-between">
-        <span class="text-xs text-neutral-500">保存后自动校验是否包含 SAPISID</span>
-        <button class="btn px-4 py-2 text-sm" onclick="saveCookie()">保存并激活</button>
+      <div class="flex items-center justify-between flex-wrap gap-3 mb-3">
+        <div><div class="text-sm font-semibold">Cookie 凭证列表 <span id="cookies-count" class="pill">0 个</span></div>
+          <p class="text-xs text-neutral-500 mt-1">Cookie 与所属项目成对保存；按「多凭证轮询」开关随机或轮询分配。</p></div>
+        <div class="flex gap-2"><button class="px-3 py-1.5 text-sm rounded-lg border border-neutral-300" onclick="addCookieRow()">＋ 添加 Cookie</button>
+          <button id="cookies-save" class="btn px-4 py-1.5 text-sm" onclick="saveCookieCredentials()">保存 Cookie 列表</button></div>
       </div>
+      <p class="text-xs text-neutral-500 mb-3">已有 Cookie 留空保留原值，保存后只回显掩码。代理可跟随全局、直连或绑定代理池节点；先在上方代理池添加节点。每次请求及其重试固定使用同一份凭证和出口。</p>
+      <div id="cookies-list" class="space-y-3"></div>
+      <p id="cookies-empty" class="text-xs text-neutral-500 hidden">当前没有 Cookie 凭证，添加后保存即可使用。</p>
+      <p id="cookies-result" class="text-xs mt-3" role="status" aria-live="polite"></p>
     </div>
   </section>
 
@@ -715,7 +720,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div class="flex items-center justify-between"><label for="disconnect_grace_seconds" class="text-sm">重连宽限(秒)</label><input id="disconnect_grace_seconds" type="number" min="0" max="300" step="1" class="inp" style="width:90px" placeholder="5"></div>
           <div class="flex items-center justify-between"><span class="text-sm">续传缓冲保留时长(秒)</span><input id="resumable_ttl_seconds" type="number" step="60" class="inp" style="width:90px"></div>
           <div class="flex items-center justify-between"><span class="text-sm">续传缓冲数量上限</span><input id="resumable_max_streams" type="number" step="10" class="inp" style="width:90px"></div>
-          <div class="flex items-center justify-between"><span class="text-sm">多 Key 轮询（round-robin）</span><label class="switch"><input type="checkbox" id="roundrobin"><span class="slider"></span></label></div>
+          <div class="flex items-center justify-between"><span class="text-sm">多凭证轮询（Key / Cookie；关闭为随机）</span><label class="switch"><input type="checkbox" id="roundrobin"><span class="slider"></span></label></div>
           <div>
             <div class="flex items-center justify-between"><span class="text-sm">输出附加安全分<span class="helpq" onclick="hlp(this,'h_ss')">?</span></span><label class="switch"><input type="checkbox" id="safety_score"><span class="slider"></span></label></div>
             <div id="h_ss" class="helpbox">在每条回复<b>正文末尾</b>附一个可折叠块，列出该回复各安全分类的概率与严重度评分（Hate Speech / Dangerous Content / Sexually Explicit / Harassment / Jailbreak）。用来判断内容离触发拦截还有多远。<br>前端若不渲染 HTML，会看到一段 <code>&lt;details&gt;</code> 原文，属正常。<br><b>Cookie 通道注意</b>：该通道平时下发 <code>OFF</code>（分类器整个关闭、上游不回传评分）。打开本开关后会改为下发 <code>BLOCK_NONE</code>——仍然<b>永不拦截</b>，只是让上游把评分算出来回传。不需要看评分就关掉，保持 <code>OFF</code>。</div>
@@ -805,15 +810,64 @@ function parseCookies(str){
   if(str.startsWith('[')&&str.endsWith(']')){ try{ const a=JSON.parse(str); if(Array.isArray(a)) return a.map(c=>{const n=c.name||c.key,v=c.value; return (n&&v)?`${n}=${v}`:'';}).filter(Boolean).join('; ');}catch(e){} }
   return str;
 }
-async function saveCookie(){
-  let ck=parseCookies($('cookie-input').value); let pid=$('project-input').value.trim();
-  const m=pid.match(/[?&]project=([^&]+)/)||pid.match(/\/projects\/([^\/]+)/); if(m) pid=m[1];
-  $('cookie-input').value=ck; $('project-input').value=pid;
-  if(!pid){ toast('请填写 Project ID'); return; }
+let COOKIES=[], COOKIES_READY=false;
+function credentialProxyValue(rec){ return rec.proxy_mode==='pool'?'pool:'+(rec.proxy_id||''):(rec.proxy_mode||'inherit'); }
+function credentialProxyOptions(value){
+  const pool=PROXY_STATE?.pool||[];
+  const choices=[['inherit','跟随全局代理'],['direct','直接连接'],...pool.map(p=>['pool:'+p.id,p.name+' · '+p.url_masked])];
+  if(value.startsWith('pool:')&&!choices.some(p=>p[0]===value)) choices.push([value,'绑定的代理已失效，请重新选择']);
+  return choices.map(([v,label])=>`<option value="${escapeProxyHTML(v)}" ${v===value?'selected':''}>${escapeProxyHTML(label)}</option>`).join('');
+}
+function readCredentialProxy(value){ return value.startsWith('pool:')?{proxy_mode:'pool',proxy_id:value.slice(5)}:{proxy_mode:value,proxy_id:''}; }
+function refreshCredentialProxySelectors(){
+  document.querySelectorAll('.credential-proxy').forEach(el=>{const v=el.value; el.innerHTML=credentialProxyOptions(v); el.value=v;});
+}
+function renderCookies(){
+  $('cookies-list').innerHTML=COOKIES.map((rec,i)=>`<div class="border border-neutral-200 rounded-lg p-3" data-cookie-i="${i}">
+    <div class="flex items-center gap-2 mb-2"><span class="pill">#${i+1}</span>
+      <input class="inp c-name flex-1 min-w-0" maxlength="80" aria-label="凭证名称" placeholder="凭证名称" value="${escapeProxyHTML(rec.name)}">
+      <label class="text-xs whitespace-nowrap"><input type="checkbox" class="c-enabled" ${rec.enabled===false?'':'checked'}>启用</label>
+      <button class="text-xs text-rose-600 px-2 py-1 border rounded-lg" onclick="removeCookieRow(${i})">删除</button></div>
+    <label class="lbl block mb-1">Google Cookie（含 HttpOnly 字段）</label>
+    <textarea class="inp log c-cookie mb-2" rows="2" autocomplete="off" spellcheck="false" placeholder="${escapeProxyHTML(rec.cookie_configured?rec.cookie_masked+'；留空保留，粘贴以更新':'粘贴完整 Cookie 或 Cookie-Editor JSON')}">${escapeProxyHTML(rec.cookie||'')}</textarea>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-2"><div><label class="lbl block mb-1">所属 Project ID</label>
+      <input class="inp log c-project" value="${escapeProxyHTML(rec.project_id)}" placeholder="项目 ID 或含 ?project= 的控制台 URL"></div>
+      <div><label class="lbl block mb-1">此凭证的出网代理</label><select class="inp credential-proxy c-proxy">${credentialProxyOptions(credentialProxyValue(rec))}</select></div></div>
+  </div>`).join('');
+  $('cookies-count').textContent=COOKIES.length+' 个';
+  $('cookies-empty').classList.toggle('hidden',COOKIES.length>0);
+}
+function collectCookies(){
+  document.querySelectorAll('[data-cookie-i]').forEach(row=>{
+    const rec=COOKIES[Number(row.dataset.cookieI)]; if(!rec) return;
+    rec.name=row.querySelector('.c-name').value.trim();
+    rec.cookie=parseCookies(row.querySelector('.c-cookie').value);
+    rec.project_id=row.querySelector('.c-project').value.trim();
+    const m=rec.project_id.match(/[?&]project=([^&]+)/); if(m) rec.project_id=decodeURIComponent(m[1]);
+    rec.enabled=row.querySelector('.c-enabled').checked;
+    Object.assign(rec,readCredentialProxy(row.querySelector('.c-proxy').value));
+  });
+  return COOKIES.map(({id,name,cookie,project_id,enabled,proxy_mode,proxy_id})=>({id,name,cookie:cookie||'',project_id,enabled,proxy_mode,proxy_id}));
+}
+function addCookieRow(){if(!COOKIES_READY){toast('请先完成 Cookie 列表读取。');return;} collectCookies(); COOKIES.push({name:'Cookie '+(COOKIES.length+1),cookie:'',project_id:'',enabled:true,proxy_mode:'inherit'}); renderCookies();}
+function removeCookieRow(i){collectCookies(); COOKIES.splice(i,1); renderCookies();}
+async function loadCookieCredentials(){
+  try{const r=await fetch('/api/cookie-credentials',{cache:'no-store'}); const d=await r.json(); if(!r.ok) throw new Error(d.error||'读取失败'); COOKIES=d.credentials||[]; COOKIES_READY=true; renderCookies();}
+  catch(e){$('cookies-result').textContent=e.message||'Cookie 列表读取失败，请刷新后重试。';}
+}
+async function saveCookieCredentials(){
+  if(!COOKIES_READY){$('cookies-result').textContent='请先完成 Cookie 列表读取，刷新后重试。'; return;}
+  const credentials=collectCookies();
+  if(!credentials.length&&!confirm('保存空 Cookie 列表后将停止 Cookie 调用，重启也保持为空。确定保存？')) return;
+  const button=$('cookies-save'); button.disabled=true;
   try{
-    const r=await fetch('/api/cookie',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie:ck,project_id:pid})});
-    const d=await r.json(); toast(r.ok?(d.message||'已保存并激活'):('❌ '+(d.error||'保存失败')));
-  }catch(e){ toast('❌ 网络请求失败'); }
+    const r=await fetch('/api/cookie-credentials',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({credentials})});
+    const d=await r.json(); if(!r.ok) throw new Error(d.error||'保存失败');
+    COOKIES=d.credentials||[]; renderCookies();
+    $('cookies-result').textContent='已保存 '+d.total+' 条凭证，其中 '+d.enabled+' 条启用；新请求立即生效。';
+    await loadNetworkProxy();
+  }catch(e){$('cookies-result').textContent=e.message||'网络请求失败';}
+  finally{button.disabled=false;}
 }
 async function loadRuntime(){
   try{
@@ -822,16 +876,6 @@ async function loadRuntime(){
     document.querySelector(`input[name=mode][value=${m}]`).checked=true;
     $('mode-pill').textContent = m==='web_proxy' ? '通道 Cookie 直连' : '通道 Express API';
     $('cookie-box').classList.toggle('hidden', m!=='web_proxy');
-    /* S-1：后端只返回掩码，绝不回填到输入框（否则保存时会把真实 Cookie 覆盖成掩码）。
-       输入框留空 = 保持现有 Cookie；填了才更新。 */
-    const ci=$('cookie-input');
-    if(ci){
-      ci.value='';
-      ci.placeholder = s.google_cookie_configured
-        ? ('已配置：'+s.google_cookie+'　（留空则保持不变，需更新时粘贴新 Cookie）')
-        : '粘贴完整 Cookie 头或 Cookie-Editor 导出内容';
-    }
-    if(s.google_project_id) $('project-input').value=s.google_project_id;
   }catch(e){}
 }
 
@@ -865,6 +909,7 @@ function renderProxyPool(s){
   $('proxy-pool-select').value=selected;
   $('proxy-pool-list').innerHTML=pool.length?pool.map(p=>{
     const id=escapeProxyHTML(p.id), locked=p.active?'1':'0';
+    const bound=(s.bound_credentials||{})[p.id]||0, deleteLocked=p.active||bound>0;
     return `<div class="border ${p.active?'border-emerald-300':'border-neutral-200'} rounded-lg p-3">
       <div class="flex items-start justify-between flex-wrap gap-2">
         <div class="min-w-0 flex-1"><div class="text-sm font-medium break-all">${escapeProxyHTML(p.name)}${p.active?' <span class="text-xs text-emerald-600">当前使用</span>':''}</div><div class="text-xs text-neutral-500 break-all mt-1">${escapeProxyHTML(p.url_masked)}</div></div>
@@ -872,7 +917,7 @@ function renderProxyPool(s){
           <button data-proxy-action="use" data-proxy-id="${id}" data-locked="${locked}" ${p.active?'disabled':''} class="btn px-3 py-1.5 text-xs">${p.active?'已启用':'使用'}</button>
           <button data-proxy-action="test" data-proxy-id="${id}" class="px-2 py-1.5 text-xs rounded-lg border border-neutral-300">测试</button>
           <button data-proxy-action="edit" data-proxy-id="${id}" class="px-2 py-1.5 text-xs rounded-lg border border-neutral-300">编辑</button>
-          <button data-proxy-action="delete" data-proxy-id="${id}" data-locked="${locked}" ${p.active?'disabled title="先切换后删除"':''} class="px-2 py-1.5 text-xs rounded-lg border border-rose-200 text-rose-600">删除</button>
+          <button data-proxy-action="delete" data-proxy-id="${id}" data-locked="${deleteLocked?'1':'0'}" ${deleteLocked?'disabled title="先切换全局代理并解除凭证绑定"':''} class="px-2 py-1.5 text-xs rounded-lg border border-rose-200 text-rose-600">${bound?'已绑定 '+bound+' 条凭证':'删除'}</button>
         </div>
       </div><p id="proxy-pool-result-${id}" class="text-xs mt-2 break-all" role="status" aria-live="polite"></p>
     </div>`;
@@ -900,6 +945,7 @@ function renderNetworkProxy(s){
   $('proxy-effective').textContent='当前生效：'+(active?(active.name+' · '):'')+(s.effective_url_masked||(s.mode==='environment'?'跟随运行环境（未设置 PROXY_URL）':'直接连接'));
   renderProxyPool(s);
   proxyModeChanged();
+  if(typeof refreshCredentialProxySelectors==='function') refreshCredentialProxySelectors();
 }
 async function loadNetworkProxy(){
   try{
@@ -1014,18 +1060,20 @@ function renderKeys(){
     <div class="border border-neutral-200 rounded-lg p-3" data-i="${i}">
       <div class="flex items-center gap-2 mb-2">
         <span class="pill" style="text-transform:none">#${i+1}</span>
-        <input class="inp log k-key" style="flex:1" placeholder="粘贴 Express API Key（明文显示）" value="${(rec.key||'').replace(/"/g,'&quot;')}">
+        <input class="inp log k-key" style="flex:1" placeholder="粘贴 Express API Key（明文显示）" value="${escapeProxyHTML(rec.key)}">
         <label class="flex items-center gap-1 text-xs text-neutral-500 whitespace-nowrap"><input type="checkbox" class="k-enabled" ${rec.enabled===false?'':'checked'}>启用</label>
         <button class="px-2 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="probeOneKey(${i})">探测</button>
         <button class="px-2 py-1 text-xs rounded-lg border border-rose-200 text-rose-600 hover:bg-rose-50" onclick="removeKeyRow(${i})">删除</button>
       </div>
       <div class="flex items-center gap-2 flex-wrap">
         <span class="lbl whitespace-nowrap">Project ID</span>
-        <input class="inp log k-project" style="flex:1;min-width:160px" placeholder="留空 = 等待自动探测" value="${(rec.project_id||'').replace(/"/g,'&quot;')}">
+        <input class="inp log k-project" style="flex:1;min-width:160px" placeholder="留空 = 等待自动探测" value="${escapeProxyHTML(rec.project_id)}">
         ${keySrcPill(rec)}
         <span class="text-xs text-neutral-400">${rec.detected_at?('探测于 '+new Date(rec.detected_at*1000).toLocaleString()):''}</span>
       </div>
-      <div class="text-xs mt-1 ${(rec._msg_ok===false)?'text-rose-600':'text-neutral-500'}">${rec._msg||''}</div>
+      <label class="lbl block mt-2 mb-1">此凭证的出网代理</label>
+      <select class="inp credential-proxy k-proxy">${credentialProxyOptions(credentialProxyValue(rec))}</select>
+      <div class="text-xs mt-1 ${(rec._msg_ok===false)?'text-rose-600':'text-neutral-500'}">${escapeProxyHTML(rec._msg)}</div>
     </div>`).join('');
   $('keys-count').textContent = KEYS.length + ' 个';
   $('keys-empty').classList.toggle('hidden', KEYS.length>0);
@@ -1039,6 +1087,7 @@ function collectKeys(){
     const pid = row.querySelector('.k-project').value.trim();
     if(pid !== (KEYS[i].project_id||'')){ KEYS[i].project_id = pid; KEYS[i].project_source = pid?'manual':''; }
     KEYS[i].enabled = row.querySelector('.k-enabled').checked;
+    Object.assign(KEYS[i],readCredentialProxy(row.querySelector('.k-proxy').value));
   });
   return KEYS.filter(r=>r.key);
 }
@@ -1057,7 +1106,7 @@ async function saveExpressKeys(){
   try{
     const r=await fetch('/api/express-keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:payload})});
     const d=await r.json();
-    if(r.ok){ KEYS=(d.keys||[]).map(x=>Object.assign({},x)); renderKeys(); toast('已保存 '+KEYS.length+' 个 Key（已热生效）'); }
+    if(r.ok){ KEYS=(d.keys||[]).map(x=>Object.assign({},x)); renderKeys(); toast('已保存 '+KEYS.length+' 个 Key（已热生效）'); await loadNetworkProxy(); }
     else toast('❌ '+(d.error||'保存失败'));
   }catch(e){ toast('❌ 网络请求失败'); }
 }
@@ -1316,12 +1365,11 @@ try{
   es.onmessage=e=>{ if(e.data.includes('keep-alive')) return; logwin.insertAdjacentHTML('beforeend',logLine(e.data)); if(autoscroll) logwin.scrollTop=logwin.scrollHeight; };
 }catch(e){}
 
-/* ---------- Project ID auto-extract ---------- */
-$('project-input').addEventListener('input',e=>{ const v=e.target.value.trim(); const m=v.match(/[?&]project=([^&]+)/)||v.match(/\/projects\/([^\/]+)/); if(m) e.target.value=m[1]; });
+/* Cookie Project IDs are extracted per row when collecting credentials. */
 $('image_aspect_ratio').addEventListener('change', e=>{ curAR=e.target.value; });
 
 /* init */
-fetchStats(); setInterval(fetchStats,3000); loadRuntime(); loadParams(); loadExpressKeys(); loadNetworkProxy();
+fetchStats(); setInterval(fetchStats,3000); loadRuntime(); loadParams(); loadExpressKeys(); loadCookieCredentials(); loadNetworkProxy();
 </script>
 </body>
 </html>
@@ -1456,14 +1504,18 @@ async def test_network_proxy_api(body: NetworkProxySetting, _auth: bool = Depend
 
 @app.get("/api/settings/runtime")
 async def get_runtime_settings(_auth: bool = Depends(require_auth)):
-    cookie = app_state.get_google_cookie()
+    app_state.import_cookie_credentials_once(config.GOOGLE_COOKIE, config.GOOGLE_PROJECT_ID)
+    records = app_state.get_cookie_credentials()
+    first = records[0] if records else {}
+    cookie = first.get("cookie", "")
     return JSONResponse(content={
         "use_web_proxy": app_state.is_web_proxy_enabled(),
         # S-1：只回显掩码。完整 Cookie 等价于该 Google 账号的完整访问权，
         # 没有任何理由让它出现在前端 JS / 浏览器缓存 / 截图里。
         "google_cookie": mask_cookie(cookie),
         "google_cookie_configured": bool(cookie),
-        "google_project_id": app_state.get_project_id(),
+        "google_project_id": first.get("project_id", ""),
+        "cookie_credentials_count": len(records),
     })
 
 
@@ -1564,7 +1616,7 @@ def _express_keys_payload() -> dict:
 
 @app.get("/api/express-keys")
 async def list_express_keys(_auth: bool = Depends(require_auth)):
-    return JSONResponse(content=_express_keys_payload())
+    return JSONResponse(content=_express_keys_payload(), headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/express-keys")
@@ -1576,7 +1628,16 @@ async def save_express_keys(body: ExpressKeysBody, _auth: bool = Depends(require
     """
     if not isinstance(body.keys, list):
         return JSONResponse(status_code=400, content={"error": "keys 必须是数组。"})
-    saved = app_state.set_express_keys(body.keys)
+    try:
+        for record in body.keys:
+            if not isinstance(record, (dict, str)):
+                raise ValueError("每条 Key 凭证应为对象或字符串。")
+            network_proxy.normalize_credential_proxy(record if isinstance(record, dict) else {})
+        saved = app_state.set_express_keys(body.keys)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except OSError:
+        return JSONResponse(status_code=500, content={"error": "凭证保存失败，请检查状态目录。"})
     express_key_manager.refresh_keys()
     # 新加进来、还没有 Project ID 的 Key 立刻在后台探一次
     pending = [r["key"] for r in saved if not r.get("project_id")]
@@ -1619,6 +1680,40 @@ class CookieSetting(BaseModel):
     project_id: str = ""
 
 
+def _cookie_credentials_payload() -> dict:
+    app_state.import_cookie_credentials_once(config.GOOGLE_COOKIE, config.GOOGLE_PROJECT_ID)
+    records = app_state.get_cookie_credentials()
+    return {"credentials": [{k: v for k, v in rec.items() if k != "cookie"} |
+                            {"cookie_configured": bool(rec.get("cookie")),
+                             "cookie_masked": mask_cookie(rec.get("cookie", ""))} for rec in records],
+            "total": len(records), "enabled": sum(bool(r.get("enabled", True)) for r in records),
+            "roundrobin": bool(app_state.get_setting("roundrobin", config.ROUNDROBIN))}
+
+
+@app.get("/api/cookie-credentials")
+async def list_cookie_credentials(_auth: bool = Depends(require_auth)):
+    return JSONResponse(content=_cookie_credentials_payload(), headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/cookie-credentials")
+async def save_cookie_credentials(request: Request, _auth: bool = Depends(require_auth)):
+    try:
+        body = await request.json()
+        if not isinstance(body, dict) or "credentials" not in body:
+            raise ValueError("请提供 credentials 数组。")
+        app_state.import_cookie_credentials_once(config.GOOGLE_COOKIE, config.GOOGLE_PROJECT_ID)
+        app_state.set_cookie_credentials(body["credentials"])
+    except ValueError as exc:
+        # json decoder exceptions may include submitted content; use a fixed message.
+        message = "请求体应为有效 JSON。" if isinstance(exc, json.JSONDecodeError) else str(exc)
+        return JSONResponse(status_code=400, content={"error": message}, headers={"Cache-Control": "no-store"})
+    except OSError:
+        return JSONResponse(status_code=500, content={"error": "凭证保存失败，请检查状态目录。"})
+    cookie_credential_manager.reset()
+    return JSONResponse(content={"status": "success", **_cookie_credentials_payload()},
+                        headers={"Cache-Control": "no-store"})
+
+
 @app.post("/api/cookie")
 async def set_google_cookie(setting: CookieSetting, _auth: bool = Depends(require_auth)):
     """保存 Cookie 与 Project ID。
@@ -1633,16 +1728,26 @@ async def set_google_cookie(setting: CookieSetting, _auth: bool = Depends(requir
         validation = validate_cookie(new_cookie)
         if not validation["valid"]:
             return JSONResponse(status_code=400, content={"error": validation["message"]})
-        app_state.set_google_cookie(new_cookie)
         message = validation["message"]
     else:
-        if not app_state.get_google_cookie():
-            return JSONResponse(status_code=400, content={
-                "error": "尚未配置 Cookie，请粘贴完整的 Google Cookie。"})
         message = "✅ 已保留原有 Cookie，仅更新 Project ID。"
 
-    if project_id:
-        app_state.set_project_id(project_id)
+    try:
+        app_state.import_cookie_credentials_once(config.GOOGLE_COOKIE, config.GOOGLE_PROJECT_ID)
+        records = app_state.get_cookie_credentials()
+        record = dict(records[0]) if records else {"name": "原 Cookie 凭证"}
+        if not new_cookie and not record.get("cookie"):
+            return JSONResponse(status_code=400, content={"error": "尚未配置 Cookie，请粘贴完整的 Google Cookie。"})
+        if new_cookie:
+            record["cookie"] = new_cookie
+        if project_id:
+            record["project_id"] = project_id
+        app_state.set_cookie_credentials([record, *records[1:]])
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except OSError:
+        return JSONResponse(status_code=500, content={"error": "凭证保存失败，请检查状态目录。"})
+    cookie_credential_manager.reset()
     return JSONResponse(content={"status": "success", "message": message})
 
 

@@ -15,6 +15,8 @@ def isolated_state(monkeypatch, tmp_path):
     monkeypatch.setattr(runtime_state.app_state, "_state", {"use_web_proxy": False})
     monkeypatch.setattr(config, "PROXY_URL", None)
     monkeypatch.setattr(config, "SSL_CERT_FILE", None)
+    monkeypatch.setattr(config, "GOOGLE_COOKIE", None)
+    monkeypatch.setattr(config, "GOOGLE_PROJECT_ID", None)
     monkeypatch.setattr(config, "API_KEY", "proxy-test-password")
     yield runtime_state.app_state
 

@@ -24,7 +24,8 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from models import OpenAIRequest, normalize_content_part
 from upstreams.base import BaseUpstream
 from runtime_state import app_state
-from network_proxy import get_proxy_client_args
+from network_proxy import get_proxy_client_args, credential_proxy_scope, bind_credential_proxy
+from cookie_credentials import cookie_credential_manager
 import config as app_config
 import model_capabilities as mc
 from message_processing import (
@@ -1090,10 +1091,10 @@ def _make_usage_chunk(response_id: str, model: str, usage: dict, usage_metadata:
 # ========== 认证解析 ==========
 
 def _get_cookie_string() -> str:
-    return app_config.GOOGLE_COOKIE or app_state.get_google_cookie() or ""
+    return app_state.get_google_cookie() or app_config.GOOGLE_COOKIE or ""
 
 def _get_project_id() -> str:
-    return app_config.GOOGLE_PROJECT_ID or app_state.get_project_id() or ""
+    return app_state.get_project_id() or app_config.GOOGLE_PROJECT_ID or ""
 
 
 def _wants_usage(request_obj: OpenAIRequest) -> bool:
@@ -1223,7 +1224,7 @@ async def _execute_stream_request_generator(
 
 
 async def _collect_full_response(project_id, base_model_name, request_obj, headers, client_kwargs,
-                                 retry_max, backoff_sec, fastapi_request) -> dict:
+                                 retry_max, backoff_sec, fastapi_request, cookie_str="") -> dict:
     """非流式地完整取回一次响应（供生图假流式复用）。返回 dict。"""
     for attempt in range(retry_max + 1):
         if await fastapi_request.is_disconnected():
@@ -1231,7 +1232,7 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
         try:
             body = await build_batch_graphql_body_async(
                 project_id, base_model_name, request_obj)
-            req_headers = build_headers(_get_cookie_string()) or headers
+            req_headers = build_headers(cookie_str) if cookie_str else headers
             async with httpx.AsyncClient(**client_kwargs) as client:
                 response = await client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body)
 
@@ -1315,6 +1316,7 @@ class CookieProxyUpstream(BaseUpstream):
     使用 Cookie + SAPISIDHASH 鉴权调用 batchGraphql 端点。
     """
 
+    @credential_proxy_scope
     async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request):
         try:
             validate_request_schemas(request_obj)
@@ -1322,7 +1324,9 @@ class CookieProxyUpstream(BaseUpstream):
             return error_response(UpstreamError(400, str(exc), "invalid_request_error"))
 
         # ===== 1. 验证认证 =====
-        cookie_str = _get_cookie_string()
+        credential = cookie_credential_manager.get_record()
+        managed = app_state.cookie_credentials_initialized()
+        cookie_str = credential["cookie"] if credential else ("" if managed else _get_cookie_string())
         if not cookie_str:
             return error_response(UpstreamError(401, (
                 "未配置 Google Cookie。\n"
@@ -1330,13 +1334,18 @@ class CookieProxyUpstream(BaseUpstream):
                 "或设置环境变量 GOOGLE_COOKIE 和 GOOGLE_PROJECT_ID。"
             ), "authentication_error"))
 
-        project_id = _get_project_id()
+        project_id = credential["project_id"] if credential else _get_project_id()
         if not project_id:
             return error_response(UpstreamError(400, (
                 "未配置 Google Cloud Project ID。\n"
                 "请在大盘中填写，或设置环境变量 GOOGLE_PROJECT_ID。\n"
                 "可从 Studio URL 中获取：...?project=YOUR_PROJECT_ID"
             ), "invalid_request_error"))
+
+        try:
+            bind_credential_proxy(credential)
+        except ValueError:
+            return error_response(UpstreamError(503, "凭证代理配置已失效，请检查绑定的代理池节点。"))
 
         # ===== 2. 构建请求头 =====
         headers = build_headers(cookie_str)
@@ -1397,6 +1406,8 @@ class CookieProxyUpstream(BaseUpstream):
         response_id = f"chatcmpl-studio-{int(time.time())}-{uuid.uuid4().hex[:8]}"
         start_time = time.monotonic()
         request_label = f"{base_model_name} | 请求={response_id.rsplit('-', 1)[-1]}"
+        if credential:
+            request_label += f" | 凭证={credential['name']}"
         job_id = getattr(getattr(fastapi_request, "job", None), "id", None)
         if job_id:
             request_label += f" | 任务={job_id}"
@@ -1434,7 +1445,7 @@ class CookieProxyUpstream(BaseUpstream):
                 print(f"🖼️ [生图保护] 图片模型 {base_model_name} 已自动切换为假流式输出（Cookie 通道），避免分块 base64 卡死前端。")
                 res = await _collect_full_response(
                     project_id, base_model_name, request_obj, headers, client_kwargs,
-                    retry_max, backoff_sec, fastapi_request,
+                    retry_max, backoff_sec, fastapi_request, cookie_str=cookie_str,
                 )
                 if res.get("kind") != "ok":
                     stats.add_error()
@@ -1494,7 +1505,7 @@ class CookieProxyUpstream(BaseUpstream):
                                 project_id, base_model_name, request_obj,
                                 force_search=force_builtin_search, native_tools=False)
                             return body
-                    req_headers = build_headers(_get_cookie_string()) or headers
+                    req_headers = build_headers(cookie_str) or headers
                     if cookie_debug:
                         print(f"🔎 [Studio 调试] 出站 generationConfig: "
                               f"{json.dumps(body['variables'].get('generationConfig', {}), ensure_ascii=False)}")
@@ -1677,7 +1688,7 @@ class CookieProxyUpstream(BaseUpstream):
                             return await build_batch_graphql_body_async(
                                 project_id, base_model_name, request_obj,
                                 force_search=force_builtin_search, native_tools=False)
-                    req_headers = build_headers(_get_cookie_string()) or headers
+                    req_headers = build_headers(cookie_str) or headers
                     if cookie_debug:
                         print(f"🔎 [Studio 调试] 出站 generationConfig: "
                               f"{json.dumps(body['variables'].get('generationConfig', {}), ensure_ascii=False)}")

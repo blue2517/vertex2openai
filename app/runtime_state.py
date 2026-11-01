@@ -4,6 +4,7 @@ import os
 import tempfile
 import threading
 import time
+import uuid
 
 import config as app_config
 
@@ -107,6 +108,49 @@ class AppState:
         with self._lock:
             return self._state.get("google_project_id", "")
 
+    # Cookie records are paired credentials, never independently selected secrets/projects.
+    def cookie_credentials_initialized(self) -> bool:
+        with self._lock:
+            return bool(self._state.get("cookie_credentials_initialized"))
+
+    def get_cookie_credentials(self) -> list:
+        with self._lock:
+            return copy.deepcopy(self._state.get("cookie_credentials", []))
+
+    def _persist_patch(self, patch: dict) -> None:
+        """Caller holds _lock. Roll back memory as well as disk on failed writes."""
+        previous = copy.deepcopy(self._state)
+        self._state.update(copy.deepcopy(patch))
+        if not self._save():
+            self._state = previous
+            raise OSError("凭证保存失败，请检查状态目录权限和剩余空间。")
+
+    def import_cookie_credentials_once(self, env_cookie: str = "", env_project: str = "") -> None:
+        with self._lock:
+            if self._state.get("cookie_credentials_initialized"):
+                return
+            # A dashboard Cookie belongs with the dashboard project, even if an old
+            # GOOGLE_PROJECT_ID is still present in the service environment.
+            cookie = self._state.get("google_cookie") or env_cookie or ""
+            project = ((self._state.get("google_project_id") or env_project) if self._state.get("google_cookie")
+                       else (env_project or self._state.get("google_project_id"))) or ""
+            records = self._state.get("cookie_credentials")
+            if not isinstance(records, list):
+                records = ([{"id": uuid.uuid4().hex, "name": "原 Cookie 凭证", "cookie": cookie,
+                             "project_id": project, "enabled": True, "proxy_mode": "inherit", "proxy_id": ""}]
+                           if cookie else [])
+            self._persist_patch({"cookie_credentials": records, "cookie_credentials_initialized": True})
+
+    def set_cookie_credentials(self, records: list) -> list:
+        from cookie_credentials import normalize_cookie_records
+        with self._lock:
+            clean = normalize_cookie_records(records, self.get_cookie_credentials())
+            first = clean[0] if clean else {}
+            self._persist_patch({"cookie_credentials": clean, "cookie_credentials_initialized": True,
+                                 "google_cookie": first.get("cookie", ""),
+                                 "google_project_id": first.get("project_id", "")})
+            return copy.deepcopy(clean)
+
     # ---------- 全局出网代理（独立保存，避免通用设置接口返回认证信息） ----------
 
     def get_network_proxy(self) -> dict:
@@ -175,6 +219,8 @@ class AppState:
             "detected_at": item.get("detected_at") or 0,
             "note": str(item.get("note", "") or "").strip(),
             "enabled": bool(item.get("enabled", True)),
+            "proxy_mode": str(item.get("proxy_mode", "inherit") or "inherit"),
+            "proxy_id": str(item.get("proxy_id", "") or ""),
         }
 
     def get_express_keys(self) -> list:
@@ -203,9 +249,10 @@ class AppState:
             seen.add(rec["key"])
             clean.append(rec)
         with self._lock:
-            self._state["express_keys"] = clean
-            self._state["express_keys_initialized"] = True
-            self._save()
+            from network_proxy import normalize_credential_proxy
+            for rec in clean:
+                rec.update(normalize_credential_proxy(rec))
+            self._persist_patch({"express_keys": clean, "express_keys_initialized": True})
             print(f"🔑 [状态管理器] 已保存 {len(clean)} 个 Express API Key（明文存于 web_state.json，权限 0600）。")
         return clean
 

@@ -3,9 +3,12 @@
 import asyncio
 import time
 import uuid
+from contextvars import ContextVar
+from functools import wraps
 from urllib.parse import urlsplit
 
 import httpx
+from starlette.responses import StreamingResponse
 
 import config as app_config
 from runtime_state import app_state
@@ -14,6 +17,7 @@ PROXY_MODES = ("environment", "custom", "direct", "pool")
 PROXY_SCHEMES = ("http", "https", "socks5", "socks5h")
 PROXY_TEST_URL = "https://www.gstatic.com/generate_204"
 MAX_PROXY_POOL_SIZE = 100
+_request_proxy_args = ContextVar("credential_proxy_args", default=None)
 
 
 class ProxyEntryNotFound(ValueError):
@@ -78,12 +82,97 @@ def _effective_url(conf: dict) -> str | None:
 
 def get_proxy_client_args() -> dict:
     """每次创建客户端时取一致快照；显式直连/自定义不受 HTTP_PROXY 等干扰。"""
+    snapshot = _request_proxy_args.get()
+    if snapshot is not None:
+        return dict(snapshot)
+    return _global_proxy_client_args()
+
+
+def _global_proxy_client_args() -> dict:
     conf = app_state.get_network_proxy()
     args = {"trust_env": conf["mode"] == "environment"}
     url = _effective_url(conf)
     if url:
         args["proxy"] = url
     return args
+
+
+def normalize_credential_proxy(record: dict) -> dict:
+    mode = record.get("proxy_mode", "inherit") or "inherit"
+    ident = record.get("proxy_id", "") or ""
+    if mode not in ("inherit", "direct", "pool") or not isinstance(ident, str):
+        raise ValueError("凭证代理请选择跟随全局、直接连接或代理池。")
+    if mode == "pool":
+        entry = next((p for p in app_state.get_network_proxy()["pool"] if p["id"] == ident), None)
+        if entry is None:
+            raise ProxyEntryNotFound("凭证绑定的代理已失效，请重新选择代理池节点。")
+        validate_proxy_url(entry["url"])
+    return {"proxy_mode": mode, "proxy_id": ident if mode == "pool" else ""}
+
+
+def get_credential_proxy_args(record: dict | None = None) -> dict:
+    binding = normalize_credential_proxy(record or {})
+    if binding["proxy_mode"] == "inherit":
+        return _global_proxy_client_args()
+    if binding["proxy_mode"] == "direct":
+        return {"trust_env": False}
+    # Resolve once, then keep the URL snapshot for the full request lifetime.
+    conf = app_state.get_network_proxy()
+    entry = next((p for p in conf["pool"] if p["id"] == binding["proxy_id"]), None)
+    if entry is None:
+        raise ProxyEntryNotFound("凭证绑定的代理已失效，请重新选择代理池节点。")
+    return {"trust_env": False, "proxy": entry["url"]}
+
+
+def bind_credential_proxy(record: dict | None = None) -> None:
+    _request_proxy_args.set(get_credential_proxy_args(record))
+
+
+def credential_proxy_scope(func):
+    """Isolate concurrent jobs, worker threads and deferred streaming iterators."""
+    @wraps(func)
+    async def wrapped(*args, **kwargs):
+        token = _request_proxy_args.set(None)
+        try:
+            response = await func(*args, **kwargs)
+            snapshot = _request_proxy_args.get()
+        finally:
+            _request_proxy_args.reset(token)
+        if isinstance(response, StreamingResponse) and snapshot is not None:
+            original = response.body_iterator
+
+            async def stream():
+                try:
+                    while True:
+                        stream_token = _request_proxy_args.set(snapshot)
+                        try:
+                            chunk = await anext(original)
+                        except StopAsyncIteration:
+                            return
+                        finally:
+                            _request_proxy_args.reset(stream_token)
+                        # Never keep a context token across a yield: callers can
+                        # consume or close the iterator from different tasks.
+                        yield chunk
+                finally:
+                    stream_token = _request_proxy_args.set(snapshot)
+                    try:
+                        if hasattr(original, "aclose"):
+                            await original.aclose()
+                    finally:
+                        _request_proxy_args.reset(stream_token)
+            response.body_iterator = stream()
+        return response
+    return wrapped
+
+
+def credential_proxy_bindings() -> dict:
+    counts = {}
+    for record in app_state.get_express_keys() + app_state.get_cookie_credentials():
+        if record.get("proxy_mode") == "pool" and record.get("proxy_id"):
+            ident = record["proxy_id"]
+            counts[ident] = counts.get(ident, 0) + 1
+    return counts
 
 
 def get_proxy_status() -> dict:
@@ -98,6 +187,7 @@ def get_proxy_status() -> dict:
         "custom_configured": bool(conf["url"]),
         "active_id": conf["active_id"],
         "current_in_pool": bool(effective and any(item["url"] == effective for item in conf["pool"])),
+        "bound_credentials": credential_proxy_bindings(),
         "pool": [{"id": item["id"], "name": item["name"], "url_masked": mask_proxy_url(item["url"]),
                   "active": conf["mode"] == "pool" and item["id"] == conf["active_id"]}
                  for item in conf["pool"]],
@@ -182,6 +272,8 @@ def delete_proxy_entry(proxy_id: str) -> dict:
             raise ProxyEntryNotFound("代理条目不存在，请刷新列表。")
         if conf["mode"] == "pool" and conf["active_id"] == proxy_id:
             raise ValueError("请先切换到其他代理或连接方式，再删除正在使用的代理。")
+        if credential_proxy_bindings().get(proxy_id):
+            raise ValueError("此代理仍被凭证绑定，请先在 Cookie / Key 列表解除绑定并保存。")
         entries = [item for item in conf["pool"] if item["id"] != proxy_id]
         selected = conf["active_id"]
         if selected == proxy_id:

@@ -21,6 +21,7 @@ import model_capabilities as mc
 from runtime_state import app_state
 import config as app_config
 from schema_validation import SchemaValidationError, validate_request_schemas
+from network_proxy import credential_proxy_scope, bind_credential_proxy
 
 LEGACY_EXPRESS_PREFIX = "[EXPRESS] "
 LEGACY_PAY_PREFIX = "[PAY]"
@@ -137,8 +138,8 @@ def resolve_express_model_path(base_model_name: str, settings: dict,
         return base_model_name
 
     project = (str(key_project_id or "").strip()
-               or app_config.GOOGLE_PROJECT_ID
-               or app_state.get_project_id() or "").strip()
+               or app_state.get_project_id()
+               or app_config.GOOGLE_PROJECT_ID or "").strip()
     if not project:
         print("⚠️ [上游端点] 已选择钉定 location，但该 Key 没有可用的 Project ID"
               "（请在控制台「通道与凭证」页触发探测或手动填写该 Key 的 Project ID，"
@@ -154,6 +155,7 @@ class ExpressSDKUpstream(BaseUpstream):
     官方 API Key Express Mode 渠道处理器
     封装了原有的多密钥切匙、代理挂载以及 SDK 运行时调用
     """
+    @credential_proxy_scope
     async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request):
         try:
             validate_request_schemas(request_obj)
@@ -192,6 +194,11 @@ class ExpressSDKUpstream(BaseUpstream):
             )
 
         express_api_key = key_record["key"]
+        try:
+            bind_credential_proxy(key_record)
+        except ValueError:
+            return JSONResponse(status_code=503, content=create_openai_error_response(
+                503, "凭证代理配置已失效，请检查绑定的代理池节点。", "configuration_error"))
         _inj_settings = app_state.get_effective_settings(base_model_name)
         # 多账号：location 钉定用**这个 Key 自己的**项目，而不是 Cookie 通道的全局项目
         model_to_call = resolve_express_model_path(base_model_name, _inj_settings,
