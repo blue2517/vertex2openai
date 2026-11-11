@@ -12,6 +12,8 @@ class AppSettings(BaseSettings):
     SAFETY_SCORE: bool = False
     PROXY_URL: Optional[str] = None
     SSL_CERT_FILE: Optional[str] = None
+    # Empty: discover this process's service from /proc/self/cgroup.
+    RESTART_SYSTEMD_UNIT: str = ""
     # 标准（Express）模式的上游 base_url 覆盖。留空 = 用 SDK 默认（全局端点）。
     # 仅在确有需要时使用；要钉住 location 请用控制台的
     # express_location（见 DEFAULT_SETTINGS）+「通道与凭证」里的 Project ID，不要动这个。
@@ -42,6 +44,7 @@ ROUNDROBIN = _settings.ROUNDROBIN
 SAFETY_SCORE = _settings.SAFETY_SCORE
 PROXY_URL = _settings.PROXY_URL
 SSL_CERT_FILE = _settings.SSL_CERT_FILE
+RESTART_SYSTEMD_UNIT = _settings.RESTART_SYSTEMD_UNIT
 VERTEX_BASE_URL = _settings.VERTEX_BASE_URL
 
 GOOGLE_COOKIE = _settings.GOOGLE_COOKIE

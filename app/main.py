@@ -32,6 +32,7 @@ import network_proxy
 from request_lifecycle import DisconnectMiddleware, shutdown_jobs
 from api_errors import create_openai_error_response, error_type_for_status
 from token_counting import warm_tokenizer
+from service_control import service_control
 
 express_key_manager = ExpressKeyManager()
 
@@ -359,9 +360,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="flex items-center gap-2">
       <span class="pill pill-accent" id="mode-pill">通道 —</span>
       <span class="pill"><span class="relative flex h-2 w-2"><span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span><span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span></span><span id="uptime">运行中</span></span>
+      <button id="restart-service" onclick="restartService()" class="pill" style="cursor:pointer" title="重启当前服务，进行中的请求可能中断">重启</button>
       <button onclick="logout()" class="pill" style="cursor:pointer" title="退出登录">退出</button>
     </div>
   </header>
+  <div id="restart-status" class="hidden text-sm text-amber-700 mb-4" role="status" aria-live="polite"></div>
 
   <!-- Tabs -->
   <nav class="flex gap-6 border-b border-neutral-200 mb-6 overflow-x-auto">
@@ -756,6 +759,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="px-4 py-2.5 border-b border-neutral-200 flex items-center gap-2">
         <div class="flex gap-1.5"><div class="w-3 h-3 rounded-full bg-rose-400"></div><div class="w-3 h-3 rounded-full bg-amber-400"></div><div class="w-3 h-3 rounded-full bg-emerald-400"></div></div>
         <span class="ml-2 text-xs text-neutral-400 log">terminal · 实时监控</span>
+        <button class="btn ml-auto px-3 py-1 text-xs" onclick="scrollLogsToLatest()">回到最新</button>
       </div>
       <div id="logwin" class="log p-4 space-y-1.5 overflow-y-auto bg-[#fbfbfb]" style="height:60vh"></div>
     </div>
@@ -774,9 +778,72 @@ function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show');
 function fmt(n){ return (n||0).toLocaleString('en-US'); }
 async function logout(){ try{ await fetch('/api/logout',{method:'POST'}); }catch(e){} location.href='/'; }
 
+/* ---------- Service restart ---------- */
+let restartBusy=false;
+async function serviceFetch(url, options={}){
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),5000);
+  try{
+    const response=await fetch(url,{...options,cache:'no-store',signal:controller.signal});
+    const data=await response.json();
+    return {ok:response.ok,status:response.status,data};
+  }
+  finally{ clearTimeout(timeout); }
+}
+async function restartService(){
+  if(restartBusy) return;
+  if(!confirm('确认重启服务？\n进行中的请求可能中断，未保存的修改会丢失。已保存的配置会保留，恢复后需要重新登录。')) return;
+  restartBusy=true;
+  const button=$('restart-service'), status=$('restart-status');
+  button.disabled=true; button.textContent='重启中…';
+  status.classList.remove('hidden'); status.textContent='正在提交重启请求…';
+  try{
+    const before=await serviceFetch('/api/service/status');
+    if(!before.ok) throw new Error('服务状态读取失败，请稍后重试。');
+    const previous=before.data.instance_id;
+    if(!previous) throw new Error('服务实例标识缺失，请刷新页面后重试。');
+    let response;
+    try{
+      response=await serviceFetch('/api/service/restart',{
+        method:'POST',headers:{'X-Requested-With':'service-restart'}
+      });
+    }catch(e){
+      // A dropped response can mean the restart already began. Never retry POST.
+    }
+    if(response && !response.ok){
+      if(response.status===401) throw new Error('登录已过期，请刷新页面重新登录。');
+      throw new Error(response.data.detail||'重启请求提交失败。');
+    }
+    status.textContent='正在等待服务重新启动（最多约 3 分钟），恢复后将自动刷新并返回登录页…';
+    const deadline=Date.now()+180000;
+    while(Date.now()<deadline){
+      await new Promise(resolve=>setTimeout(resolve,1500));
+      let state;
+      try{
+        const result=await serviceFetch('/api/service/status');
+        if(result.ok) state=result.data;
+      }catch(e){}
+      if(state?.instance_id && state.instance_id!==previous){
+        status.textContent='服务已重新启动，正在刷新…';
+        location.reload();
+        return;
+      }
+      if(state?.error) throw new Error(state.error);
+    }
+    throw new Error('等待超时，尚未确认服务恢复。请稍后刷新，或检查 systemd 服务状态与日志。');
+  }catch(e){
+    status.textContent=e.message||'重启操作异常，请检查服务状态。';
+  }finally{
+    restartBusy=false; button.disabled=false; button.textContent='重启';
+  }
+}
+/* ---------- End service restart ---------- */
+
 function switchTab(t){
   document.querySelectorAll('.tab').forEach(e=>e.classList.toggle('active', e.dataset.tab===t));
   ['overview','channel','params','logs'].forEach(v=>$('view-'+v).classList.toggle('hidden', v!==t));
+  // 隐藏的日志容器没有可滚动尺寸，显示后再定位到最新日志。
+  if(t==='logs') scrollLogsToLatest();
 }
 
 /* ---------- Overview ---------- */
@@ -1350,7 +1417,14 @@ async function saveSettings(){
 
 /* ---------- Logs ---------- */
 const logwin=$('logwin'); let autoscroll=true;
-logwin.addEventListener('scroll',()=>{ autoscroll = logwin.scrollHeight-logwin.scrollTop-logwin.clientHeight<50; });
+function scrollLogsToLatest(){
+  autoscroll=true;
+  logwin.scrollTop=logwin.scrollHeight;
+}
+logwin.addEventListener('scroll',()=>{
+  if(logwin.clientHeight===0) return;
+  autoscroll = logwin.scrollHeight-logwin.scrollTop-logwin.clientHeight<50;
+});
 function logLine(t){
   let c='#525252',bg='transparent',bl='2px solid transparent';
   if(t.includes('✅')||t.includes('🎉')){c='#0369a1';bl='2px solid #38bdf8';}
@@ -1425,6 +1499,27 @@ async def logout(request: Request):
 @app.get("/api/stats")
 async def get_stats_api(_auth: bool = Depends(require_auth)):
     return JSONResponse(content=stats.get_json_stats())
+
+
+@app.get("/api/service/status")
+async def service_status_api():
+    # Restart clears login sessions. Expose only an opaque boot ID and generic
+    # restart state so the old page can distinguish the new, ready process.
+    return JSONResponse(content=service_control.status(), headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/service/restart", status_code=202)
+async def restart_service_api(request: Request, _auth: bool = Depends(require_auth)):
+    # Custom header + same-origin fetch: cross-site forms cannot trigger a restart.
+    # CORS deliberately does not allow credentials, so cross-site JS cannot either.
+    if request.headers.get("X-Requested-With") != "service-restart":
+        raise HTTPException(status_code=403, detail="请使用控制台的重启按钮。")
+    try:
+        service_control.request_restart()
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return JSONResponse(status_code=202, content=service_control.status(),
+                        headers={"Cache-Control": "no-store"})
 
 
 # ==========================================
@@ -1768,7 +1863,7 @@ async def stream_logs_endpoint(request: Request, _auth: bool = Depends(require_a
             for msg in rt_logger.snapshot_history():
                 for chunk in _event_chunks(msg):
                     yield chunk
-            while True:
+            while not service_control.status()["restarting"]:
                 if await request.is_disconnected():
                     break
                 try:
