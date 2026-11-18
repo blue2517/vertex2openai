@@ -1,6 +1,7 @@
 import json
 import time
 import math
+import uuid
 import asyncio
 import httpx
 import re
@@ -25,8 +26,17 @@ from runtime_state import app_state
 from logger import stats
 from request_lifecycle import cancel_and_wait
 from api_errors import (
-    UpstreamError, create_openai_error_response, extract_upstream_error, error_sse,
+    TIMEOUT_EXCEPTIONS,
+    UpstreamError,
+    create_openai_error_response,
+    extract_upstream_error,
+    error_sse,
 )
+
+try:
+    import httpx2
+except ImportError:  # pragma: no cover - optional in environments without httpx2
+    httpx2 = None
 
 
 def _safety_score_enabled() -> bool:
@@ -54,6 +64,242 @@ def get_retry_settings() -> tuple[int, float]:
     except (TypeError, ValueError):
         backoff = float(app_config.DEFAULT_SETTINGS["retry_backoff_seconds"])
     return max(0, min(50, retry_max)), max(0.0, min(120.0, backoff))
+
+
+class UpstreamTrace:
+    """Per-generation diagnostics, without headers, prompt text or session values."""
+
+    def __init__(
+        self,
+        channel: str,
+        model: str,
+        response_id: str,
+        started: float,
+        unit_label: str = "JSON",
+        monotonic: Optional[Callable[[], float]] = None,
+    ):
+        self.channel = channel
+        self.label = f"{model} | 请求={response_id.rsplit('-', 1)[-1]}"
+        self.started = started
+        self.unit_label = unit_label
+        self._monotonic = monotonic or time.monotonic
+        self.attempts = 0
+        self.has_headers = False
+        self.received_bytes = 0
+        self.objects = 0
+        self.kinds: set[str] = set()
+        self.first_packet: Optional[float] = None
+        self.first_output: Optional[float] = None
+
+    def begin_attempt(self):
+        self.attempts += 1
+        self.has_headers = False
+        self.received_bytes = 0
+        self.objects = 0
+        self.kinds.clear()
+
+    def received_headers(self):
+        self.has_headers = True
+
+    def received_packet(self):
+        if self.first_packet is None:
+            self.first_packet = self._monotonic() - self.started
+            print(f"📦 [{self.channel}] {self.label} | 首包耗时 {self.first_packet:.2f}s")
+
+    def observe_event(self, kind: str):
+        labels = {"text": "正文", "thought": "思考", "image": "图片", "function_call": "工具调用"}
+        if kind not in labels:
+            return
+        self.kinds.add(kind)
+        elapsed = self._monotonic() - self.started
+        if self.first_output is None:
+            self.first_output = elapsed
+            print(f"⚡ [{self.channel}] {self.label} | 首字耗时 {elapsed:.2f}s（{labels[kind]}）")
+
+    def summary(self) -> str:
+        packet = "未到达" if self.first_packet is None else f"{self.first_packet:.2f}s"
+        first = "未到达" if self.first_output is None else f"{self.first_output:.2f}s"
+        return (f"上游请求={self.attempts} | 响应头={'已收' if self.has_headers else '未收'}"
+                f" | 本次接收={self.received_bytes}B/{self.objects}{self.unit_label}"
+                f" | 思考={'有' if 'thought' in self.kinds else '无'}"
+                f" | 正文={'有' if 'text' in self.kinds else '无'}"
+                f" | 工具={'有' if 'function_call' in self.kinds else '无'}"
+                f" | 首包={packet} | 首字={first}"
+                f" | 总耗时 {self._monotonic() - self.started:.2f}s")
+
+    def transport_failure(self, error: Exception):
+        stage = "读取响应体" if self.has_headers else "等待响应头"
+        print(f"⚠️ [{self.channel}] {self.label} | 异常={type(error).__name__}"
+              f" | 阶段={stage} | {self.summary()}")
+
+
+class _FirstPacketStreamMixin:
+    """Observe the first non-empty body read before decompression/UTF-8 decoding."""
+
+    def __init__(self, stream: Any, trace: UpstreamTrace, count_bytes: bool = False):
+        self.stream = stream
+        self.trace = trace
+        self.count_bytes = count_bytes
+
+    async def __aiter__(self):
+        async for chunk in self.stream:
+            if chunk:
+                self.trace.received_packet()
+                if self.count_bytes:
+                    self.trace.received_bytes += len(chunk)
+            yield chunk
+
+    async def aclose(self):
+        await self.stream.aclose()
+
+
+class FirstPacketByteStream(_FirstPacketStreamMixin, httpx.AsyncByteStream):
+    pass
+
+
+if httpx2 is not None:
+    class _Httpx2FirstPacketByteStream(_FirstPacketStreamMixin, httpx2.AsyncByteStream):
+        pass
+else:  # pragma: no cover
+    _Httpx2FirstPacketByteStream = FirstPacketByteStream
+
+
+def _wrap_first_packet_stream(stream: Any, trace: UpstreamTrace, count_bytes: bool = False) -> Any:
+    if httpx2 is not None and isinstance(stream, httpx2.AsyncByteStream):
+        return _Httpx2FirstPacketByteStream(stream, trace, count_bytes=count_bytes)
+    return FirstPacketByteStream(stream, trace, count_bytes=count_bytes)
+
+
+class _ObservingTransportMixin:
+    """Wrap an httpx/httpx2 async transport to enforce timeouts and record first-packet timing."""
+
+    def __init__(self, inner: Any, trace: UpstreamTrace, timeout: Optional[httpx.Timeout] = None):
+        self.inner = inner
+        self.trace = trace
+        self.timeout = timeout
+
+    async def handle_async_request(self, request: Any) -> Any:
+        if self.timeout is not None:
+            existing = request.extensions.get("timeout")
+            if not existing or all(v is None for v in existing.values()):
+                request.extensions["timeout"] = self.timeout.as_dict()
+        response = await self.inner.handle_async_request(request)
+        self.trace.received_headers()
+        if response.status_code == 200:
+            if response.is_stream_consumed:
+                if response.content:
+                    self.trace.received_packet()
+                    self.trace.received_bytes += len(response.content)
+            elif response.stream is not None:
+                response.stream = _wrap_first_packet_stream(response.stream, self.trace, count_bytes=True)
+        return response
+
+    async def aclose(self):
+        await self.inner.aclose()
+
+
+class _ObservingAsyncTransport(_ObservingTransportMixin, httpx.AsyncBaseTransport):
+    pass
+
+
+if httpx2 is not None:
+    class _Httpx2ObservingAsyncTransport(_ObservingTransportMixin, httpx2.AsyncBaseTransport):
+        pass
+else:  # pragma: no cover
+    _Httpx2ObservingAsyncTransport = _ObservingAsyncTransport
+
+
+def _wrap_observing_transport(inner: Any, trace: UpstreamTrace, timeout: Optional[httpx.Timeout] = None) -> Any:
+    if isinstance(inner, _ObservingTransportMixin):
+        inner.trace = trace
+        if timeout is not None:
+            inner.timeout = timeout
+        return inner
+    if httpx2 is not None and isinstance(inner, httpx2.AsyncBaseTransport):
+        return _Httpx2ObservingAsyncTransport(inner, trace, timeout=timeout)
+    return _ObservingAsyncTransport(inner, trace, timeout=timeout)
+
+
+def _wrap_httpx_instance(httpx_client: Any, trace: UpstreamTrace, timeout: Optional[httpx.Timeout]) -> None:
+    transport = getattr(httpx_client, "_transport", None)
+    if transport is not None:
+        httpx_client._transport = _wrap_observing_transport(transport, trace, timeout=timeout)
+    mounts = getattr(httpx_client, "_mounts", None)
+    if isinstance(mounts, dict):
+        for pattern, mounted in list(mounts.items()):
+            if mounted is not None:
+                mounts[pattern] = _wrap_observing_transport(mounted, trace, timeout=timeout)
+
+
+def attach_express_trace(
+    client: Any,
+    trace: Optional[UpstreamTrace],
+    read_timeout_seconds: Optional[float] = None,
+) -> Any:
+    """Attach HTTP header, first-packet observation, and timeouts to a google-genai client."""
+    if client is None or trace is None:
+        return client
+    api_client = getattr(client, "_api_client", None)
+    httpx_client = getattr(api_client, "_async_httpx_client", None)
+    if httpx_client is None:
+        return client
+    timeout = (
+        httpx.Timeout(120.0, connect=30.0, read=float(read_timeout_seconds))
+        if read_timeout_seconds is not None
+        else None
+    )
+    if getattr(httpx_client, "_per_loop", False) and hasattr(httpx_client, "_client_for_running_loop"):
+        httpx_client._express_trace_config = (trace, timeout)
+        if not getattr(httpx_client, "_express_loop_hooked", False):
+            orig_for_loop = httpx_client._client_for_running_loop
+
+            def _traced_client_for_running_loop():
+                inner = orig_for_loop()
+                cfg_trace, cfg_timeout = httpx_client._express_trace_config
+                _wrap_httpx_instance(inner, cfg_trace, cfg_timeout)
+                return inner
+
+            httpx_client._client_for_running_loop = _traced_client_for_running_loop
+            httpx_client._express_loop_hooked = True
+        loop_clients = getattr(httpx_client, "_loop_clients", None)
+        if isinstance(loop_clients, dict):
+            for inner in list(loop_clients.values()):
+                _wrap_httpx_instance(inner, trace, timeout)
+    else:
+        _wrap_httpx_instance(httpx_client, trace, timeout)
+    return client
+
+
+def _observe_gemini_response(trace: Optional[UpstreamTrace], resp: Any) -> None:
+    """Record semantic output kinds (thought/text/image/function_call) on an Express trace."""
+    if trace is None or resp is None:
+        return
+    candidates = getattr(resp, "candidates", None) or []
+    for candidate in candidates:
+        content = getattr(candidate, "content", None)
+        parts = getattr(content, "parts", None) or []
+        if parts:
+            for part in parts:
+                if getattr(part, "function_call", None) is not None:
+                    trace.observe_event("function_call")
+                elif getattr(part, "inline_data", None) is not None or getattr(part, "file_data", None) is not None:
+                    trace.observe_event("image")
+                else:
+                    text = getattr(part, "text", None)
+                    if isinstance(text, str) and text:
+                        trace.observe_event("thought" if getattr(part, "thought", None) is True else "text")
+        else:
+            cand_text = getattr(candidate, "text", None)
+            if isinstance(cand_text, str) and cand_text:
+                trace.observe_event("text")
+            elif content is not None:
+                content_text = getattr(content, "text", None)
+                if isinstance(content_text, str) and content_text:
+                    trace.observe_event("text")
+    if not candidates:
+        resp_text = getattr(resp, "text", None)
+        if isinstance(resp_text, str) and resp_text:
+            trace.observe_event("text")
 
 class StreamingReasoningProcessor:
     def __init__(self, tag_name: str = VERTEX_REASONING_TAG):
@@ -151,6 +397,8 @@ class StreamingReasoningProcessor:
     
 
 def is_retryable_exception(e):
+    if isinstance(e, TIMEOUT_EXCEPTIONS):
+        return False
     if extract_upstream_error(e)[0] in (401, 403):
         return False
     error_str = str(e).lower()
@@ -632,7 +880,15 @@ async def gemini_fake_stream_generator(
     request_obj: OpenAIRequest,
     is_auto_attempt: bool,
     fastapi_request: Optional[Any] = None,
+    trace: Optional[UpstreamTrace] = None,
+    read_timeout_seconds: Optional[float] = None,
 ):
+    if trace is None:
+        trace = UpstreamTrace("Express", model_for_api_call, uuid.uuid4().hex[:8], time.monotonic(), unit_label="块")
+    if read_timeout_seconds is None:
+        read_timeout_seconds = app_state.get_express_nonstream_read_timeout_seconds()
+    attach_express_trace(gemini_client_instance, trace, read_timeout_seconds=read_timeout_seconds)
+    is_image_request = mc.get_profile(request_obj.model)["is_image"]
     print(f"🌊 [假流式] 已开始调用 Gemini 模型 {model_for_api_call}，客户端请求模型名为 {request_obj.model}。")
 
     # P1-6：不再使用 tenacity 的硬编码 20 次，改为与真流式/非流式一致的手写退避，
@@ -660,6 +916,7 @@ async def gemini_fake_stream_generator(
                 print(f"ℹ️ [客户端断开] 假流式请求前检测到客户端已断开，停止调用模型 {model_for_api_call}。")
                 return
 
+            trace.begin_attempt()
             api_call_task = asyncio.create_task(
                 gemini_client_instance.aio.models.generate_content(
                     model=model_for_api_call,
@@ -690,10 +947,13 @@ async def gemini_fake_stream_generator(
                 raise
             except Exception as e_call:
                 last_error = e_call
+                if not isinstance(e_call, UpstreamError) and not hasattr(e_call, "code"):
+                    trace.transport_failure(e_call)
                 if is_retryable_exception(e_call) and attempt < max_retries:
                     stats.add_retry()
-                    print(f"⚠️ [自动重试] 假流式上游繁忙（{e_call.__class__.__name__}），"
-                          f"第 {attempt + 1} 次退避重试，等待 {backoff_sec} 秒。")
+                    _, err_msg = extract_upstream_error(e_call)
+                    print(f"⚠️ [Express] {trace.label} | 首段输出前暂时失败：{err_msg}"
+                          f" | {backoff_sec}s 后进行第 {attempt + 2}/{max_retries + 1} 次尝试 | {trace.summary()}")
                     waited = 0.0
                     while waited < backoff_sec:
                         step = min(max(0.5, outer_keep_alive_interval or 1.0), backoff_sec - waited)
@@ -713,18 +973,19 @@ async def gemini_fake_stream_generator(
         if raw_gemini_response is None:
             raise last_error or ValueError("上游未返回任何响应（重试已耗尽）。")
 
+        trace.objects += 1
+        _observe_gemini_response(trace, raw_gemini_response)
         _record_usage(raw_gemini_response)
 
         openai_response_dict = convert_to_openai_format(raw_gemini_response, request_obj.model)
 
         if _gemini_prompt_blocked(raw_gemini_response):
-            block_message = f"Response blocked by Gemini safety filter: {raw_gemini_response.prompt_feedback.block_reason}"
-            if hasattr(raw_gemini_response.prompt_feedback, "block_reason_message") and \
-               raw_gemini_response.prompt_feedback.block_reason_message:
-                block_message += f" (Message: {raw_gemini_response.prompt_feedback.block_reason_message})"
+            print(f"❌ [Express] {trace.label} | 上游拦截了请求 | {trace.summary()}")
             raise UpstreamError(400, "上游拦截了请求。", code="content_filter")
 
         if not is_gemini_response_valid(raw_gemini_response):
+            desc = "只返回了思考、未返回正文" if "thought" in trace.kinds else "未返回任何内容"
+            print(f"❌ [Express] {trace.label} | 上游{desc} | {trace.summary()}")
             raise _empty_gemini_error(raw_gemini_response)
 
         async for chunk_sse in _chunk_openai_response_dict_for_sse(
@@ -732,11 +993,15 @@ async def gemini_fake_stream_generator(
         ):
             yield chunk_sse
 
+        done_label = "生图假流式完成" if is_image_request else "假流式完成"
+        print(f"✅ [Express] {trace.label} | {done_label} | {trace.summary()}")
+
     except asyncio.CancelledError:
         raise
     except Exception as e_outer_gemini:
-        err_msg_detail = f"Gemini 假流式生成器异常（模型：{request_obj.model}）：{type(e_outer_gemini).__name__} - {str(e_outer_gemini)}"
-        print(f"❌ [API 错误响应] 假流发生器运行崩溃 (Model: {request_obj.model})。错误详情: {err_msg_detail}")
+        err_code, err_msg = extract_upstream_error(e_outer_gemini)
+        icon = "🔑" if err_code in (401, 403) else "❌"
+        print(f"{icon} [Express] {trace.label} | HTTP {err_code} | {err_msg} | {trace.summary()}")
         if not is_auto_attempt:
             yield error_sse(e_outer_gemini)
             yield "data: [DONE]\n\n"
@@ -774,21 +1039,44 @@ async def execute_gemini_call(
     fastapi_request: Optional[Any] = None,
     fallback_model: Optional[str] = None,
     fallback_client_factory: Optional[Callable[[], Any]] = None,
+    trace: Optional[UpstreamTrace] = None,
 ):
     fallback_client = None
+    if trace is None:
+        trace = UpstreamTrace("Express", model_to_call, uuid.uuid4().hex[:8], time.monotonic(), unit_label="块")
+
+    is_image_request = mc.get_profile(request_obj.model)["is_image"]
+    use_fake_stream = bool(
+        request_obj.stream and (
+            app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED) or is_image_request
+        )
+    )
+    read_timeout_seconds = (
+        app_state.get_express_stream_read_timeout_seconds()
+        if (request_obj.stream and not use_fake_stream)
+        else app_state.get_express_nonstream_read_timeout_seconds()
+    )
+    attach_express_trace(current_client, trace, read_timeout_seconds=read_timeout_seconds)
 
     def _get_fallback_client():
         nonlocal fallback_client
         if fallback_client_factory is None:
             return current_client
         if fallback_client is None:
-            fallback_client = fallback_client_factory()
+            fallback_client = attach_express_trace(
+                fallback_client_factory(), trace, read_timeout_seconds=read_timeout_seconds,
+            )
         return fallback_client
 
     # P1-2：prompt 构建内部有远程图片下载与 PIL 压缩（同步阻塞），
     # 放到线程里执行，避免卡住整个事件循环。
     actual_prompt_for_call = await asyncio.to_thread(prompt_func, request_obj.messages)
-    print(f"🚀 [上游请求] 正在调用 Agent Platform Express Mode 模型 {model_to_call}，客户端请求模型名为 {request_obj.model}。")
+
+    if request_obj.stream:
+        mode_name = "生图假流式" if is_image_request else ("假流式" if use_fake_stream else "流式")
+    else:
+        mode_name = "非流式"
+    print(f"→ [Express] {trace.label} | {len(request_obj.messages)} 条消息 | {mode_name}")
 
     async def _client_gone() -> bool:
         """检测客户端是否已断开连接（用于在重试前及时止损）。"""
@@ -800,18 +1088,16 @@ async def execute_gemini_call(
             return False
 
     if request_obj.stream:
-        # 生图判定统一走能力档案（nano-banana-2.1 名字里不带 image，裸 "image" in 会漏判，
-        # 漏判会绕开下面的生图假流式保护，走真流式）
-        is_image_request = mc.get_profile(request_obj.model)["is_image"]
-
-        if app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED) or is_image_request:
+        if use_fake_stream:
             if is_image_request:
-                 print("🖼️ [生图保护] 图片模型请求已自动切换为假流式输出，以避免上游流式限制。")
+                print("🖼️ [生图保护] 图片模型请求已自动切换为假流式输出，以避免上游流式限制。")
             return StreamingResponse(
                 gemini_fake_stream_generator(
                     current_client, model_to_call, actual_prompt_for_call,
                     gen_config_dict, request_obj, is_auto_attempt,
                     fastapi_request=fastapi_request,
+                    trace=trace,
+                    read_timeout_seconds=read_timeout_seconds,
                 ), media_type="text/event-stream"
             )
         else: # True Streaming
@@ -831,6 +1117,7 @@ async def execute_gemini_call(
                         print(f"ℹ️ [客户端断开] 真流式请求前检测到客户端已断开，停止调用模型 {model_to_call}。")
                         return
                     stream_gen_obj = None
+                    trace.begin_attempt()
                     try:
                         stream_gen_obj = await current_client.aio.models.generate_content_stream(
                             model=model_to_call,
@@ -846,8 +1133,10 @@ async def execute_gemini_call(
 
                         async for chunk_item_call in stream_gen_obj:
                             last_chunk = chunk_item_call
+                            trace.objects += 1
                             if _gemini_prompt_blocked(chunk_item_call):
                                 raise UpstreamError(400, "上游拦截了请求。", code="content_filter")
+                            _observe_gemini_response(trace, chunk_item_call)
                             got_output = got_output or is_gemini_response_valid(chunk_item_call)
                             if getattr(chunk_item_call, "usage_metadata", None):
                                 final_p_tk, final_c_tk, final_t_tk = _extract_usage(chunk_item_call)
@@ -862,6 +1151,8 @@ async def execute_gemini_call(
                                 yield sse_chunk
 
                         if not got_output:
+                            desc = "只返回了思考、未返回正文" if "thought" in trace.kinds else "未返回任何内容"
+                            print(f"❌ [Express] {trace.label} | 上游{desc} | {trace.summary()}")
                             raise _empty_gemini_error(last_chunk)
 
                         if final_p_tk > 0 or final_c_tk > 0:
@@ -877,23 +1168,29 @@ async def execute_gemini_call(
                             })
 
                         yield "data: [DONE]\n\n"
-                        return
+                        print(f"✅ [Express] {trace.label} | 流式传输顺利完毕 | {trace.summary()}")
                         return
 
                     except asyncio.CancelledError:
                         raise
                     except Exception as e_stream_call:
+                        if not isinstance(e_stream_call, UpstreamError) and not hasattr(e_stream_call, "code"):
+                            trace.transport_failure(e_stream_call)
+                        err_code, err_msg = extract_upstream_error(e_stream_call)
                         error_str = str(e_stream_call).lower()
                         is_retryable = (
-                            "429" in error_str or "503" in error_str or "too many requests" in error_str
-                            or "quota" in error_str or "resource exhausted" in error_str
+                            not isinstance(e_stream_call, TIMEOUT_EXCEPTIONS)
+                            and (
+                                "429" in error_str or "503" in error_str or "too many requests" in error_str
+                                or "quota" in error_str or "resource exhausted" in error_str
+                            )
                         )
-                        if extract_upstream_error(e_stream_call)[0] in (401, 403):
+                        if err_code in (401, 403):
                             is_retryable = False
 
                         # location 钉定路径不对 → 退回裸模型名再试一次（仅在还没输出内容时）
                         if (fallback_model and model_to_call != fallback_model
-                                and extract_upstream_error(e_stream_call)[0] not in (401, 403)
+                                and err_code not in (401, 403)
                                 and not has_yielded and is_location_pin_failure(e_stream_call)):
                             print(f"↩️ [上游端点] 钉定路径调用失败（{str(e_stream_call)[:80]}），"
                                   f"已退回默认路由 {fallback_model} 重试一次。"
@@ -911,7 +1208,8 @@ async def execute_gemini_call(
                             # 原先硬编码 2**(attempt%4)，控制台设置对真流式完全没作用。
                             wait_time = backoff_sec
                             stats.add_retry() # 核心：手动重试计入大盘
-                            print(f"⚠️ [自动重试] Agent Platform Express Mode 流式请求返回 429/503 或配额繁忙。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
+                            print(f"⚠️ [Express] {trace.label} | 首段输出前暂时失败：{err_msg}"
+                                  f" | {wait_time}s 后进行第 {attempt + 2}/{max_retries + 1} 次尝试 | {trace.summary()}")
                             if await _client_gone():
                                 print(f"ℹ️ [客户端断开] 重试前检测到客户端已断开，停止调用模型 {model_to_call}。")
                                 return
@@ -926,8 +1224,13 @@ async def execute_gemini_call(
                                 yield ": keep-alive\n\n"
                             continue
 
-                        err_msg_detail_stream = f"Gemini 流式请求异常（模型：{model_to_call}）：{type(e_stream_call).__name__} - {str(e_stream_call)}"
-                        print(f"❌ [API 错误响应] 流式连接异常中断 (Model: {model_to_call})。错误详情: {err_msg_detail_stream}")
+                        if err_code in (401, 403):
+                            print(f"🔑 [Express] {trace.label} | HTTP {err_code} | 认证/权限失败，本次请求已结束。")
+                        elif has_yielded:
+                            print(f"❌ [Express] {trace.label} | 上游输出中断：{err_msg} | {trace.summary()}")
+                        elif not isinstance(e_stream_call, UpstreamError) or e_stream_call.code != "empty_response":
+                            err_prefix = "重试耗尽" if is_retryable else "请求终止"
+                            print(f"❌ [Express] {trace.label} | {err_prefix}：{err_msg} | {trace.summary()}")
                         if is_auto_attempt:
                             raise e_stream_call
                         # 错误独立于 delta.content；已输出正文也必须报告失败。
@@ -952,6 +1255,7 @@ async def execute_gemini_call(
                     status_code=499,
                     content=create_openai_error_response(499, "客户端已断开连接，请求已取消。", "client_closed_request"),
                 )
+            trace.begin_attempt()
             try:
                 response_obj_call = await current_client.aio.models.generate_content(
                     model=model_to_call,
@@ -962,8 +1266,11 @@ async def execute_gemini_call(
             except asyncio.CancelledError:
                 raise
             except Exception as e_call:
+                if not isinstance(e_call, UpstreamError) and not hasattr(e_call, "code"):
+                    trace.transport_failure(e_call)
+                err_code, err_msg = extract_upstream_error(e_call)
                 if (fallback_model and model_to_call != fallback_model
-                        and extract_upstream_error(e_call)[0] not in (401, 403)
+                        and err_code not in (401, 403)
                         and is_location_pin_failure(e_call)):
                     print(f"↩️ [上游端点] 钉定路径调用失败（{str(e_call)[:80]}），"
                           f"已退回默认路由 {fallback_model} 重试一次。"
@@ -976,53 +1283,43 @@ async def execute_gemini_call(
                 if is_retryable_exception(e_call) and attempt < max_retries:
                     stats.add_retry()
                     wait_time = backoff_sec   # F-5：同上，统一用控制台配置的退避
-                    print(f"⚠️ [自动重试] 上游繁忙或触发配额限制（{e_call.__class__.__name__}）。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
+                    print(f"⚠️ [Express] {trace.label} | 上游暂时失败：{err_msg}"
+                          f" | {wait_time}s 后进行第 {attempt + 2}/{max_retries + 1} 次尝试 | {trace.summary()}")
                     await asyncio.sleep(wait_time)
                     continue
+                icon = "🔑" if err_code in (401, 403) else "❌"
+                print(f"{icon} [Express] {trace.label} | HTTP {err_code} | {err_msg} | {trace.summary()}")
+                if isinstance(e_call, TIMEOUT_EXCEPTIONS):
+                    raise UpstreamError(504, err_msg, "timeout") from e_call
                 raise
 
         # 兜底：绝不让 None 流到下游的有效性检查里变成一条误导性的“无有效内容”
         if response_obj_call is None:
-            print(f"❌ [上游无响应] 模型 {model_to_call} 在 {max_retries + 1} 次尝试后仍未返回任何响应。")
+            print(f"❌ [Express] {trace.label} | HTTP 502 | 上游未返回任何响应（重试已耗尽）。| {trace.summary()}")
             return JSONResponse(
                 status_code=502,
                 content=create_openai_error_response(
                     502, "上游未返回任何响应（重试已耗尽）。", "upstream_error"),
             )
 
+        trace.objects += 1
+        _observe_gemini_response(trace, response_obj_call)
+
         if _gemini_prompt_blocked(response_obj_call):
             block_msg = f"Agent Platform 安全策略拦截了请求：{response_obj_call.prompt_feedback.block_reason}"
             if hasattr(response_obj_call.prompt_feedback,"block_reason_message") and \
                response_obj_call.prompt_feedback.block_reason_message:
                 block_msg+=f"（{response_obj_call.prompt_feedback.block_reason_message}）"
-            print(f"❌ [上游拦截] {block_msg}")
+            print(f"❌ [Express] {trace.label} | {block_msg} | {trace.summary()}")
             raise UpstreamError(400, "上游拦截了请求。", code="content_filter")
 
         if not is_gemini_response_valid(response_obj_call):
-            error_details = f"Agent Platform 非流式响应无有效内容，模型：{model_to_call}。"
-            if hasattr(response_obj_call, "candidates"):
-                candidates = response_obj_call.candidates or []
-                error_details += f"Candidates: {len(candidates)}. "
-                if candidates:
-                    candidate = candidates[0]
-                    if hasattr(candidate, "content"):
-                        error_details += "Has content. "
-                        parts = getattr(candidate.content, "parts", None) or []
-                        if hasattr(candidate.content, "parts"):
-                            error_details += f"Parts: {len(parts)}. "
-                            if parts:
-                                part = parts[0]
-                                if getattr(part, "function_call", None) is not None:
-                                    error_details += f"First part is function_call: {part.function_call.name}"
-                                elif hasattr(part, "text"):
-                                    text_preview = str(getattr(part, "text", ""))[:100]
-                                    error_details += f"First part text: '{text_preview}'"
-            else:
-                error_details += f"Response type: {type(response_obj_call).__name__}"
-            print(f"❌ [上游无有效内容] {error_details}")
+            desc = "只返回了思考、未返回正文" if "thought" in trace.kinds else "未返回任何内容"
+            print(f"❌ [Express] {trace.label} | 上游{desc} | {trace.summary()}")
             raise _empty_gemini_error(response_obj_call)
 
         _record_usage(response_obj_call)
+        print(f"✅ [Express] {trace.label} | 非流式完成 | {trace.summary()}")
 
         openai_response_content = convert_to_openai_format(response_obj_call, request_obj.model)
         return JSONResponse(content=openai_response_content)

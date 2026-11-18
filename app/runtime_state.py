@@ -334,20 +334,32 @@ class AppState:
             return default
 
     @staticmethod
-    def _validate_studio_read_timeout_seconds(value) -> int:
+    def _validate_read_timeout_seconds(value, label: str = "Studio 读取超时") -> int:
         if (isinstance(value, bool) or not isinstance(value, (int, float))
                 or not 1 <= value <= 3600 or int(value) != value):
-            raise ValueError("Studio 读取超时须为 1–3600 的整数（秒）。")
+            raise ValueError(f"{label}须为 1–3600 的整数（秒）。")
         return int(value)
 
-    def get_studio_read_timeout_seconds(self) -> int:
+    @staticmethod
+    def _validate_studio_read_timeout_seconds(value) -> int:
+        return AppState._validate_read_timeout_seconds(value, "Studio 读取超时")
+
+    def _get_validated_read_timeout(self, key: str, label: str) -> int:
         """读取经过校验的秒数，兼容旧配置及手工修改后的无效值。"""
-        default = app_config.DEFAULT_SETTINGS["studio_read_timeout_seconds"]
+        default = app_config.DEFAULT_SETTINGS[key]
         try:
-            return self._validate_studio_read_timeout_seconds(
-                self.get_setting("studio_read_timeout_seconds", default))
+            return self._validate_read_timeout_seconds(self.get_setting(key, default), label)
         except ValueError:
             return default
+
+    def get_studio_read_timeout_seconds(self) -> int:
+        return self._get_validated_read_timeout("studio_read_timeout_seconds", "Studio 读取超时")
+
+    def get_express_stream_read_timeout_seconds(self) -> int:
+        return self._get_validated_read_timeout("express_stream_read_timeout_seconds", "Express 流式读取超时")
+
+    def get_express_nonstream_read_timeout_seconds(self) -> int:
+        return self._get_validated_read_timeout("express_nonstream_read_timeout_seconds", "Express 非流式读取超时")
 
     @staticmethod
     def _validate_disconnect_grace_seconds(value) -> int:
@@ -370,10 +382,14 @@ class AppState:
         if not isinstance(patch, dict):
             return self.get_settings()
         # 先校验再写入；无效超时值应拒绝整份 patch，避免其它字段被部分保存。
-        if "studio_read_timeout_seconds" in patch:
-            patch = dict(patch)
-            patch["studio_read_timeout_seconds"] = self._validate_studio_read_timeout_seconds(
-                patch["studio_read_timeout_seconds"])
+        for timeout_key, timeout_label in (
+            ("studio_read_timeout_seconds", "Studio 读取超时"),
+            ("express_stream_read_timeout_seconds", "Express 流式读取超时"),
+            ("express_nonstream_read_timeout_seconds", "Express 非流式读取超时"),
+        ):
+            if timeout_key in patch:
+                patch = dict(patch)
+                patch[timeout_key] = self._validate_read_timeout_seconds(patch[timeout_key], timeout_label)
         if "continue_on_disconnect" in patch and not isinstance(patch["continue_on_disconnect"], bool):
             raise ValueError("断连后等待重连须为布尔值。")
         if "disconnect_grace_seconds" in patch:

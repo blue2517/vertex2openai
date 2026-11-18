@@ -83,6 +83,9 @@ DEFAULT_SETTINGS = {
     "retry_backoff_seconds": 5,
     # Studio/Cookie 通道等待首段或下一段响应数据的上限（秒），保存后对新请求生效。
     "studio_read_timeout_seconds": 180,
+    # Express/API Key 通道读取超时（秒），流式与非流式（含假流式/生图）分开配置。
+    "express_stream_read_timeout_seconds": 180,
+    "express_nonstream_read_timeout_seconds": 180,
     # 开关（初始值取环境变量）
     "fake_streaming": FAKE_STREAMING_ENABLED,
     "fake_streaming_interval": FAKE_STREAMING_INTERVAL_SECONDS,

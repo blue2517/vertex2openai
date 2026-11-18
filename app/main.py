@@ -700,6 +700,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <input id="studio_read_timeout_seconds" type="number" min="1" max="3600" step="1" class="inp" placeholder="180">
           <div id="h_studio_timeout" class="helpbox">仅作用于 Studio/Cookie 通道，文本流式、非流式和生图共用。默认 <b>180 秒</b>，可填 <b>1–3600</b> 的整数。限制的是等待首段或下一段上游响应数据的时间，而非整次生成的总时长。点击“保存全局设置”后对新请求立即生效；非流式超时返回 504 并结束本次请求。客户端或外层反向代理的超时需相应留足。</div>
         </div>
+        <div class="grid grid-cols-2 gap-3 mb-3">
+          <div>
+            <label for="express_stream_read_timeout_seconds" class="lbl mb-1 block">Express 流式读取超时(秒)<span class="helpq" onclick="hlp(this,'h_express_stream_timeout');event.preventDefault()">?</span></label>
+            <input id="express_stream_read_timeout_seconds" type="number" min="1" max="3600" step="1" class="inp" placeholder="180">
+            <div id="h_express_stream_timeout" class="helpbox">仅作用于 Express/API Key 通道的<b>真流式</b>请求。默认 <b>180 秒</b>，可填 <b>1–3600</b> 的整数。限制等待首包或相邻两段流式数据之间的最大静默时长，超时返回 504 并结束本次请求。</div>
+          </div>
+          <div>
+            <label for="express_nonstream_read_timeout_seconds" class="lbl mb-1 block">Express 非流式读取超时(秒)<span class="helpq" onclick="hlp(this,'h_express_nonstream_timeout');event.preventDefault()">?</span></label>
+            <input id="express_nonstream_read_timeout_seconds" type="number" min="1" max="3600" step="1" class="inp" placeholder="180">
+            <div id="h_express_nonstream_timeout" class="helpbox">作用于 Express/API Key 通道的<b>非流式</b>及<b>假流式/生图</b>请求（底层均走整包返回）。默认 <b>180 秒</b>，可填 <b>1–3600</b> 的整数，超时返回 504 并结束本次请求。</div>
+          </div>
+        </div>
         <div class="grid grid-cols-2 gap-3">
           <div><div class="lbl mb-1">最大重试次数</div><input id="retry_max" type="number" class="inp"></div>
           <div><div class="lbl mb-1">退避间隔(秒)</div><input id="retry_backoff_seconds" type="number" step="0.5" class="inp"></div>
@@ -1214,7 +1226,7 @@ async function loadParams(){
     const s=await (await fetch('/api/settings')).json();
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
-    ['native_thinking_mode','thinking_g3_level','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','studio_read_timeout_seconds','disconnect_grace_seconds','fake_streaming_interval','inject_system_instruction','sampling_policy','express_location','resumable_ttl_seconds','resumable_max_streams'].forEach(k=>setV(k,s[k]));
+    ['native_thinking_mode','thinking_g3_level','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','studio_read_timeout_seconds','express_stream_read_timeout_seconds','express_nonstream_read_timeout_seconds','disconnect_grace_seconds','fake_streaming_interval','inject_system_instruction','sampling_policy','express_location','resumable_ttl_seconds','resumable_max_streams'].forEach(k=>setV(k,s[k]));
     ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','image_system_instruction','resumable_enabled','continue_on_disconnect'].forEach(k=>setV(k,s[k]));
     // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
@@ -1363,11 +1375,20 @@ async function saveSettings(){
   // 只保存 ② 全局设置区（基础设施项）。
   // ① 按模型参数不在这里保存——那些字段显示的是"当前所选模型"的生效值，
   // 一起提交会把某个模型的专属值（比如生图的注入内容）写成全局默认。
-  const studioTimeout=numOr('studio_read_timeout_seconds',180);
-  if(!Number.isInteger(studioTimeout)||studioTimeout<1||studioTimeout>3600){
-    toast('Studio 读取超时须为 1–3600 的整数（秒）。');
-    $('studio_read_timeout_seconds').focus();
-    return;
+  const readTimeoutFields=[
+    ['studio_read_timeout_seconds','Studio 读取超时'],
+    ['express_stream_read_timeout_seconds','Express 流式读取超时'],
+    ['express_nonstream_read_timeout_seconds','Express 非流式读取超时'],
+  ];
+  const timeoutValues={};
+  for(const [id,label] of readTimeoutFields){
+    const val=numOr(id,180);
+    if(!Number.isInteger(val)||val<1||val>3600){
+      toast(`${label}须为 1–3600 的整数（秒）。`);
+      $(id).focus();
+      return;
+    }
+    timeoutValues[id]=val;
   }
   const disconnectGrace=numOr('disconnect_grace_seconds',5);
   if(!Number.isInteger(disconnectGrace)||disconnectGrace<0||disconnectGrace>300){
@@ -1382,7 +1403,9 @@ async function saveSettings(){
     img_compress_quality:numOr('img_compress_quality',85),
     retry_max:numOr('retry_max',10),
     retry_backoff_seconds:numOr('retry_backoff_seconds',5),
-    studio_read_timeout_seconds:studioTimeout,
+    studio_read_timeout_seconds:timeoutValues.studio_read_timeout_seconds,
+    express_stream_read_timeout_seconds:timeoutValues.express_stream_read_timeout_seconds,
+    express_nonstream_read_timeout_seconds:timeoutValues.express_nonstream_read_timeout_seconds,
     fake_streaming:$('fake_streaming').checked,
     fake_streaming_interval:numOr('fake_streaming_interval',1),
     roundrobin:$('roundrobin').checked,
@@ -1410,7 +1433,7 @@ async function saveSettings(){
   if(!confirm(scope + '\n\n确定保存全局设置吗？')) return;
   try{
     const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
-    if(r.ok){ GLOBAL_SETTINGS=await r.json(); setV('studio_read_timeout_seconds',GLOBAL_SETTINGS.studio_read_timeout_seconds); toast(overriding?'已保存全局(基础设施)设置；该模型的思考/生图/采样为专属值，未改全局':'全局设置已保存'); }
+    if(r.ok){ GLOBAL_SETTINGS=await r.json(); ['studio_read_timeout_seconds','express_stream_read_timeout_seconds','express_nonstream_read_timeout_seconds'].forEach(k=>setV(k,GLOBAL_SETTINGS[k])); toast(overriding?'已保存全局(基础设施)设置；该模型的思考/生图/采样为专属值，未改全局':'全局设置已保存'); }
     else toast('保存失败');
   }catch(e){ toast('❌ 网络请求失败'); }
 }

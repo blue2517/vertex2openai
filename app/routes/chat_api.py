@@ -137,9 +137,10 @@ async def _resumable_stream(request: Request, request_obj: OpenAIRequest, api_ke
             response = job.response or _cancel_response(job.reason)
             return JSONResponse(status_code=response.status_code, content=_response_payload(response),
                                 headers=_resume_headers(buf.id, not is_new))
+        headers = {**_resume_headers(buf.id, not is_new), "X-Accel-Buffering": "no"}
         response = ManagedStreamingResponse(
             sse_from_buffer(buf, _resume_start_seq(request)), request, job, token,
-            media_type="text/event-stream", headers=_resume_headers(buf.id, not is_new))
+            media_type="text/event-stream", headers=headers)
         transferred = True
         return response
     except ClientDisconnected:
@@ -154,6 +155,8 @@ async def _resumable_json(request: Request, request_obj: OpenAIRequest, api_key:
     wait_timeout = 600.0
     if app_state.is_web_proxy_enabled():
         wait_timeout = max(wait_timeout, app_state.get_studio_read_timeout_seconds() + 90.0)
+    else:
+        wait_timeout = max(wait_timeout, app_state.get_express_nonstream_read_timeout_seconds() + 90.0)
     try:
         if buf.payload is None:
             await while_connected(buf.wait_for(2 ** 62, wait_timeout), request)
@@ -235,9 +238,10 @@ async def _direct_response(request, request_obj, api_key):
         response.headers["X-Request-Id"] = job.id
         if not isinstance(response, StreamingResponse):
             return response
+        stream_headers = {**dict(response.headers), "X-Accel-Buffering": "no"}
         managed = ManagedStreamingResponse(
             _direct_frames(job, queue), request, job, token,
-            status_code=response.status_code, headers=dict(response.headers),
+            status_code=response.status_code, headers=stream_headers,
             media_type=response.media_type)
         transferred = True
         return managed

@@ -1,4 +1,6 @@
 import re
+import time
+import uuid
 from functools import partial
 
 from typing import Any
@@ -11,6 +13,8 @@ from google import genai
 from models import OpenAIRequest
 from upstreams.base import BaseUpstream
 from api_helpers import (
+    UpstreamTrace,
+    attach_express_trace,
     create_generation_config,
     execute_gemini_call,
     create_openai_error_response,
@@ -212,6 +216,13 @@ class ExpressSDKUpstream(BaseUpstream):
         )
         register_client = getattr(fastapi_request, "register_upstream_client", lambda client: client)
         register_client(client_to_use)
+        trace = UpstreamTrace("Express", base_model_name, uuid.uuid4().hex[:8], time.monotonic(), unit_label="块")
+        if key_record.get("note"):
+            trace.label += f" | 凭证={key_record['note']}"
+        job_id = getattr(getattr(fastapi_request, "job", None), "id", None)
+        if job_id:
+            trace.label += f" | 任务={job_id}"
+        attach_express_trace(client_to_use, trace)
         _log_resolved_endpoint(client_to_use)
         print(f"🌐 [上游端点] 使用官方 Gemini Express Mode SDK 调用模型 {base_model_name}。")
         if model_to_call != base_model_name:
@@ -261,10 +272,14 @@ class ExpressSDKUpstream(BaseUpstream):
             # 自动退回裸模型名重试一次。
             fallback_model=(base_model_name if model_to_call != base_model_name else None),
             fallback_client_factory=(
-                lambda: register_client(genai.Client(
-                    vertexai=True,
-                    api_key=express_api_key,
-                    http_options=request_http_options,
-                ))
+                lambda: attach_express_trace(
+                    register_client(genai.Client(
+                        vertexai=True,
+                        api_key=express_api_key,
+                        http_options=request_http_options,
+                    )),
+                    trace,
+                )
             ),
+            trace=trace,
         )

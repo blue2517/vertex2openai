@@ -10,6 +10,39 @@ import httpx
 import anyio
 from fastapi.responses import JSONResponse, StreamingResponse
 
+try:
+    import httpx2
+except ImportError:  # pragma: no cover - optional in environments without httpx2
+    httpx2 = None
+
+
+def _exc_tuple(attr: str) -> tuple:
+    classes = [getattr(httpx, attr)]
+    if httpx2 is not None and hasattr(httpx2, attr):
+        classes.append(getattr(httpx2, attr))
+    return tuple(classes)
+
+
+TIMEOUT_EXCEPTIONS = _exc_tuple("TimeoutException")
+REQUEST_EXCEPTIONS = _exc_tuple("RequestError")
+_READ_TIMEOUT_EXCEPTIONS = _exc_tuple("ReadTimeout")
+_CONNECT_TIMEOUT_EXCEPTIONS = _exc_tuple("ConnectTimeout")
+_WRITE_TIMEOUT_EXCEPTIONS = _exc_tuple("WriteTimeout")
+_POOL_TIMEOUT_EXCEPTIONS = _exc_tuple("PoolTimeout")
+
+
+def describe_timeout_exception(error: Exception) -> str:
+    """Return a concise Chinese timeout reason without exposing URLs or secrets."""
+    if isinstance(error, _READ_TIMEOUT_EXCEPTIONS):
+        return "读取上游响应超时，本次请求已结束。"
+    if isinstance(error, _CONNECT_TIMEOUT_EXCEPTIONS):
+        return "连接上游超时，本次请求已结束。"
+    if isinstance(error, _WRITE_TIMEOUT_EXCEPTIONS):
+        return "发送上游请求超时，本次请求已结束。"
+    if isinstance(error, _POOL_TIMEOUT_EXCEPTIONS):
+        return "等待上游连接池超时，本次请求已结束。"
+    return "上游请求超时，本次请求已结束。"
+
 
 _STATUS_NAMES = {
     "INVALID_ARGUMENT": 400, "FAILED_PRECONDITION": 400,
@@ -60,9 +93,9 @@ def upstream_error(value, status_code=None, error_type=None):
         return value
     status = _http_status(status_code)
     code = None
-    if isinstance(value, httpx.TimeoutException):
-        return UpstreamError(status or 504, "上游请求超时。", error_type)
-    if isinstance(value, httpx.RequestError):
+    if isinstance(value, TIMEOUT_EXCEPTIONS):
+        return UpstreamError(status or 504, describe_timeout_exception(value), error_type or "timeout")
+    if isinstance(value, REQUEST_EXCEPTIONS):
         return UpstreamError(status or 502, "上游连接中断。", error_type)
     if isinstance(value, httpx.HTTPStatusError):
         status = status or value.response.status_code

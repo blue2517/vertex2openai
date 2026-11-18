@@ -41,7 +41,7 @@ from message_processing import (
 )
 from logger import stats
 from token_counting import CookieUsageCounter
-from api_helpers import get_retry_settings
+from api_helpers import FirstPacketByteStream, UpstreamTrace, get_retry_settings
 from api_errors import UpstreamError, upstream_error, error_payload, error_response, error_sse
 from signature_store import SignatureRecord, SignatureState, signature_store
 from schema_validation import SchemaValidationError, validate_request_schemas
@@ -107,77 +107,21 @@ def _is_retryable_exception(error: Exception) -> bool:
     return _is_retryable_error(message) or "timeout" in message
 
 
-class _StudioStreamTrace:
-    """Per-generation diagnostics, without headers, prompt text or session values."""
+class _StudioStreamTrace(UpstreamTrace):
+    """Per-generation Studio diagnostics sharing the common UpstreamTrace implementation."""
 
     def __init__(self, model: str, response_id: str, started: float):
-        self.label = f"{model} | 请求={response_id.rsplit('-', 1)[-1]}"
-        self.started = started
-        self.attempts = 0
-        self.has_headers = False
-        self.received_bytes = 0
-        self.objects = 0
-        self.kinds: set[str] = set()
-        self.first_packet: Optional[float] = None
-        self.first_output: Optional[float] = None
-
-    def begin_attempt(self):
-        self.attempts += 1
-        self.has_headers = False
-        self.received_bytes = 0
-        self.objects = 0
-        self.kinds.clear()
-
-    def received_headers(self):
-        self.has_headers = True
-
-    def received_packet(self):
-        if self.first_packet is None:
-            self.first_packet = time.monotonic() - self.started
-            print(f"📦 [Studio] {self.label} | 首包耗时 {self.first_packet:.2f}s")
-
-    def observe_event(self, kind: str):
-        labels = {"text": "正文", "thought": "思考", "image": "图片", "function_call": "工具调用"}
-        if kind not in labels:
-            return
-        self.kinds.add(kind)
-        elapsed = time.monotonic() - self.started
-        if self.first_output is None:
-            self.first_output = elapsed
-            print(f"⚡ [Studio] {self.label} | 首字耗时 {elapsed:.2f}s（{labels[kind]}）")
-
-    def summary(self) -> str:
-        packet = "未到达" if self.first_packet is None else f"{self.first_packet:.2f}s"
-        first = "未到达" if self.first_output is None else f"{self.first_output:.2f}s"
-        return (f"上游请求={self.attempts} | 响应头={'已收' if self.has_headers else '未收'}"
-                f" | 本次接收={self.received_bytes}B/{self.objects}JSON"
-                f" | 思考={'有' if 'thought' in self.kinds else '无'}"
-                f" | 正文={'有' if 'text' in self.kinds else '无'}"
-                f" | 工具={'有' if 'function_call' in self.kinds else '无'}"
-                f" | 首包={packet} | 首字={first}"
-                f" | 总耗时 {time.monotonic() - self.started:.2f}s")
-
-    def transport_failure(self, error: Exception):
-        stage = "读取响应体" if self.has_headers else "等待响应头"
-        print(f"⚠️ [Studio] {self.label} | 异常={type(error).__name__}"
-              f" | 阶段={stage} | {self.summary()}")
+        super().__init__(
+            "Studio", model, response_id, started,
+            unit_label="JSON", monotonic=lambda: time.monotonic(),
+        )
 
 
-class _FirstPacketStream(httpx.AsyncByteStream):
+class _FirstPacketStream(FirstPacketByteStream):
     """Observe the first non-empty body read before decompression/UTF-8 decoding."""
 
     def __init__(self, stream: httpx.AsyncByteStream, trace: _StudioStreamTrace):
-        self.stream = stream
-        self.trace = trace
-
-    async def __aiter__(self):
-        async for chunk in self.stream:
-            if chunk:
-                self.trace.received_packet()
-            yield chunk
-
-    async def aclose(self):
-        await self.stream.aclose()
+        super().__init__(stream, trace, count_bytes=False)
 
 
 # ========== requestContext 模板 ==========
