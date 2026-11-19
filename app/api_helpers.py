@@ -77,12 +77,14 @@ class UpstreamTrace:
         started: float,
         unit_label: str = "JSON",
         monotonic: Optional[Callable[[], float]] = None,
+        on_first_packet: Optional[Callable[[], None]] = None,
     ):
         self.channel = channel
         self.label = f"{model} | 请求={response_id.rsplit('-', 1)[-1]}"
         self.started = started
         self.unit_label = unit_label
         self._monotonic = monotonic or time.monotonic
+        self._on_first_packet = on_first_packet
         self.attempts = 0
         self.has_headers = False
         self.received_bytes = 0
@@ -105,6 +107,8 @@ class UpstreamTrace:
         if self.first_packet is None:
             self.first_packet = self._monotonic() - self.started
             print(f"📦 [{self.channel}] {self.label} | 首包耗时 {self.first_packet:.2f}s")
+            if self._on_first_packet is not None:
+                self._on_first_packet()
 
     def observe_event(self, kind: str):
         labels = {"text": "正文", "thought": "思考", "image": "图片", "function_call": "工具调用"}

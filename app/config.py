@@ -81,6 +81,15 @@ DEFAULT_SETTINGS = {
     # 两条通道统一走 api_helpers.get_retry_settings() 读取（会钳位到 0–50）。
     "retry_max": 10,
     "retry_backoff_seconds": 5,
+    # 跨凭证自动重试：单凭证按原规则终止后，按原轮询/随机规则切换凭证重试/补位（0–50 次）。
+    "credential_failover_enabled": False,
+    "credential_failover_max": 3,
+    # 并发竞争：多个凭证在 0–t 秒随机延迟窗口内并行发起，率先收到首包/首字者胜出，其余立即终止。
+    "credential_race_enabled": False,
+    "credential_race_concurrency": 2,
+    "credential_race_delay_seconds": 2.0,
+    "credential_race_win_mode": "first_output",  # first_output(首字) | first_packet(安全首包)
+    "credential_race_stream_only": False,        # 关=流式/假流式/非流式均参与；开=仅真流式
     # Studio/Cookie 通道等待首段或下一段响应数据的上限（秒），保存后对新请求生效。
     "studio_read_timeout_seconds": 180,
     # Express/API Key 通道读取超时（秒），流式与非流式（含假流式/生图）分开配置。

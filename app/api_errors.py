@@ -202,7 +202,7 @@ async def prepare_stream_response(response):
     An error before actual output is an HTTP error. Once real output starts,
     the existing iterator and its independent SSE error events are preserved.
     """
-    if not isinstance(response, StreamingResponse):
+    if not isinstance(response, StreamingResponse) or getattr(response, "_stream_prepared", False):
         return response
     iterator = response.body_iterator
     decoder = codecs.getincrementaldecoder("utf-8")()
@@ -271,6 +271,7 @@ async def prepare_stream_response(response):
                         await close()
 
                 response.body_iterator = replay()
+                response._stream_prepared = True
                 transferred = True
                 return response
         return failed(UpstreamError(502, "上游未返回有效回复。", code="empty_response"))

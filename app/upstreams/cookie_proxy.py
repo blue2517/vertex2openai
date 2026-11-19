@@ -17,7 +17,7 @@ import hashlib
 import asyncio
 import httpx
 import traceback
-from typing import Any, Optional, List, Dict, AsyncGenerator
+from typing import Any, Callable, Optional, List, Dict, AsyncGenerator
 from fastapi import Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
@@ -1056,6 +1056,7 @@ async def _execute_stream_request_generator_once(
     body: dict,
     sampler: "_RawSampler | None" = None,
     trace: Optional[_StudioStreamTrace] = None,
+    on_safe_first_packet: Optional[Callable[[], None]] = None,
 ) -> AsyncGenerator[tuple[str, Any], None]:
     """
     异步生成器：真正实时地拉取数据，抛出**原始事件**（不做 SSE 格式化）：
@@ -1099,7 +1100,12 @@ async def _execute_stream_request_generator_once(
             async for obj in _iter_json_objects(response, trace):
                 if sampler is not None:
                     sampler.add(obj)
-                for event_type, data in _extract_from_results(obj):
+                events = list(_extract_from_results(obj))
+                # batchGraphql 的 429/权限错误会包在 HTTP 200 JSON 里，只有确认不含 error/blocked
+                # 才触发「安全首包」信号，防止错误包抢赢竞速。
+                if on_safe_first_packet is not None and not any(et in ("error", "blocked") for et, _ in events):
+                    on_safe_first_packet()
+                for event_type, data in events:
                     if event_type in ("text", "thought", "image", "function_call"):
                         has_content = True
                         if trace is not None:
@@ -1146,9 +1152,12 @@ async def _execute_stream_request_generator(
     fallback_body: Any = None,
     fallback_state: Optional[dict] = None,
     trace: Optional[_StudioStreamTrace] = None,
+    on_safe_first_packet: Optional[Callable[[], None]] = None,
 ) -> AsyncGenerator[tuple[str, Any], None]:
     """Execute native tools, lazily degrading after one clear protocol rejection."""
-    async for status, data in _execute_stream_request_generator_once(client, headers, body, sampler, trace):
+    async for status, data in _execute_stream_request_generator_once(
+        client, headers, body, sampler, trace, on_safe_first_packet=on_safe_first_packet
+    ):
         if status != "native_tool_unsupported":
             yield status, data
             continue
@@ -1162,7 +1171,8 @@ async def _execute_stream_request_generator(
             resolved_fallback = await resolved_fallback
         print("⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；本次及后续重试固定降级为文本工具观测。")
         async for fallback_status, fallback_data in _execute_stream_request_generator_once(
-                client, headers, resolved_fallback, sampler, trace):
+                client, headers, resolved_fallback, sampler, trace,
+                on_safe_first_packet=on_safe_first_packet):
             yield fallback_status, fallback_data
         return
 
@@ -1178,6 +1188,9 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
                 project_id, base_model_name, request_obj)
             req_headers = build_headers(cookie_str) if cookie_str else headers
             async with httpx.AsyncClient(**client_kwargs) as client:
+                register_client = getattr(fastapi_request, "register_upstream_client", None)
+                if register_client is not None:
+                    register_client(client)
                 response = await client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body)
 
             if response.status_code in (429, 503, 500) and attempt < retry_max:
@@ -1261,15 +1274,24 @@ class CookieProxyUpstream(BaseUpstream):
     """
 
     @credential_proxy_scope
-    async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request):
+    async def chat_completions(
+        self,
+        request_obj: OpenAIRequest,
+        fastapi_request: Request,
+        *,
+        credential: dict | None = None,
+    ):
         try:
             validate_request_schemas(request_obj)
         except SchemaValidationError as exc:
             return error_response(UpstreamError(400, str(exc), "invalid_request_error"))
 
         # ===== 1. 验证认证 =====
-        credential = cookie_credential_manager.get_record()
-        managed = app_state.cookie_credentials_initialized()
+        if credential is not None:
+            managed = True
+        else:
+            credential = cookie_credential_manager.get_record()
+            managed = app_state.cookie_credentials_initialized()
         cookie_str = credential["cookie"] if credential else ("" if managed else _get_cookie_string())
         if not cookie_str:
             return error_response(UpstreamError(401, (
@@ -1356,6 +1378,13 @@ class CookieProxyUpstream(BaseUpstream):
         if job_id:
             request_label += f" | 任务={job_id}"
 
+        on_safe_first_packet = getattr(fastapi_request, "notify_first_packet", None)
+        register_client = getattr(fastapi_request, "register_upstream_client", lambda client: client)
+
+        def _record_error():
+            if not getattr(fastapi_request, "suppress_attempt_error_stats", False):
+                stats.add_error()
+
         def nonstream_failure(error):
             error = upstream_error(error)
             status = error.status_code
@@ -1392,11 +1421,13 @@ class CookieProxyUpstream(BaseUpstream):
                     retry_max, backoff_sec, fastapi_request, cookie_str=cookie_str,
                 )
                 if res.get("kind") != "ok":
-                    stats.add_error()
+                    _record_error()
                     print(f"❌ [Studio] 生图失败 | {res.get('error', {})}")
                     yield error_sse(res)
                     yield "data: [DONE]\n\n"
                     return
+                if on_safe_first_packet is not None:
+                    on_safe_first_packet()
                 yield _make_openai_chunk(response_id, model_display, role="assistant")
                 full_text = res.get("full_text") or ""
                 if res.get("reasoning_text"):
@@ -1455,6 +1486,7 @@ class CookieProxyUpstream(BaseUpstream):
                               f"{json.dumps(body['variables'].get('generationConfig', {}), ensure_ascii=False)}")
 
                     async with httpx.AsyncClient(**client_kwargs) as client:
+                        register_client(client)
                         has_yielded_to_client = False
                         got_text = False       # 是否收到过“正文”（text/image）
                         got_thought = False    # 是否收到过思考
@@ -1472,6 +1504,7 @@ class CookieProxyUpstream(BaseUpstream):
                         async for status, data in _execute_stream_request_generator(
                             client, req_headers, body, sampler=sampler,
                             fallback_body=fallback_body, trace=trace,
+                            on_safe_first_packet=on_safe_first_packet,
                         ):
                             usage_counter.observe(status, data)
                             if status == "thought":
@@ -1518,14 +1551,14 @@ class CookieProxyUpstream(BaseUpstream):
 
                             # 如果属于 Cookie 权限错误
                             elif status == "cookie_error":
-                                stats.add_error()
+                                _record_error()
                                 print(f"🔑 [Studio] {trace.label} | HTTP {upstream_error(data).status_code} | 认证/权限失败，本次请求已结束。")
                                 yield error_sse(data)
                                 yield "data: [DONE]\n\n"
                                 return
 
                             elif status in ("api_error", "api_error_text"):
-                                stats.add_error()
+                                _record_error()
                                 print(f"❌ [Studio] {trace.label} | 上游输出中断：{upstream_error(data)} | {trace.summary()}")
                                 yield error_sse(data)
                                 yield "data: [DONE]\n\n"
@@ -1541,7 +1574,7 @@ class CookieProxyUpstream(BaseUpstream):
                                 else:
                                     # 如果已经开始了输出，或者错误不可重试，直接抛给前端结束
                                     err_prefix = "请求终止" if status == "fatal_error" else "重试耗尽"
-                                    stats.add_error()
+                                    _record_error()
                                     print(f"❌ [Studio] {trace.label} | {err_prefix}：{upstream_error(data)} | {trace.summary()}")
                                     yield error_sse(data)
                                     yield "data: [DONE]\n\n"
@@ -1583,7 +1616,7 @@ class CookieProxyUpstream(BaseUpstream):
                                 detail += f"；promptFeedback 拦截：{blocked_msg}"
                             desc = "只返回了思考、未返回正文" if got_thought else "未返回任何内容"
                             hint = (_THINKING_RUNAWAY_HINT if got_thought else _NO_BODY_HINT)
-                            stats.add_error()
+                            _record_error()
                             print(f"❌ [Studio] {base_model_name} | 上游{desc}（{detail}）")
                             print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
                             filtered = bool(blocked_msg) or ((finish_raw or "").upper() in _FINISH_FILTERED)
@@ -1638,6 +1671,7 @@ class CookieProxyUpstream(BaseUpstream):
                               f"{json.dumps(body['variables'].get('generationConfig', {}), ensure_ascii=False)}")
 
                     async with httpx.AsyncClient(**client_kwargs) as client:
+                        register_client(client)
                         response = await client.post(
                             BATCH_GRAPHQL_URL, headers=req_headers, json=body
                         )
@@ -1724,6 +1758,8 @@ class CookieProxyUpstream(BaseUpstream):
                     elapsed = time.monotonic() - start_time
 
                     if got_output:
+                        if on_safe_first_packet is not None:
+                            on_safe_first_packet()
                         finish_reason = "tool_calls" if tool_calls else _map_finish_reason(finish_raw)
                     else:
                         # 无正文（只有思考 / 完全空）：返回明确诊断而不是一个空格
@@ -1732,7 +1768,7 @@ class CookieProxyUpstream(BaseUpstream):
                             detail += f"；promptFeedback 拦截：{blocked_msg}"
                         desc = "只返回了思考、未返回正文" if reasoning_text else "未返回任何内容"
                         hint = (_THINKING_RUNAWAY_HINT if reasoning_text else _NO_BODY_HINT)
-                        stats.add_error()
+                        _record_error()
                         print(f"❌ [Studio] {base_model_name} | 上游{desc}（{detail}）| {elapsed:.1f}s")
                         print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
                         filtered = bool(blocked_msg) or ((finish_raw or "").upper() in _FINISH_FILTERED)

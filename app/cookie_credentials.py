@@ -52,17 +52,29 @@ class CookieCredentialManager:
         self._lock = threading.Lock()
         self._index = 0
 
-    def get_record(self):
+    def get_enabled_records(self) -> list:
+        return [r for r in app_state.get_cookie_credentials() if r.get("enabled", True)]
+
+    def get_record(self, exclude_ids=None):
+        excluded = set(exclude_ids) if exclude_ids else set()
         with self._lock:
-            records = [r for r in app_state.get_cookie_credentials() if r.get("enabled", True)]
+            records = self.get_enabled_records()
             if not records:
                 return None
             if app_state.get_setting("roundrobin", config.ROUNDROBIN):
-                index = self._index % len(records)
-                self._index = (index + 1) % len(records)
-            else:
-                index = random.randrange(len(records))
-            return records[index]
+                total = len(records)
+                start = self._index % total
+                for offset in range(total):
+                    idx = (start + offset) % total
+                    rec = records[idx]
+                    if rec.get("id") not in excluded:
+                        self._index = (idx + 1) % total
+                        return rec
+                return None
+            candidates = [r for r in records if r.get("id") not in excluded]
+            if not candidates:
+                return None
+            return candidates[random.randrange(len(candidates))]
 
     def reset(self):
         with self._lock:

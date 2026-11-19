@@ -716,6 +716,50 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div><div class="lbl mb-1">最大重试次数</div><input id="retry_max" type="number" class="inp"></div>
           <div><div class="lbl mb-1">退避间隔(秒)</div><input id="retry_backoff_seconds" type="number" step="0.5" class="inp"></div>
         </div>
+        <div class="border-t border-neutral-100 mt-4 pt-3 space-y-3">
+          <div>
+            <div class="flex items-center justify-between">
+              <span class="text-sm font-medium">跨凭证自动重试<span class="helpq" onclick="hlp(this,'h_cred_failover');event.preventDefault()">?</span></span>
+              <label class="switch"><input type="checkbox" id="credential_failover_enabled"><span class="slider"></span></label>
+            </div>
+            <div id="h_cred_failover" class="helpbox">当前凭证按原规则终止（429 耗尽、超时、401/403、5xx 等）后，按原「多凭证轮询 / 随机」规则自动切换凭证重试，直到成功或达到 <b>n</b> 次上限；400 参数/内容拦截以及已开始输出正文后的中断不会重试。<br>与「并发竞争」同时开启时采用<b>槽位立即补位（方式 B）</b>：任一并发槽位失败会立刻补入下一个凭证继续竞争，无需等待其余慢连接。每个凭证始终只连各自绑定的代理，完全隔离。</div>
+          </div>
+          <div class="flex items-center justify-between gap-3">
+            <label for="credential_failover_max" class="text-sm">跨凭证重试次数 (n)</label>
+            <input id="credential_failover_max" type="number" min="0" max="50" step="1" class="inp" style="width:110px" placeholder="3">
+          </div>
+        </div>
+        <div class="border-t border-neutral-100 mt-4 pt-3 space-y-3">
+          <div>
+            <div class="flex items-center justify-between">
+              <span class="text-sm font-medium">并发竞争（多凭证竞速）<span class="helpq" onclick="hlp(this,'h_cred_race');event.preventDefault()">?</span></span>
+              <label class="switch"><input type="checkbox" id="credential_race_enabled"><span class="slider"></span></label>
+            </div>
+            <div id="h_cred_race" class="helpbox">收到调用后按原轮询/随机规则挑选多个不同凭证，第 1 个立即发起，其余在 <b>0–t 秒</b>内随机延迟发起；率先收到<b>首包</b>（HTTP 200 且非业务错误）或<b>首字</b>（首个有效思考/正文/图片/工具输出）的连接胜出并继续传输，其余连接立刻取消并关闭底层客户端。<br>可用凭证数少于并发数时自动按可用数降级；每个凭证始终只连自己的代理，完全隔离；Express 与 Cookie 双通道均支持。</div>
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label for="credential_race_concurrency" class="lbl mb-1 block">并发凭证数</label>
+              <input id="credential_race_concurrency" type="number" min="2" max="20" step="1" class="inp" placeholder="2">
+            </div>
+            <div>
+              <label for="credential_race_delay_seconds" class="lbl mb-1 block">随机延迟窗口(秒, t)</label>
+              <input id="credential_race_delay_seconds" type="number" min="0" max="60" step="0.5" class="inp" placeholder="2">
+            </div>
+          </div>
+          <div>
+            <label for="credential_race_win_mode" class="lbl mb-1 block">竞速胜出条件</label>
+            <select id="credential_race_win_mode" class="inp">
+              <option value="first_output">首字（首个有效思考/正文/图片/工具输出，推荐）</option>
+              <option value="first_packet">首包（HTTP 200 且非业务错误首包，更快抢占）</option>
+            </select>
+          </div>
+          <div class="flex items-center justify-between">
+            <span class="text-sm">并发竞争仅对真流式生效<span class="helpq" onclick="hlp(this,'h_cred_race_stream_only');event.preventDefault()">?</span></span>
+            <label class="switch"><input type="checkbox" id="credential_race_stream_only"><span class="slider"></span></label>
+          </div>
+          <div id="h_cred_race_stream_only" class="helpbox">关闭（默认）：真流式、假流式与非流式（含生图）均参与并发竞争，适合算力池整体排队 PVP 场景。<br>开启：仅对真流式请求启用并发竞争，非流式/假流式仍按单凭证（及可选跨凭证重试）执行。</div>
+        </div>
       </div>
 
       <!-- 开关 -->
@@ -1226,8 +1270,8 @@ async function loadParams(){
     const s=await (await fetch('/api/settings')).json();
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
-    ['native_thinking_mode','thinking_g3_level','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','studio_read_timeout_seconds','express_stream_read_timeout_seconds','express_nonstream_read_timeout_seconds','disconnect_grace_seconds','fake_streaming_interval','inject_system_instruction','sampling_policy','express_location','resumable_ttl_seconds','resumable_max_streams'].forEach(k=>setV(k,s[k]));
-    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','image_system_instruction','resumable_enabled','continue_on_disconnect'].forEach(k=>setV(k,s[k]));
+    ['native_thinking_mode','thinking_g3_level','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','credential_failover_max','credential_race_concurrency','credential_race_delay_seconds','credential_race_win_mode','studio_read_timeout_seconds','express_stream_read_timeout_seconds','express_nonstream_read_timeout_seconds','disconnect_grace_seconds','fake_streaming_interval','inject_system_instruction','sampling_policy','express_location','resumable_ttl_seconds','resumable_max_streams'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','image_system_instruction','resumable_enabled','continue_on_disconnect','credential_failover_enabled','credential_race_enabled','credential_race_stream_only'].forEach(k=>setV(k,s[k]));
     // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
       if(s.hide_thoughts) setV('native_thinking_mode','off');
@@ -1396,6 +1440,24 @@ async function saveSettings(){
     $('disconnect_grace_seconds').focus();
     return;
   }
+  const failoverMax=numOr('credential_failover_max',3);
+  if(!Number.isInteger(failoverMax)||failoverMax<0||failoverMax>50){
+    toast('跨凭证重试次数须为 0–50 的整数。');
+    $('credential_failover_max').focus();
+    return;
+  }
+  const raceConcurrency=numOr('credential_race_concurrency',2);
+  if(!Number.isInteger(raceConcurrency)||raceConcurrency<2||raceConcurrency>20){
+    toast('并发凭证数须为 2–20 的整数。');
+    $('credential_race_concurrency').focus();
+    return;
+  }
+  const raceDelay=numOr('credential_race_delay_seconds',2);
+  if(!Number.isFinite(raceDelay)||raceDelay<0||raceDelay>60){
+    toast('随机延迟窗口须为 0–60 之间的数字（秒）。');
+    $('credential_race_delay_seconds').focus();
+    return;
+  }
   const patch={
     img_compress_enabled:$('img_compress_enabled').checked,
     img_compress_max_dim:numOr('img_compress_max_dim',1536),
@@ -1403,6 +1465,13 @@ async function saveSettings(){
     img_compress_quality:numOr('img_compress_quality',85),
     retry_max:numOr('retry_max',10),
     retry_backoff_seconds:numOr('retry_backoff_seconds',5),
+    credential_failover_enabled:$('credential_failover_enabled').checked,
+    credential_failover_max:failoverMax,
+    credential_race_enabled:$('credential_race_enabled').checked,
+    credential_race_concurrency:raceConcurrency,
+    credential_race_delay_seconds:raceDelay,
+    credential_race_win_mode:$('credential_race_win_mode').value,
+    credential_race_stream_only:$('credential_race_stream_only').checked,
     studio_read_timeout_seconds:timeoutValues.studio_read_timeout_seconds,
     express_stream_read_timeout_seconds:timeoutValues.express_stream_read_timeout_seconds,
     express_nonstream_read_timeout_seconds:timeoutValues.express_nonstream_read_timeout_seconds,
@@ -1433,7 +1502,7 @@ async function saveSettings(){
   if(!confirm(scope + '\n\n确定保存全局设置吗？')) return;
   try{
     const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
-    if(r.ok){ GLOBAL_SETTINGS=await r.json(); ['studio_read_timeout_seconds','express_stream_read_timeout_seconds','express_nonstream_read_timeout_seconds'].forEach(k=>setV(k,GLOBAL_SETTINGS[k])); toast(overriding?'已保存全局(基础设施)设置；该模型的思考/生图/采样为专属值，未改全局':'全局设置已保存'); }
+    if(r.ok){ GLOBAL_SETTINGS=await r.json(); ['studio_read_timeout_seconds','express_stream_read_timeout_seconds','express_nonstream_read_timeout_seconds','credential_failover_enabled','credential_failover_max','credential_race_enabled','credential_race_concurrency','credential_race_delay_seconds','credential_race_win_mode','credential_race_stream_only'].forEach(k=>setV(k,GLOBAL_SETTINGS[k])); toast(overriding?'已保存全局(基础设施)设置；该模型的思考/生图/采样为专属值，未改全局':'全局设置已保存'); }
     else toast('保存失败');
   }catch(e){ toast('❌ 网络请求失败'); }
 }

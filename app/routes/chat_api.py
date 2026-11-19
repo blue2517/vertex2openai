@@ -12,6 +12,7 @@ from models import OpenAIRequest
 from runtime_state import app_state
 from upstreams.express_sdk import ExpressSDKUpstream
 from upstreams.cookie_proxy import CookieProxyUpstream
+from credential_dispatch import dispatch_upstream
 from api_helpers import extract_upstream_error, create_openai_error_response
 from api_errors import error_response, prepare_stream_response, terminal_error_response
 from request_lifecycle import (
@@ -29,8 +30,9 @@ cookie_upstream = CookieProxyUpstream()
 
 
 async def _call_upstream(request_obj: OpenAIRequest, fastapi_request: Request):
-    upstream = cookie_upstream if app_state.is_web_proxy_enabled() else express_upstream
-    return await upstream.chat_completions(request_obj, fastapi_request)
+    is_cookie = app_state.is_web_proxy_enabled()
+    upstream = cookie_upstream if is_cookie else express_upstream
+    return await dispatch_upstream(upstream, request_obj, fastapi_request, is_cookie_channel=is_cookie)
 
 
 def _request_fingerprint(request_obj: OpenAIRequest) -> str:
@@ -153,10 +155,12 @@ async def _resumable_stream(request: Request, request_obj: OpenAIRequest, api_ke
 async def _resumable_json(request: Request, request_obj: OpenAIRequest, api_key: str):
     buf, job, token, is_new = await _begin_buffered_job(request, request_obj, api_key)
     wait_timeout = 600.0
+    dispatch_cfg = app_state.get_dispatch_settings()
+    attempt_multiplier = (1 + dispatch_cfg["credential_failover_max"]) if dispatch_cfg["credential_failover_enabled"] else 1
     if app_state.is_web_proxy_enabled():
-        wait_timeout = max(wait_timeout, app_state.get_studio_read_timeout_seconds() + 90.0)
+        wait_timeout = max(wait_timeout, app_state.get_studio_read_timeout_seconds() * attempt_multiplier + 90.0)
     else:
-        wait_timeout = max(wait_timeout, app_state.get_express_nonstream_read_timeout_seconds() + 90.0)
+        wait_timeout = max(wait_timeout, app_state.get_express_nonstream_read_timeout_seconds() * attempt_multiplier + 90.0)
     try:
         if buf.payload is None:
             await while_connected(buf.wait_for(2 ** 62, wait_timeout), request)

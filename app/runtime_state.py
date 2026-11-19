@@ -1,5 +1,6 @@
 import copy
 import json
+import math
 import os
 import tempfile
 import threading
@@ -377,6 +378,70 @@ class AppState:
         except ValueError:
             return 5
 
+    @staticmethod
+    def _validate_int_range(value, low: int, high: int, label: str, unit: str = "") -> int:
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or not low <= value <= high or int(value) != value):
+            suffix = f"（{unit}）" if unit else ""
+            raise ValueError(f"{label}须为 {low}–{high} 的整数{suffix}。")
+        return int(value)
+
+    @staticmethod
+    def _validate_float_range(value, low: float, high: float, label: str, unit: str = "") -> float:
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or not low <= float(value) <= high):
+            suffix = f"（{unit}）" if unit else ""
+            raise ValueError(f"{label}须为 {low:g}–{high:g} 之间的数字{suffix}。")
+        return float(value)
+
+    @staticmethod
+    def _validate_race_win_mode(value) -> str:
+        if not isinstance(value, str) or value not in ("first_output", "first_packet"):
+            raise ValueError("竞速胜出条件须为 first_output（首字）或 first_packet（首包）。")
+        return value
+
+    def get_dispatch_settings(self) -> dict:
+        defaults = app_config.DEFAULT_SETTINGS
+        failover_enabled = self.get_setting("credential_failover_enabled", defaults["credential_failover_enabled"]) is True
+        try:
+            failover_max = self._validate_int_range(
+                self.get_setting("credential_failover_max", defaults["credential_failover_max"]),
+                0, 50, "跨凭证重试次数",
+            )
+        except ValueError:
+            failover_max = int(defaults["credential_failover_max"])
+        race_enabled = self.get_setting("credential_race_enabled", defaults["credential_race_enabled"]) is True
+        try:
+            race_concurrency = self._validate_int_range(
+                self.get_setting("credential_race_concurrency", defaults["credential_race_concurrency"]),
+                2, 20, "并发凭证数",
+            )
+        except ValueError:
+            race_concurrency = int(defaults["credential_race_concurrency"])
+        try:
+            race_delay = self._validate_float_range(
+                self.get_setting("credential_race_delay_seconds", defaults["credential_race_delay_seconds"]),
+                0.0, 60.0, "随机延迟窗口", "秒",
+            )
+        except ValueError:
+            race_delay = float(defaults["credential_race_delay_seconds"])
+        try:
+            race_win_mode = self._validate_race_win_mode(
+                self.get_setting("credential_race_win_mode", defaults["credential_race_win_mode"])
+            )
+        except ValueError:
+            race_win_mode = defaults["credential_race_win_mode"]
+        race_stream_only = self.get_setting("credential_race_stream_only", defaults["credential_race_stream_only"]) is True
+        return {
+            "credential_failover_enabled": failover_enabled,
+            "credential_failover_max": failover_max,
+            "credential_race_enabled": race_enabled,
+            "credential_race_concurrency": race_concurrency,
+            "credential_race_delay_seconds": race_delay,
+            "credential_race_win_mode": race_win_mode,
+            "credential_race_stream_only": race_stream_only,
+        }
+
     def update_settings(self, patch: dict) -> dict:
         """合并更新设置，只接受已知键，返回更新后的完整设置。"""
         if not isinstance(patch, dict):
@@ -396,6 +461,29 @@ class AppState:
             patch = dict(patch)
             patch["disconnect_grace_seconds"] = self._validate_disconnect_grace_seconds(
                 patch["disconnect_grace_seconds"])
+        for bool_key, bool_label in (
+            ("credential_failover_enabled", "跨凭证自动重试"),
+            ("credential_race_enabled", "并发竞争"),
+            ("credential_race_stream_only", "仅对真流式生效"),
+        ):
+            if bool_key in patch and not isinstance(patch[bool_key], bool):
+                raise ValueError(f"{bool_label}须为布尔值。")
+        if "credential_failover_max" in patch:
+            patch = dict(patch)
+            patch["credential_failover_max"] = self._validate_int_range(
+                patch["credential_failover_max"], 0, 50, "跨凭证重试次数")
+        if "credential_race_concurrency" in patch:
+            patch = dict(patch)
+            patch["credential_race_concurrency"] = self._validate_int_range(
+                patch["credential_race_concurrency"], 2, 20, "并发凭证数")
+        if "credential_race_delay_seconds" in patch:
+            patch = dict(patch)
+            patch["credential_race_delay_seconds"] = self._validate_float_range(
+                patch["credential_race_delay_seconds"], 0.0, 60.0, "随机延迟窗口", "秒")
+        if "credential_race_win_mode" in patch:
+            patch = dict(patch)
+            patch["credential_race_win_mode"] = self._validate_race_win_mode(
+                patch["credential_race_win_mode"])
         with self._lock:
             current = self._state.get("settings")
             current = dict(current) if isinstance(current, dict) else {}

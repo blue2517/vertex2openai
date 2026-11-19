@@ -160,7 +160,13 @@ class ExpressSDKUpstream(BaseUpstream):
     封装了原有的多密钥切匙、代理挂载以及 SDK 运行时调用
     """
     @credential_proxy_scope
-    async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request):
+    async def chat_completions(
+        self,
+        request_obj: OpenAIRequest,
+        fastapi_request: Request,
+        *,
+        credential: dict | None = None,
+    ):
         try:
             validate_request_schemas(request_obj)
         except SchemaValidationError as exc:
@@ -168,8 +174,6 @@ class ExpressSDKUpstream(BaseUpstream):
                 status_code=400,
                 content=create_openai_error_response(400, str(exc), "invalid_request_error"),
             )
-
-        express_key_manager_instance = fastapi_request.app.state.express_key_manager
 
         base_model_name, is_grounded_search, model_error = _normalize_model_name(request_obj.model)
         if model_error:
@@ -179,23 +183,27 @@ class ExpressSDKUpstream(BaseUpstream):
                 content=create_openai_error_response(400, model_error, "invalid_request_error"),
             )
 
-        if express_key_manager_instance.get_total_keys() == 0:
-            error_msg = ("未配置任何 Express API Key，无法调用 Gemini Express Mode"
-                         "（请在控制台「通道与凭证」页添加，或设环境变量 VERTEX_EXPRESS_API_KEY）。")
-            print(f"❌ [密钥配置] {error_msg}")
-            return JSONResponse(
-                status_code=401,
-                content=create_openai_error_response(401, error_msg, "authentication_error"),
-            )
+        if credential is not None:
+            key_record = credential
+        else:
+            express_key_manager_instance = fastapi_request.app.state.express_key_manager
+            if express_key_manager_instance.get_total_keys() == 0:
+                error_msg = ("未配置任何 Express API Key，无法调用 Gemini Express Mode"
+                             "（请在控制台「通道与凭证」页添加，或设环境变量 VERTEX_EXPRESS_API_KEY）。")
+                print(f"❌ [密钥配置] {error_msg}")
+                return JSONResponse(
+                    status_code=401,
+                    content=create_openai_error_response(401, error_msg, "authentication_error"),
+                )
 
-        key_record = express_key_manager_instance.get_express_record()
-        if not key_record:
-            error_msg = "没有可用的 Express API Key。"
-            print(f"❌ [密钥配置] {error_msg}")
-            return JSONResponse(
-                status_code=401,
-                content=create_openai_error_response(401, error_msg, "authentication_error"),
-            )
+            key_record = express_key_manager_instance.get_express_record()
+            if not key_record:
+                error_msg = "没有可用的 Express API Key。"
+                print(f"❌ [密钥配置] {error_msg}")
+                return JSONResponse(
+                    status_code=401,
+                    content=create_openai_error_response(401, error_msg, "authentication_error"),
+                )
 
         express_api_key = key_record["key"]
         try:
@@ -216,7 +224,11 @@ class ExpressSDKUpstream(BaseUpstream):
         )
         register_client = getattr(fastapi_request, "register_upstream_client", lambda client: client)
         register_client(client_to_use)
-        trace = UpstreamTrace("Express", base_model_name, uuid.uuid4().hex[:8], time.monotonic(), unit_label="块")
+        trace = UpstreamTrace(
+            "Express", base_model_name, uuid.uuid4().hex[:8], time.monotonic(),
+            unit_label="块",
+            on_first_packet=getattr(fastapi_request, "notify_first_packet", None),
+        )
         if key_record.get("note"):
             trace.label += f" | 凭证={key_record['note']}"
         job_id = getattr(getattr(fastapi_request, "job", None), "id", None)
