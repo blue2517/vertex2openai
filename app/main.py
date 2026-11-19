@@ -184,18 +184,38 @@ def _revoke_session(token: str) -> None:
         _sessions.pop(token, None)
 
 
+def _session_tokens(request: Request) -> list[str]:
+    tokens: list[str] = []
+    raw = request.headers.get("cookie", "")
+    for chunk in raw.split(";"):
+        if "=" not in chunk:
+            continue
+        name, val = chunk.split("=", 1)
+        if name.strip() == AUTH_COOKIE:
+            token = val.strip().strip('"')
+            if token and token not in tokens:
+                tokens.append(token)
+    fallback = request.cookies.get(AUTH_COOKIE, "")
+    if fallback and fallback not in tokens:
+        tokens.append(fallback)
+    return tokens
+
+
 def _is_authed(request: Request) -> bool:
-    token = request.cookies.get(AUTH_COOKIE, "")
-    if not token:
+    tokens = _session_tokens(request)
+    if not tokens:
         return False
+    now = time.time()
     with _sessions_lock:
-        exp = _sessions.get(token)
-        if exp is None:
-            return False
-        if exp < time.time():
-            _sessions.pop(token, None)
-            return False
-    return True
+        for token in tokens:
+            exp = _sessions.get(token)
+            if exp is None:
+                continue
+            if exp < now:
+                _sessions.pop(token, None)
+                continue
+            return True
+    return False
 
 
 def _login_retry_after(ip: str) -> int:
@@ -277,11 +297,17 @@ LOGIN_HTML = r"""<!DOCTYPE html>
     <div id="err" class="err"></div>
   </div>
 <script>
+const BASE_PATH = (typeof location !== 'undefined' && location.pathname)
+  ? location.pathname.replace(/\/+$/, '')
+  : '';
+const appUrl = path => (typeof path === 'string' && path.startsWith('/') && !path.startsWith('//') && BASE_PATH && !path.startsWith(BASE_PATH + '/'))
+  ? BASE_PATH + path
+  : path;
 async function doLogin(e){
   e.preventDefault();
   const pw=document.getElementById('pw').value;
-  const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
-  if(r.ok){ location.href='/'; } else { document.getElementById('err').textContent='密码错误，请重试'; }
+  const r=await fetch(appUrl('/api/login'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
+  if(r.ok){ location.href=appUrl('/'); } else { document.getElementById('err').textContent='密码错误，请重试'; }
   return false;
 }
 </script>
@@ -303,6 +329,14 @@ class LoginBody(BaseModel):
     password: str
 
 
+def _cookie_path(request: Request) -> str:
+    prefix = (request.headers.get("x-forwarded-prefix") or "").strip()
+    if prefix.startswith("/") and not prefix.startswith("//"):
+        cleaned = "/" + prefix.strip("/")
+        return cleaned if cleaned != "/" else "/"
+    return "/"
+
+
 @app.post("/api/login")
 async def login(body: LoginBody, request: Request):
     ip = request.client.host if request.client else "unknown"
@@ -316,12 +350,20 @@ async def login(body: LoginBody, request: Request):
     if config.API_KEY and secrets.compare_digest(body.password, config.API_KEY):
         _clear_login_failure(ip)
         resp = JSONResponse(content={"ok": True})
+        cookie_path = _cookie_path(request)
+        is_secure = (request.url.scheme == "https"
+                     or request.headers.get("x-forwarded-proto", "") == "https")
+        if cookie_path != "/":
+            resp.delete_cookie(
+                AUTH_COOKIE, path="/",
+                httponly=True, samesite="lax", secure=is_secure,
+            )
         resp.set_cookie(
             AUTH_COOKIE, _issue_session(),
-            httponly=True, samesite="lax", max_age=SESSION_TTL_SECONDS, path="/",
+            httponly=True, samesite="lax", max_age=SESSION_TTL_SECONDS,
+            path=cookie_path,
             # 反代后 request.url.scheme 可能是 http，这里同时看 x-forwarded-proto
-            secure=(request.url.scheme == "https"
-                    or request.headers.get("x-forwarded-proto", "") == "https"),
+            secure=is_secure,
         )
         return resp
 
@@ -332,9 +374,21 @@ async def login(body: LoginBody, request: Request):
 
 @app.post("/api/logout")
 async def logout(request: Request):
-    _revoke_session(request.cookies.get(AUTH_COOKIE, ""))
+    for token in _session_tokens(request):
+        _revoke_session(token)
     resp = JSONResponse(content={"ok": True})
-    resp.delete_cookie(AUTH_COOKIE, path="/")
+    cookie_path = _cookie_path(request)
+    is_secure = (request.url.scheme == "https"
+                 or request.headers.get("x-forwarded-proto", "") == "https")
+    resp.delete_cookie(
+        AUTH_COOKIE, path=cookie_path,
+        httponly=True, samesite="lax", secure=is_secure,
+    )
+    if cookie_path != "/":
+        resp.delete_cookie(
+            AUTH_COOKIE, path="/",
+            httponly=True, samesite="lax", secure=is_secure,
+        )
     return resp
 
 

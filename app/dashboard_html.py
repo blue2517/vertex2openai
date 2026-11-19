@@ -856,6 +856,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 <script>
 const $ = id => document.getElementById(id);
+const BASE_PATH = (typeof location !== 'undefined' && location.pathname)
+  ? location.pathname.replace(/\/+$/, '')
+  : '';
+const appUrl = path => (typeof path === 'string' && path.startsWith('/') && !path.startsWith('//') && BASE_PATH && !path.startsWith(BASE_PATH + '/'))
+  ? BASE_PATH + path
+  : path;
+if (BASE_PATH) {
+  if (typeof globalThis.fetch === 'function') {
+    const _origFetch = globalThis.fetch.bind(globalThis);
+    globalThis.fetch = (input, init) => _origFetch(typeof input === 'string' ? appUrl(input) : input, init);
+  }
+  if (typeof globalThis.EventSource === 'function') {
+    const _OrigEventSource = globalThis.EventSource;
+    globalThis.EventSource = class extends _OrigEventSource {
+      constructor(url, init) { super(appUrl(url), init); }
+    };
+  }
+}
 let CAPS = {}, curAR = "";
 let GLOBAL_SETTINGS = {}, OVERRIDES = {};
 let OVERVIEW_DATA = null, CRED_FILTER = 'all', DETAIL_CRED_ID = '';
@@ -884,7 +902,7 @@ function rateClass(r){
   if(r === null || r === undefined) return '';
   return r >= 90 ? 'ok' : (r >= 60 ? 'warn' : 'err');
 }
-async function logout(){ try{ await fetch('/api/logout',{method:'POST'}); }catch(e){} location.href='/'; }
+async function logout(){ try{ await fetch('/api/logout',{method:'POST'}); }catch(e){} location.href=appUrl('/'); }
 
 /* ---------- Service restart ---------- */
 let restartBusy=false;
