@@ -19,7 +19,8 @@ from upstreams import cookie_proxy, express_sdk
 
 
 RETIRED_KEYS = {'prefill_mode', 'prefill_suppress_thinking', 'prefill_instruction',
-                'inject_prefill', 'inject_prefill_for_image'}
+                'inject_prefill', 'inject_prefill_for_image',
+                'inject_system_instruction', 'safety_score'}
 
 
 @pytest.fixture
@@ -27,11 +28,13 @@ def legacy_settings(isolated_state, request):
     mode = getattr(request, 'param', 'smart')
     retired = {'prefill_mode': mode, 'prefill_suppress_thinking': True,
                'prefill_instruction': 'SERVER_REWRITE', 'inject_prefill': 'SERVER_ASSISTANT',
-               'inject_prefill_for_image': True}
+               'inject_prefill_for_image': True,
+               'inject_system_instruction': 'SERVER_SYSTEM_INJECT',
+               'safety_score': True}
     isolated_state._state['settings'] = {
         **retired,
         'native_thinking_mode': 'request', 'thinking_g3_level': 'low',
-        'inject_system_instruction': '', 'express_location': '',
+        'express_location': '',
         'model_overrides': {'gemini-4-argon': retired, 'gemini-3.6-flash-image': retired},
     }
     return isolated_state

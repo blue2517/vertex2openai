@@ -44,8 +44,6 @@ class ExpressKeyManager:
                 return None
             random.shuffle(indexed)
             original_idx, rec = indexed[0]
-        print(f"🔑 [密钥选择] 已随机选择第 {original_idx + 1} 个 Express API Key"
-              f"（项目：{rec.get('project_id') or '未探测'}）。")
         return dict(rec, index=original_idx)
 
     def get_roundrobin_express_record(self, exclude_keys: Optional[Iterable[str]] = None) -> Optional[dict]:
@@ -70,8 +68,6 @@ class ExpressKeyManager:
             if chosen is None:
                 return None
             original_idx, rec = chosen
-        print(f"🔑 [密钥选择] 已按轮询策略选择第 {original_idx + 1} 个 Express API Key"
-              f"（项目：{rec.get('project_id') or '未探测'}）。")
         return dict(rec, index=original_idx)
 
     def get_express_record(self, exclude_keys: Optional[Iterable[str]] = None) -> Optional[dict]:

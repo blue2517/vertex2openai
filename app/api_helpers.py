@@ -14,13 +14,12 @@ from models import OpenAIRequest, OpenAIMessage
 from message_processing import (
     convert_to_openai_format,
     extract_reasoning_by_tags,
-    _create_safety_ratings_html,
 )
 import config as app_config
-from config import VERTEX_REASONING_TAG
 
 import model_capabilities as mc
 from runtime_state import app_state
+from usage_stats import usage_ledger
 
 # 引入报错重试统计器
 from logger import stats
@@ -37,14 +36,6 @@ try:
     import httpx2
 except ImportError:  # pragma: no cover - optional in environments without httpx2
     httpx2 = None
-
-
-def _safety_score_enabled() -> bool:
-    try:
-        return bool(app_state.get_setting("safety_score", app_config.SAFETY_SCORE))
-    except Exception:
-        return bool(app_config.SAFETY_SCORE)
-
 
 
 def get_retry_settings() -> tuple[int, float]:
@@ -78,6 +69,12 @@ class UpstreamTrace:
         unit_label: str = "JSON",
         monotonic: Optional[Callable[[], float]] = None,
         on_first_packet: Optional[Callable[[], None]] = None,
+        cred_id: str = "",
+        cred_label: str = "",
+        proxy_label: str = "",
+        request_model: str = "",
+        upstream_model: str = "",
+        mode: str = "stream",
     ):
         self.channel = channel
         self.label = f"{model} | 请求={response_id.rsplit('-', 1)[-1]}"
@@ -85,6 +82,13 @@ class UpstreamTrace:
         self.unit_label = unit_label
         self._monotonic = monotonic or time.monotonic
         self._on_first_packet = on_first_packet
+        self.cred_id = cred_id
+        self.cred_label = cred_label
+        self.proxy_label = proxy_label
+        self.request_model = request_model or model
+        self.upstream_model = upstream_model or model
+        self.mode = mode
+        self._recorded = False
         self.attempts = 0
         self.has_headers = False
         self.received_bytes = 0
@@ -92,6 +96,42 @@ class UpstreamTrace:
         self.kinds: set[str] = set()
         self.first_packet: Optional[float] = None
         self.first_output: Optional[float] = None
+
+    def record_result(
+        self,
+        status_code: int,
+        success: bool,
+        *,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        error: str = "",
+        cancelled: bool = False,
+    ) -> None:
+        if self._recorded or not self.cred_id:
+            return
+        self._recorded = True
+        latency_ms = int(round(max(0.0, self._monotonic() - self.started) * 1000))
+        ttft_ms = int(round(self.first_output * 1000)) if self.first_output is not None else None
+        fp_ms = int(round(self.first_packet * 1000)) if self.first_packet is not None else None
+        ch = "cookie" if self.channel.lower() in ("studio", "cookie") else "express"
+        usage_ledger.record_attempt(
+            channel=ch,
+            cred_id=self.cred_id,
+            cred_label=self.cred_label or self.channel,
+            proxy_label=self.proxy_label,
+            request_model=self.request_model,
+            upstream_model=self.upstream_model,
+            mode=self.mode,
+            status_code=status_code,
+            success=success,
+            latency_ms=latency_ms,
+            ttft_ms=ttft_ms,
+            first_packet_ms=fp_ms,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            error=error,
+            cancelled=cancelled,
+        )
 
     def begin_attempt(self):
         self.attempts += 1
@@ -304,101 +344,6 @@ def _observe_gemini_response(trace: Optional[UpstreamTrace], resp: Any) -> None:
         resp_text = getattr(resp, "text", None)
         if isinstance(resp_text, str) and resp_text:
             trace.observe_event("text")
-
-class StreamingReasoningProcessor:
-    def __init__(self, tag_name: str = VERTEX_REASONING_TAG):
-        self.tag_name = tag_name
-        self.open_tag = f"<{tag_name}>"
-        self.close_tag = f"</{tag_name}>"
-        self.tag_buffer = ""
-        self.inside_tag = False
-        self._reasoning_chunks = []
-        self.partial_tag_buffer = "" 
-
-    def process_chunk(self, content: str) -> tuple[str, str]:
-        if self.partial_tag_buffer:
-            content = self.partial_tag_buffer + content
-            self.partial_tag_buffer = ""
-        self.tag_buffer += content
-        
-        processed_content_chunks = []
-        current_reasoning_chunks = []
-        
-        while self.tag_buffer:
-            if not self.inside_tag:
-                open_pos = self.tag_buffer.find(self.open_tag)
-                if open_pos == -1:
-                    partial_match = False
-                    for i in range(1, min(len(self.open_tag), len(self.tag_buffer) + 1)):
-                        if self.tag_buffer[-i:] == self.open_tag[:i]:
-                            partial_match = True
-                            if len(self.tag_buffer) > i:
-                                processed_content_chunks.append(self.tag_buffer[:-i])
-                                self.partial_tag_buffer = self.tag_buffer[-i:]
-                            else: 
-                                self.partial_tag_buffer = self.tag_buffer
-                            self.tag_buffer = ""
-                            break
-                    if not partial_match:
-                        processed_content_chunks.append(self.tag_buffer)
-                        self.tag_buffer = ""
-                    break
-                else:
-                    processed_content_chunks.append(self.tag_buffer[:open_pos])
-                    self.tag_buffer = self.tag_buffer[open_pos + len(self.open_tag):]
-                    self.inside_tag = True
-            else: 
-                close_pos = self.tag_buffer.find(self.close_tag)
-                if close_pos == -1:
-                    partial_match = False
-                    for i in range(1, min(len(self.close_tag), len(self.tag_buffer) + 1)):
-                        if self.tag_buffer[-i:] == self.close_tag[:i]:
-                            partial_match = True
-                            if len(self.tag_buffer) > i:
-                                new_reasoning = self.tag_buffer[:-i]
-                                self._reasoning_chunks.append(new_reasoning)
-                                if new_reasoning: current_reasoning_chunks.append(new_reasoning)
-                                self.partial_tag_buffer = self.tag_buffer[-i:]
-                            else: 
-                                self.partial_tag_buffer = self.tag_buffer
-                            self.tag_buffer = ""
-                            break
-                    if not partial_match:
-                        if self.tag_buffer:
-                            self._reasoning_chunks.append(self.tag_buffer)
-                            current_reasoning_chunks.append(self.tag_buffer)
-                            self.tag_buffer = ""
-                    break
-                else:
-                    final_reasoning_chunk = self.tag_buffer[:close_pos]
-                    self._reasoning_chunks.append(final_reasoning_chunk)
-                    if final_reasoning_chunk: current_reasoning_chunks.append(final_reasoning_chunk)
-                    
-                    self.tag_buffer = self.tag_buffer[close_pos + len(self.close_tag):]
-                    self.inside_tag = False
-                    
-        return "".join(processed_content_chunks), "".join(current_reasoning_chunks)
-    
-    def flush_remaining(self) -> tuple[str, str]:
-        remaining_content_chunks = []
-        if self.partial_tag_buffer:
-            remaining_content_chunks.append(self.partial_tag_buffer)
-            self.partial_tag_buffer = ""
-            
-        if not self.inside_tag:
-            if self.tag_buffer: remaining_content_chunks.append(self.tag_buffer)
-        else:
-            if self.tag_buffer: self._reasoning_chunks.append(self.tag_buffer)
-            self.inside_tag = False
-            
-        remaining_content = "".join(remaining_content_chunks)
-        remaining_reasoning = "".join(self._reasoning_chunks)
-        
-        self.tag_buffer = ""
-        self._reasoning_chunks.clear()
-        
-        return remaining_content, remaining_reasoning
-    
 
 def is_retryable_exception(e):
     if isinstance(e, TIMEOUT_EXCEPTIONS):
@@ -625,17 +570,16 @@ def _extract_usage(resp: Any) -> tuple[int, int, int]:
 
 
 def _record_usage(resp: Any) -> dict:
-    """记录 token 用量，并打印上游实际返回的流量等级。"""
+    """记录 token 用量。"""
     usage_metadata = getattr(resp, "usage_metadata", None)
     traffic_type = getattr(usage_metadata, "traffic_type", None) if usage_metadata else None
-    if traffic_type:
+    if traffic_type and app_state.get_setting("debug_outbound", False):
         value = getattr(traffic_type, "value", None) or str(traffic_type)
-        print(f"🚦 [流量等级] 上游实际 traffic_type={value}")
+        print(f"🔎 [出站调试] traffic_type={value}")
 
     p_tk, c_tk, t_tk = _extract_usage(resp)
     if p_tk or c_tk:
         stats.add_tokens(p_tk, c_tk)
-        print(f"💰 [算力消耗统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {t_tk} Tokens")
     return {"prompt_tokens": p_tk, "completion_tokens": c_tk, "total_tokens": t_tk}
 
 
@@ -774,11 +718,6 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
 
         reasoning_text, normal_text = parse_gemini_response_for_reasoning_and_content(candidate)
 
-        # Only append safety ratings to the final chunk.
-        if (openai_finish_reason and _safety_score_enabled()
-                and hasattr(candidate, "safety_ratings") and candidate.safety_ratings):
-            normal_text += _create_safety_ratings_html(candidate.safety_ratings)
-
         if reasoning_text:
             delta_payload["reasoning_content"] = reasoning_text
         if normal_text:
@@ -893,7 +832,6 @@ async def gemini_fake_stream_generator(
         read_timeout_seconds = app_state.get_express_nonstream_read_timeout_seconds()
     attach_express_trace(gemini_client_instance, trace, read_timeout_seconds=read_timeout_seconds)
     is_image_request = mc.get_profile(request_obj.model)["is_image"]
-    print(f"🌊 [假流式] 已开始调用 Gemini 模型 {model_for_api_call}，客户端请求模型名为 {request_obj.model}。")
 
     # P1-6：不再使用 tenacity 的硬编码 20 次，改为与真流式/非流式一致的手写退避，
     # 读取控制台的 retry_max / retry_backoff_seconds，并在等待期间检测客户端断开。
@@ -979,16 +917,18 @@ async def gemini_fake_stream_generator(
 
         trace.objects += 1
         _observe_gemini_response(trace, raw_gemini_response)
-        _record_usage(raw_gemini_response)
+        usage_dict = _record_usage(raw_gemini_response)
 
         openai_response_dict = convert_to_openai_format(raw_gemini_response, request_obj.model)
 
         if _gemini_prompt_blocked(raw_gemini_response):
+            trace.record_result(400, False, error="上游拦截了请求")
             print(f"❌ [Express] {trace.label} | 上游拦截了请求 | {trace.summary()}")
             raise UpstreamError(400, "上游拦截了请求。", code="content_filter")
 
         if not is_gemini_response_valid(raw_gemini_response):
             desc = "只返回了思考、未返回正文" if "thought" in trace.kinds else "未返回任何内容"
+            trace.record_result(502, False, error=f"上游{desc}")
             print(f"❌ [Express] {trace.label} | 上游{desc} | {trace.summary()}")
             raise _empty_gemini_error(raw_gemini_response)
 
@@ -997,13 +937,21 @@ async def gemini_fake_stream_generator(
         ):
             yield chunk_sse
 
+        trace.record_result(
+            200, True,
+            prompt_tokens=usage_dict.get("prompt_tokens", 0),
+            completion_tokens=usage_dict.get("completion_tokens", 0),
+        )
+        tok_part = f" | Tokens={usage_dict['prompt_tokens']}+{usage_dict['completion_tokens']}" if usage_dict.get("total_tokens") else ""
         done_label = "生图假流式完成" if is_image_request else "假流式完成"
-        print(f"✅ [Express] {trace.label} | {done_label} | {trace.summary()}")
+        print(f"✅ [Express] {trace.label} | {done_label}{tok_part} | {trace.summary()}")
 
     except asyncio.CancelledError:
+        trace.record_result(499, False, cancelled=True)
         raise
     except Exception as e_outer_gemini:
         err_code, err_msg = extract_upstream_error(e_outer_gemini)
+        trace.record_result(err_code, False, error=err_msg)
         icon = "🔑" if err_code in (401, 403) else "❌"
         print(f"{icon} [Express] {trace.label} | HTTP {err_code} | {err_msg} | {trace.summary()}")
         if not is_auto_attempt:
@@ -1078,9 +1026,12 @@ async def execute_gemini_call(
 
     if request_obj.stream:
         mode_name = "生图假流式" if is_image_request else ("假流式" if use_fake_stream else "流式")
+        trace.mode = "image" if is_image_request else ("fake_stream" if use_fake_stream else "stream")
     else:
         mode_name = "非流式"
-    print(f"→ [Express] {trace.label} | {len(request_obj.messages)} 条消息 | {mode_name}")
+        trace.mode = "image" if is_image_request else "nonstream"
+    proxy_suffix = f" | 代理={trace.proxy_label}" if trace.proxy_label else ""
+    print(f"→ [Express] {trace.label} | {len(request_obj.messages)} 条消息 | {mode_name}{proxy_suffix}")
 
     async def _client_gone() -> bool:
         """检测客户端是否已断开连接（用于在重试前及时止损）。"""
@@ -1093,8 +1044,6 @@ async def execute_gemini_call(
 
     if request_obj.stream:
         if use_fake_stream:
-            if is_image_request:
-                print("🖼️ [生图保护] 图片模型请求已自动切换为假流式输出，以避免上游流式限制。")
             return StreamingResponse(
                 gemini_fake_stream_generator(
                     current_client, model_to_call, actual_prompt_for_call,
@@ -1156,12 +1105,12 @@ async def execute_gemini_call(
 
                         if not got_output:
                             desc = "只返回了思考、未返回正文" if "thought" in trace.kinds else "未返回任何内容"
+                            trace.record_result(502, False, error=f"上游{desc}")
                             print(f"❌ [Express] {trace.label} | 上游{desc} | {trace.summary()}")
                             raise _empty_gemini_error(last_chunk)
 
                         if final_p_tk > 0 or final_c_tk > 0:
                             stats.add_tokens(final_p_tk, final_c_tk)
-                            print(f"💰 [算力消耗统计] 提示词: {final_p_tk} | 思考与生成: {final_c_tk} | 总计: {final_t_tk} Tokens")
 
                         # P1-8：Express 真流式此前从不发 usage 块，客户端只能显示 0
                         if wants_usage(request_obj):
@@ -1172,10 +1121,17 @@ async def execute_gemini_call(
                             })
 
                         yield "data: [DONE]\n\n"
-                        print(f"✅ [Express] {trace.label} | 流式传输顺利完毕 | {trace.summary()}")
+                        trace.record_result(
+                            200, True,
+                            prompt_tokens=final_p_tk,
+                            completion_tokens=final_c_tk,
+                        )
+                        tok_part = f" | Tokens={final_p_tk}+{final_c_tk}" if (final_p_tk or final_c_tk) else ""
+                        print(f"✅ [Express] {trace.label} | 流式传输顺利完毕{tok_part} | {trace.summary()}")
                         return
 
                     except asyncio.CancelledError:
+                        trace.record_result(499, False, cancelled=True)
                         raise
                     except Exception as e_stream_call:
                         if not isinstance(e_stream_call, UpstreamError) and not hasattr(e_stream_call, "code"):
@@ -1196,13 +1152,9 @@ async def execute_gemini_call(
                         if (fallback_model and model_to_call != fallback_model
                                 and err_code not in (401, 403)
                                 and not has_yielded and is_location_pin_failure(e_stream_call)):
-                            print(f"↩️ [上游端点] 钉定路径调用失败（{str(e_stream_call)[:80]}），"
-                                  f"已退回默认路由 {fallback_model} 重试一次。"
-                                  "如持续出现，请确认「通道与凭证」里的 Project ID 属于该 API Key 且已开启计费，"
-                                  "或把「标准模式 location」设为“默认（后端自选）”。")
+                            print(f"↩️ [Express] {trace.label} | 钉定路径失败，退回默认路由 {fallback_model} 重试")
                             model_to_call = fallback_model
                             current_client = _get_fallback_client()
-                            print("ℹ️ [流量等级] 回退默认路由已使用普通请求。")
                             continue
 
                         # 关键修复：只有在“尚未向客户端输出任何内容”时才重试；
@@ -1228,6 +1180,7 @@ async def execute_gemini_call(
                                 yield ": keep-alive\n\n"
                             continue
 
+                        trace.record_result(err_code, False, error=err_msg)
                         if err_code in (401, 403):
                             print(f"🔑 [Express] {trace.label} | HTTP {err_code} | 认证/权限失败，本次请求已结束。")
                         elif has_yielded:
@@ -1268,6 +1221,7 @@ async def execute_gemini_call(
                 )
                 break
             except asyncio.CancelledError:
+                trace.record_result(499, False, cancelled=True)
                 raise
             except Exception as e_call:
                 if not isinstance(e_call, UpstreamError) and not hasattr(e_call, "code"):
@@ -1276,13 +1230,9 @@ async def execute_gemini_call(
                 if (fallback_model and model_to_call != fallback_model
                         and err_code not in (401, 403)
                         and is_location_pin_failure(e_call)):
-                    print(f"↩️ [上游端点] 钉定路径调用失败（{str(e_call)[:80]}），"
-                          f"已退回默认路由 {fallback_model} 重试一次。"
-                          "如持续出现，请确认「通道与凭证」里的 Project ID 属于该 API Key 且已开启计费，"
-                          "或把「标准模式 location」设为“默认（后端自选）”。")
+                    print(f"↩️ [Express] {trace.label} | 钉定路径失败，退回默认路由 {fallback_model} 重试")
                     model_to_call = fallback_model
                     current_client = _get_fallback_client()
-                    print("ℹ️ [流量等级] 回退默认路由已使用普通请求。")
                     continue
                 if is_retryable_exception(e_call) and attempt < max_retries:
                     stats.add_retry()
@@ -1291,6 +1241,7 @@ async def execute_gemini_call(
                           f" | {wait_time}s 后进行第 {attempt + 2}/{max_retries + 1} 次尝试 | {trace.summary()}")
                     await asyncio.sleep(wait_time)
                     continue
+                trace.record_result(err_code, False, error=err_msg)
                 icon = "🔑" if err_code in (401, 403) else "❌"
                 print(f"{icon} [Express] {trace.label} | HTTP {err_code} | {err_msg} | {trace.summary()}")
                 if isinstance(e_call, TIMEOUT_EXCEPTIONS):
@@ -1299,6 +1250,7 @@ async def execute_gemini_call(
 
         # 兜底：绝不让 None 流到下游的有效性检查里变成一条误导性的“无有效内容”
         if response_obj_call is None:
+            trace.record_result(502, False, error="上游未返回任何响应（重试已耗尽）")
             print(f"❌ [Express] {trace.label} | HTTP 502 | 上游未返回任何响应（重试已耗尽）。| {trace.summary()}")
             return JSONResponse(
                 status_code=502,
@@ -1314,16 +1266,24 @@ async def execute_gemini_call(
             if hasattr(response_obj_call.prompt_feedback,"block_reason_message") and \
                response_obj_call.prompt_feedback.block_reason_message:
                 block_msg+=f"（{response_obj_call.prompt_feedback.block_reason_message}）"
+            trace.record_result(400, False, error=block_msg)
             print(f"❌ [Express] {trace.label} | {block_msg} | {trace.summary()}")
             raise UpstreamError(400, "上游拦截了请求。", code="content_filter")
 
         if not is_gemini_response_valid(response_obj_call):
             desc = "只返回了思考、未返回正文" if "thought" in trace.kinds else "未返回任何内容"
+            trace.record_result(502, False, error=f"上游{desc}")
             print(f"❌ [Express] {trace.label} | 上游{desc} | {trace.summary()}")
             raise _empty_gemini_error(response_obj_call)
 
-        _record_usage(response_obj_call)
-        print(f"✅ [Express] {trace.label} | 非流式完成 | {trace.summary()}")
+        usage_dict = _record_usage(response_obj_call)
+        trace.record_result(
+            200, True,
+            prompt_tokens=usage_dict.get("prompt_tokens", 0),
+            completion_tokens=usage_dict.get("completion_tokens", 0),
+        )
+        tok_part = f" | Tokens={usage_dict['prompt_tokens']}+{usage_dict['completion_tokens']}" if usage_dict.get("total_tokens") else ""
+        print(f"✅ [Express] {trace.label} | 非流式完成{tok_part} | {trace.summary()}")
 
         openai_response_content = convert_to_openai_format(response_obj_call, request_obj.model)
         return JSONResponse(content=openai_response_content)

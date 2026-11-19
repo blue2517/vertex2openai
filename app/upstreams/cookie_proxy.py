@@ -29,8 +29,6 @@ from cookie_credentials import cookie_credential_manager
 import config as app_config
 import model_capabilities as mc
 from message_processing import (
-    _create_safety_ratings_html,
-    apply_console_injection,
     openai_content_to_wire_parts,
     _coerce_tool_response,
     resolve_tool_call_signature,
@@ -40,6 +38,7 @@ from message_processing import (
     _requires_signature,
 )
 from logger import stats
+from usage_stats import format_cookie_label, format_proxy_label, usage_ledger
 from token_counting import CookieUsageCounter
 from api_helpers import FirstPacketByteStream, UpstreamTrace, get_retry_settings
 from api_errors import UpstreamError, upstream_error, error_payload, error_response, error_sse
@@ -75,15 +74,6 @@ _THINKING_RUNAWAY_HINT = (
 _NO_BODY_HINT = (
     "可能被安全策略拦截或接口行为变化；原始响应样本已写入运行日志，可到大盘“运行日志”页查看。"
 )
-
-
-def _safety_html_if_enabled(ratings: Any) -> str:
-    """开关打开时把 batchGraphql 的 safetyRatings 渲染成附加块，否则空串。"""
-    if not ratings:
-        return ""
-    if not app_state.get_setting("safety_score", app_config.SAFETY_SCORE):
-        return ""
-    return _create_safety_ratings_html(ratings)
 
 
 def _is_retryable_error(error_msg: str) -> bool:
@@ -661,19 +651,12 @@ def _build_batch_graphql_body(
         if thinking_config:
             gen_config["thinkingConfig"] = thinking_config
 
-    # OFF = 分类器整个关掉，上游**不会回传** safetyRatings；BLOCK_NONE = 照常评分但从不拦截。
-    # 想看安全分就必须用后者，因此跟着「输出附加安全分」开关走（默认仍是 OFF，行为不变）。
-    _want_scores = bool(app_state.get_setting("safety_score", app_config.SAFETY_SCORE))
-    _threshold = "BLOCK_NONE" if _want_scores else "OFF"
     safety_settings = [
-        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": _threshold},
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": _threshold},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": _threshold},
-        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": _threshold},
-        # 与标准（Express）通道对齐：不发这个分类时，越狱式提示词（roleplay 预设常见）
-        # 可能被默认越狱过滤拦掉“正文”而思考照常流出 → 表现为只有思考没有正文。
-        # 已真机验证 batchGraphql 接受该分类（OFF / BLOCK_NONE 均可）。
-        {"category": "HARM_CATEGORY_JAILBREAK", "threshold": _threshold},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
+        {"category": "HARM_CATEGORY_JAILBREAK", "threshold": "OFF"},
     ]
     # Nano Banana 家族生图：追加 4 个图像安全分类，阈值全 OFF（官方示例基准）；
     # 旧生图模型维持 5 个文本分类不变（用户决策 2026-10-13）。
@@ -952,12 +935,8 @@ def _extract_from_results(obj: dict):
 # ========== token 用量映射 ==========
 
 def _record_cookie_usage(result: dict):
-    usage, info = result["usage"], result["usage_metadata"]
+    usage = result["usage"]
     stats.add_tokens(usage["prompt_tokens"], usage["completion_tokens"], count_success=False)
-    source = "上游" if not info["estimated"] else "本地分词估算" if info["source"] == "local_tokenizer" else "上游与本地补计"
-    scope = "（仅文本与工具，未含媒体 token）" if info.get("contains_media") else ""
-    print(f"💰 [Studio 用量] 提示词: {usage['prompt_tokens']} | 思考与生成: {usage['completion_tokens']}"
-          f" | 总计: {usage['total_tokens']} Tokens | 来源: {source}{scope}")
 
 
 async def _finish_cookie_usage(counter: CookieUsageCounter, body: dict, usage_meta: dict | None) -> dict:
@@ -1203,7 +1182,6 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
 
             full_text, reasoning_text, api_error, usage_meta = "", "", None, None
             finish_raw, blocked_msg = None, None
-            safety_html = ""
             sampler = _RawSampler()
             usage_counter = CookieUsageCounter()
 
@@ -1223,8 +1201,6 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
                         full_text += data
                     elif et == "finish":
                         finish_raw = data
-                    elif et == "safety":
-                        safety_html = _safety_html_if_enabled(data)
                     elif et == "blocked":
                         blocked_msg = data
                     elif et == "usage":
@@ -1252,7 +1228,7 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
                 return {"kind": "error", **error_payload(error)}
 
             usage_result = await asyncio.to_thread(usage_counter.resolve, body, usage_meta)
-            return {"kind": "ok", "full_text": full_text + safety_html, "reasoning_text": reasoning_text,
+            return {"kind": "ok", "full_text": full_text, "reasoning_text": reasoning_text,
                     "finish_reason": _map_finish_reason(finish_raw), "usage_result": usage_result}
         except Exception as e:
             error = upstream_error(e)
@@ -1345,14 +1321,6 @@ class CookieProxyUpstream(BaseUpstream):
             base_model_name = base_model_name[:-len("-search")]
 
         _profile = mc.get_profile(base_model_name)
-        _inj_settings = app_state.get_effective_settings(base_model_name)
-        # Only explicit console system instructions may add a message.
-        injected, notes = apply_console_injection(
-            request_obj.messages, system_text=_inj_settings.get("inject_system_instruction", ""))
-        for note in notes:
-            print(note)
-        if injected is not request_obj.messages:
-            request_obj = request_obj.model_copy(update={"messages": injected})
 
         # ===== 4. HTTP 客户端配置 =====
         client_kwargs = {
@@ -1371,9 +1339,11 @@ class CookieProxyUpstream(BaseUpstream):
         is_stream = request_obj.stream
         response_id = f"chatcmpl-studio-{int(time.time())}-{uuid.uuid4().hex[:8]}"
         start_time = time.monotonic()
-        request_label = f"{base_model_name} | 请求={response_id.rsplit('-', 1)[-1]}"
-        if credential:
-            request_label += f" | 凭证={credential['name']}"
+        cred_id = str((credential or {}).get("id") or "cookie_default")
+        cred_label = format_cookie_label(credential)
+        proxy_label = format_proxy_label(credential)
+        model_tag = f"{model_display}→{base_model_name}" if model_display != base_model_name else base_model_name
+        request_label = f"{model_tag} | 请求={response_id.rsplit('-', 1)[-1]} | 凭证={cred_label}"
         job_id = getattr(getattr(fastapi_request, "job", None), "id", None)
         if job_id:
             request_label += f" | 任务={job_id}"
@@ -1385,6 +1355,37 @@ class CookieProxyUpstream(BaseUpstream):
             if not getattr(fastapi_request, "suppress_attempt_error_stats", False):
                 stats.add_error()
 
+        def _record_cookie_attempt(
+            status_code: int,
+            success: bool,
+            *,
+            mode: str,
+            usage_result: Optional[dict] = None,
+            error: str = "",
+            ttft_s: Optional[float] = None,
+            first_packet_s: Optional[float] = None,
+            cancelled: bool = False,
+        ) -> None:
+            usage = (usage_result or {}).get("usage") or {}
+            usage_ledger.record_attempt(
+                channel="cookie",
+                cred_id=cred_id,
+                cred_label=cred_label,
+                proxy_label=proxy_label,
+                request_model=model_display,
+                upstream_model=base_model_name,
+                mode=mode,
+                status_code=status_code,
+                success=success,
+                latency_ms=int(round(max(0.0, time.monotonic() - start_time) * 1000)),
+                ttft_ms=int(round(ttft_s * 1000)) if ttft_s is not None else None,
+                first_packet_ms=int(round(first_packet_s * 1000)) if first_packet_s is not None else None,
+                prompt_tokens=int(usage.get("prompt_tokens") or 0),
+                completion_tokens=int(usage.get("completion_tokens") or 0),
+                error=error,
+                cancelled=cancelled,
+            )
+
         def nonstream_failure(error):
             error = upstream_error(error)
             status = error.status_code
@@ -1392,6 +1393,7 @@ class CookieProxyUpstream(BaseUpstream):
             reason = "认证/权限失败" if status in (401, 403) else error_payload(error)["error"]["message"]
             if "本次请求已结束" not in reason:
                 reason += "，本次请求已结束。"
+            _record_cookie_attempt(status, False, mode="nonstream", error=reason)
             print(f"{icon} [Studio] {request_label} | HTTP {status} | {reason}"
                   f" | 总耗时 {time.monotonic() - start_time:.2f}s")
             return error_response(error)
@@ -1403,26 +1405,25 @@ class CookieProxyUpstream(BaseUpstream):
 
         # 打印请求日志
         msg_count = len(request_obj.messages)
-        print(f"→ [Studio] {request_label}"
-              f" | {msg_count} 条消息 | {'流式' if is_stream else '非流式'}")
-
         is_image = _profile["is_image"]
+        mode_desc = "生图假流式" if (is_stream and is_image) else ("流式" if is_stream else "非流式")
+        print(f"→ [Studio] {request_label}"
+              f" | {msg_count} 条消息 | {mode_desc} | 代理={proxy_label}")
 
         # ========== 生图 + 流式：强制假流式 ==========
-        # 生图输出是超大 base64，若按流式分块传输会卡死前端解析器；
-        # 因此先完整取回，再把整张图作为“单个 chunk”一次性发出（与官方 SDK 通道一致）。
         if is_stream and is_image:
             async def image_fake_stream():
                 if await fastapi_request.is_disconnected():
                     return
-                print(f"🖼️ [生图保护] 图片模型 {base_model_name} 已自动切换为假流式输出（Cookie 通道），避免分块 base64 卡死前端。")
                 res = await _collect_full_response(
                     project_id, base_model_name, request_obj, headers, client_kwargs,
                     retry_max, backoff_sec, fastapi_request, cookie_str=cookie_str,
                 )
                 if res.get("kind") != "ok":
                     _record_error()
-                    print(f"❌ [Studio] 生图失败 | {res.get('error', {})}")
+                    err_obj = upstream_error(res)
+                    _record_cookie_attempt(err_obj.status_code, False, mode="image", error=str(err_obj))
+                    print(f"❌ [Studio] {request_label} | 生图失败 | {res.get('error', {})}")
                     yield error_sse(res)
                     yield "data: [DONE]\n\n"
                     return
@@ -1436,11 +1437,14 @@ class CookieProxyUpstream(BaseUpstream):
                 yield _make_openai_chunk(response_id, model_display, content=full_text or " ")
                 _record_cookie_usage(res["usage_result"])
                 stats.add_success()
+                _record_cookie_attempt(200, True, mode="image", usage_result=res["usage_result"])
                 if want_usage:
                     yield _make_usage_chunk(response_id, model_display, **res["usage_result"])
                 yield _make_openai_chunk(response_id, model_display, finish_reason=res.get("finish_reason", "stop"))
                 yield "data: [DONE]\n\n"
-                print(f"✅ [Studio] {base_model_name} | 生图假流式完成 | 总耗时 {time.monotonic() - start_time:.2f}s")
+                u = (res.get("usage_result") or {}).get("usage") or {}
+                tok_part = f" | Tokens={u.get('prompt_tokens', 0)}+{u.get('completion_tokens', 0)}" if u.get("total_tokens") else ""
+                print(f"✅ [Studio] {request_label} | 生图假流式完成{tok_part} | 总耗时 {time.monotonic() - start_time:.2f}s")
             return StreamingResponse(image_fake_stream(), media_type="text/event-stream")
 
         # ========== 流式处理（彻底解决 60s 超时的真·流式机制） ==========
@@ -1539,11 +1543,6 @@ class CookieProxyUpstream(BaseUpstream):
 
                             elif status == "finish":
                                 finish_raw = data
-                            elif status == "safety":
-                                # 最后一块才到，作为一个独立 chunk 追加在正文之后
-                                _sh = _safety_html_if_enabled(data)
-                                if _sh:
-                                    yield _make_openai_chunk(response_id, model_display, content=_sh)
                             elif status == "usage":
                                 usage_meta = {**(usage_meta or {}), **data}
                             elif status == "blocked":
@@ -1552,14 +1551,24 @@ class CookieProxyUpstream(BaseUpstream):
                             # 如果属于 Cookie 权限错误
                             elif status == "cookie_error":
                                 _record_error()
-                                print(f"🔑 [Studio] {trace.label} | HTTP {upstream_error(data).status_code} | 认证/权限失败，本次请求已结束。")
+                                err_obj = upstream_error(data)
+                                _record_cookie_attempt(
+                                    err_obj.status_code, False, mode="stream", error="认证/权限失败",
+                                    ttft_s=trace.first_output, first_packet_s=trace.first_packet,
+                                )
+                                print(f"🔑 [Studio] {trace.label} | HTTP {err_obj.status_code} | 认证/权限失败，本次请求已结束。")
                                 yield error_sse(data)
                                 yield "data: [DONE]\n\n"
                                 return
 
                             elif status in ("api_error", "api_error_text"):
                                 _record_error()
-                                print(f"❌ [Studio] {trace.label} | 上游输出中断：{upstream_error(data)} | {trace.summary()}")
+                                err_obj = upstream_error(data)
+                                _record_cookie_attempt(
+                                    err_obj.status_code, False, mode="stream", error=str(err_obj),
+                                    ttft_s=trace.first_output, first_packet_s=trace.first_packet,
+                                )
+                                print(f"❌ [Studio] {trace.label} | 上游输出中断：{err_obj} | {trace.summary()}")
                                 yield error_sse(data)
                                 yield "data: [DONE]\n\n"
                                 return
@@ -1575,7 +1584,12 @@ class CookieProxyUpstream(BaseUpstream):
                                     # 如果已经开始了输出，或者错误不可重试，直接抛给前端结束
                                     err_prefix = "请求终止" if status == "fatal_error" else "重试耗尽"
                                     _record_error()
-                                    print(f"❌ [Studio] {trace.label} | {err_prefix}：{upstream_error(data)} | {trace.summary()}")
+                                    err_obj = upstream_error(data)
+                                    _record_cookie_attempt(
+                                        err_obj.status_code, False, mode="stream", error=str(err_obj),
+                                        ttft_s=trace.first_output, first_packet_s=trace.first_packet,
+                                    )
+                                    print(f"❌ [Studio] {trace.label} | {err_prefix}：{err_obj} | {trace.summary()}")
                                     yield error_sse(data)
                                     yield "data: [DONE]\n\n"
                                     return
@@ -1606,6 +1620,10 @@ class CookieProxyUpstream(BaseUpstream):
                         if got_text or got_tool_call:
                             usage_result = await _finish_cookie_usage(usage_counter, body, usage_meta)
                             stats.add_success()
+                            _record_cookie_attempt(
+                                200, True, mode="stream", usage_result=usage_result,
+                                ttft_s=trace.first_output, first_packet_s=trace.first_packet,
+                            )
                             yield _make_openai_chunk(
                                 response_id, model_display,
                                 finish_reason="tool_calls" if got_tool_call else _map_finish_reason(finish_raw))
@@ -1617,9 +1635,14 @@ class CookieProxyUpstream(BaseUpstream):
                             desc = "只返回了思考、未返回正文" if got_thought else "未返回任何内容"
                             hint = (_THINKING_RUNAWAY_HINT if got_thought else _NO_BODY_HINT)
                             _record_error()
-                            print(f"❌ [Studio] {base_model_name} | 上游{desc}（{detail}）")
-                            print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
                             filtered = bool(blocked_msg) or ((finish_raw or "").upper() in _FINISH_FILTERED)
+                            _record_cookie_attempt(
+                                400 if filtered else 502, False, mode="stream",
+                                error="上游拦截了请求" if filtered else f"上游{desc}",
+                                ttft_s=trace.first_output, first_packet_s=trace.first_packet,
+                            )
+                            print(f"❌ [Studio] {trace.label} | 上游{desc}（{detail}）")
+                            print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
                             print(f"🔎 [Studio 诊断] {hint}")
                             yield error_sse(UpstreamError(
                                 400 if filtered else 502, "上游拦截了请求。" if filtered else f"上游{desc}。",
@@ -1633,7 +1656,9 @@ class CookieProxyUpstream(BaseUpstream):
                         yield "data: [DONE]\n\n"
 
                         if got_text or got_tool_call:
-                            print(f"✅ [Studio] {trace.label} | 流式传输顺利完毕 | {trace.summary()}")
+                            u = (usage_result or {}).get("usage") or {}
+                            tok_part = f" | Tokens={u.get('prompt_tokens', 0)}+{u.get('completion_tokens', 0)}" if u.get("total_tokens") else ""
+                            print(f"✅ [Studio] {trace.label} | 流式传输顺利完毕{tok_part} | {trace.summary()}")
                         return
 
             return StreamingResponse(stream_generator(), media_type="text/event-stream")
@@ -1702,7 +1727,6 @@ class CookieProxyUpstream(BaseUpstream):
 
                     full_text = ""
                     reasoning_text = ""
-                    safety_html = ""
                     tool_calls = []
                     api_error = None
                     usage_meta = None
@@ -1734,8 +1758,6 @@ class CookieProxyUpstream(BaseUpstream):
                                 pass
                             elif event_type == "finish":
                                 finish_raw = data
-                            elif event_type == "safety":
-                                safety_html = _safety_html_if_enabled(data)
                             elif event_type == "blocked":
                                 blocked_msg = data
                             elif event_type == "usage":
@@ -1769,9 +1791,13 @@ class CookieProxyUpstream(BaseUpstream):
                         desc = "只返回了思考、未返回正文" if reasoning_text else "未返回任何内容"
                         hint = (_THINKING_RUNAWAY_HINT if reasoning_text else _NO_BODY_HINT)
                         _record_error()
-                        print(f"❌ [Studio] {base_model_name} | 上游{desc}（{detail}）| {elapsed:.1f}s")
-                        print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
                         filtered = bool(blocked_msg) or ((finish_raw or "").upper() in _FINISH_FILTERED)
+                        _record_cookie_attempt(
+                            400 if filtered else 502, False, mode="nonstream",
+                            error="上游拦截了请求" if filtered else f"上游{desc}",
+                        )
+                        print(f"❌ [Studio] {request_label} | 上游{desc}（{detail}）| {elapsed:.1f}s")
+                        print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
                         print(f"🔎 [Studio 诊断] {hint}")
                         return error_response(UpstreamError(
                             400 if filtered else 502, "上游拦截了请求。" if filtered else f"上游{desc}。",
@@ -1779,10 +1805,12 @@ class CookieProxyUpstream(BaseUpstream):
 
                     usage_result = await _finish_cookie_usage(usage_counter, body, usage_meta)
                     stats.add_success()
-                    print(f"✅ [Studio] {request_label} | 非流式完成 | 总耗时 {time.monotonic() - start_time:.2f}s")
+                    _record_cookie_attempt(200, True, mode="nonstream", usage_result=usage_result)
+                    u = (usage_result or {}).get("usage") or {}
+                    tok_part = f" | Tokens={u.get('prompt_tokens', 0)}+{u.get('completion_tokens', 0)}" if u.get("total_tokens") else ""
+                    print(f"✅ [Studio] {request_label} | 非流式完成{tok_part} | 总耗时 {time.monotonic() - start_time:.2f}s")
 
-                    content_value = full_text + safety_html
-                    message_obj = {"role": "assistant", "content": content_value if content_value else None}
+                    message_obj = {"role": "assistant", "content": full_text if full_text else None}
                     if reasoning_text:
                         message_obj["reasoning_content"] = reasoning_text
                     if tool_calls:

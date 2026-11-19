@@ -327,27 +327,12 @@ def _coerce_tool_response(content: Any) -> Dict[str, Any]:
     return {"result": content}
 
 
-def apply_console_injection(messages: List[OpenAIMessage], system_text: str = "") -> Tuple[List[OpenAIMessage], List[str]]:
-    """Apply only an explicitly configured system instruction; never inspect message endings."""
-    system_text = (system_text or "").strip()
-    if not system_text:
-        return messages, []
-    new_messages = list(messages or [])
-    insert_at = 0
-    for index, message in enumerate(new_messages):
-        if message.role == "system":
-            insert_at = index + 1
-    new_messages.insert(insert_at, OpenAIMessage(role="system", content=system_text))
-    return new_messages, [f"💉 [控制台注入] 已追加 system 指令（{len(system_text)} 字）。"]
-
-
 def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") -> List[types.Content]:
     """OpenAI 消息 → Gemini contents。
 
     model_name 用于判断是否需要对缺失的思考签名启用官方哨兵（仅 Gemini 3.x 强校验）。
     留空表示“未知模型”，此时不注入哨兵——调用方（express_sdk）总会传真实模型名。
     """
-    print("🔄 [消息转换] 正在将 OpenAI 格式消息转换为 Gemini contents。")
     require_sig = _requires_signature(model_name)
     raw_gemini_messages = []
     tool_name_by_id = {}
@@ -793,39 +778,6 @@ def _rating_fields(r: Any) -> Tuple[str, str, Optional[float], Optional[float]]:
     return cat, prob, (ps if isinstance(ps, (int, float)) else None), (ss if isinstance(ss, (int, float)) else None)
 
 
-def _create_safety_ratings_html(safety_ratings: list) -> str:
-    if not safety_ratings:
-        return ""
-    # 上游对部分分类只给 probability 不给 probability_score（实测 JAILBREAK 常为 None），
-    # 直接 max(key=probability_score) 会拿 None 和 float 比较 → TypeError，
-    # 整个请求变成 500。缺分数的按 -1 排，永远不会被选成“最高分”。
-    normalized = [_rating_fields(r) for r in safety_ratings]
-    highest = max(normalized, key=lambda t: t[2] if t[2] is not None else -1.0)
-    highest_score = highest[2] if highest[2] is not None else -1.0
-
-    if highest_score < 0: color = "#888"          # 一条分数都没有
-    elif highest_score <= 0.33: color = "#0f8"
-    elif highest_score <= 0.66: color = "yellow"
-    else: color = "#bf555d"
-
-    def _fmt(cat, prob, ps, ss):
-        ps_s = f"{ps:.7f}" if ps is not None else "None"
-        ss_s = f"{ss:.8f}" if ss is not None else "None"
-        return f"{cat}: {prob} (Score: {ps_s}, Severity: {ss_s})"
-
-    summary_line = _fmt(*highest)
-    all_ratings_str = "\n".join(_fmt(*t) for t in normalized)
-
-    css_style = "<style>.cb{border:1px solid #444;margin:10px;border-radius:4px;background:#111}.cb summary{padding:8px;cursor:pointer;background:#222}.cb pre{margin:0;padding:10px;border-top:1px solid #444;white-space:pre-wrap}</style>"
-    html_output = (
-        f"{css_style}"
-        f"<details class='cb'>"
-        f"<summary style='color:{color}'>{summary_line} ▼</summary>"
-        f"<pre>\n--- Safety Ratings ---\n{all_ratings_str}\n</pre>"
-        f"</details>"
-    )
-    return html_output
-
 def _convert_image_to_markdown(image_data: bytes, mime_type: str) -> str:
     try:
         b64_data = base64.b64encode(image_data).decode("utf-8")
@@ -902,8 +854,6 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
             
             parts_in_order = list(getattr(getattr(candidate, "content", None), "parts", None) or [])
             reasoning_str, normal_content_str = parse_gemini_response_for_reasoning_and_content(candidate)
-            if app_state.get_setting("safety_score", app_config.SAFETY_SCORE) and hasattr(candidate, "safety_ratings") and candidate.safety_ratings:
-                normal_content_str += _create_safety_ratings_html(candidate.safety_ratings)
 
             tool_index = 0
             for part in parts_in_order:

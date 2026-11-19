@@ -412,8 +412,8 @@ async def dispatch_upstream(
     if initial_slots > 1:
         win_label = "安全首包" if race_win_mode == "first_packet" else "首字"
         print(
-            f"🏁 [凭证竞速] {channel_name} | 启动 {initial_slots} 路并发"
-            f"（随机窗口 0–{race_delay:g}s，胜出条件={win_label}，跨凭证补位上限={total_refill_budget}）"
+            f"🏁 [凭证竞速] {channel_name} | 模型={request_obj.model} | 启动 {initial_slots} 路并发"
+            f"（窗口 0–{race_delay:g}s，胜出={win_label}，补位上限={total_refill_budget}）"
         )
 
     try:

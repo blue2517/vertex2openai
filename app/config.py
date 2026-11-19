@@ -9,7 +9,6 @@ class AppSettings(BaseSettings):
     FAKE_STREAMING_INTERVAL: float = 1.0
     MODELS_CONFIG_URL: str = ""
     ROUNDROBIN: bool = False
-    SAFETY_SCORE: bool = False
     PROXY_URL: Optional[str] = None
     SSL_CERT_FILE: Optional[str] = None
     # Empty: discover this process's service from /proc/self/cgroup.
@@ -41,7 +40,6 @@ FAKE_STREAMING_ENABLED = _settings.FAKE_STREAMING
 FAKE_STREAMING_INTERVAL_SECONDS = _settings.FAKE_STREAMING_INTERVAL
 MODELS_CONFIG_URL = _settings.MODELS_CONFIG_URL
 ROUNDROBIN = _settings.ROUNDROBIN
-SAFETY_SCORE = _settings.SAFETY_SCORE
 PROXY_URL = _settings.PROXY_URL
 SSL_CERT_FILE = _settings.SSL_CERT_FILE
 RESTART_SYSTEMD_UNIT = _settings.RESTART_SYSTEMD_UNIT
@@ -50,10 +48,6 @@ VERTEX_BASE_URL = _settings.VERTEX_BASE_URL
 GOOGLE_COOKIE = _settings.GOOGLE_COOKIE
 GOOGLE_PROJECT_ID = _settings.GOOGLE_PROJECT_ID
 EXPERIMENT_FLAGS = _settings.EXPERIMENT_FLAGS
-
-REASONING_TAG = "agent_platform_think_tag"
-# 向后兼容别名（历史代码引用 VERTEX_REASONING_TAG）
-VERTEX_REASONING_TAG = REASONING_TAG
 
 
 # ============================================================
@@ -99,31 +93,17 @@ DEFAULT_SETTINGS = {
     "fake_streaming": FAKE_STREAMING_ENABLED,
     "fake_streaming_interval": FAKE_STREAMING_INTERVAL_SECONDS,
     "roundrobin": ROUNDROBIN,
-    "safety_score": SAFETY_SCORE,
-    # 原生思考控制（酒馆预设“卡原生思维链”核心）：
-    #   request = 跟随前端 reasoning_effort（默认）
-    #   off     = 关闭原生思考：压到该模型最低档 + 忽略前端 effort + 不回传思考
-    #             （Studio/batchGraphql 忽略 includeThoughts，故 Cookie 通道会在响应侧剥离思考块）
-    #   console = 忽略前端 effort，强制用控制台/该模型专属档位
+    # 原生思考控制：request / off / console
     "native_thinking_mode": "request",
-    # —— 以下两个为上一版布尔开关，保留仅作向后兼容（新 UI 用 native_thinking_mode）——
+    # 旧版布尔开关（保留兼容）
     "thinking_force_console": False,
     "hide_thoughts": False,
-    # 出站参数调试：打印两条通道实际发出的 generationConfig / thinkingConfig。
-    # 实机验证思考档位、采样裁剪是否生效时必开。
-    # （旧键名 cookie_debug 保留为别名，只作用于 Cookie 通道的额外诊断）
+    # 出站参数调试
     "debug_outbound": False,
     "cookie_debug": False,
-    # 思考签名内嵌开关（默认关）：
-    #   关 = 生成短 tool_call_id，签名存进进程内旁路缓存（推荐，避免被前端截断）
-    #   开 = 退回旧的 `{id}__thought__{base64}` 内嵌格式，供多进程/多副本部署使用
-    # 生图请求是否下发 system_instruction（默认关，保持既有行为）。
-    # 官方未禁止生图模型使用系统指令，但旧代码一直剥离；打开前请先真机验证目标模型。
+    # 生图请求是否下发 system_instruction（默认关）
     "image_system_instruction": False,
-    # Explicit console system instruction; empty means no injection.
-    "inject_system_instruction": "",
-    # 采样参数处理：auto=按版本自动判定 / deprecated=强制剥离 / allowed=强制保留。
-    # 给"新出的模型版本号更小但已废弃采样"这类情况留的手动出口，免于改代码。
+    # 采样参数处理：auto / deprecated / allowed
     "sampling_policy": "auto",
     # ===== 标准（Express）模式的 location 钉定（实测有效，见 README“标准模式的 location”）=====
     # 背景：只发裸模型名时，请求走 express 端点格式
@@ -164,8 +144,6 @@ PER_MODEL_KEYS = [
     "default_temperature",
     "default_top_p",
     "default_max_tokens",
-    # 注入项按模型区分很常见：只给跑角色扮演的模型开，问答模型保持干净。
-    "inject_system_instruction",
     "image_system_instruction",
     "sampling_policy",
 ]

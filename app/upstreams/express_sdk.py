@@ -19,13 +19,14 @@ from api_helpers import (
     execute_gemini_call,
     create_openai_error_response,
 )
-from message_processing import create_gemini_prompt, apply_console_injection
+from message_processing import create_gemini_prompt
 from http_options import get_http_options
 import model_capabilities as mc
 from runtime_state import app_state
 import config as app_config
 from schema_validation import SchemaValidationError, validate_request_schemas
 from network_proxy import credential_proxy_scope, bind_credential_proxy
+from usage_stats import express_credential_id, format_express_label, format_proxy_label
 
 LEGACY_EXPRESS_PREFIX = "[EXPRESS] "
 LEGACY_PAY_PREFIX = "[PAY]"
@@ -224,32 +225,36 @@ class ExpressSDKUpstream(BaseUpstream):
         )
         register_client = getattr(fastapi_request, "register_upstream_client", lambda client: client)
         register_client(client_to_use)
+        cred_id = express_credential_id(express_api_key)
+        cred_label = format_express_label(key_record)
+        proxy_label = format_proxy_label(key_record)
+        model_tag = (
+            f"{request_obj.model}→{base_model_name}"
+            if request_obj.model and request_obj.model != base_model_name
+            else base_model_name
+        )
         trace = UpstreamTrace(
-            "Express", base_model_name, uuid.uuid4().hex[:8], time.monotonic(),
+            "Express", model_tag, uuid.uuid4().hex[:8], time.monotonic(),
             unit_label="块",
             on_first_packet=getattr(fastapi_request, "notify_first_packet", None),
+            cred_id=cred_id,
+            cred_label=cred_label,
+            proxy_label=proxy_label,
+            request_model=request_obj.model,
+            upstream_model=base_model_name,
         )
-        if key_record.get("note"):
-            trace.label += f" | 凭证={key_record['note']}"
+        trace.label += f" | 凭证={cred_label}"
         job_id = getattr(getattr(fastapi_request, "job", None), "id", None)
         if job_id:
             trace.label += f" | 任务={job_id}"
         attach_express_trace(client_to_use, trace)
-        _log_resolved_endpoint(client_to_use)
-        print(f"🌐 [上游端点] 使用官方 Gemini Express Mode SDK 调用模型 {base_model_name}。")
-        if model_to_call != base_model_name:
-            print(f"🌐 [上游端点] 已钉定 location：{model_to_call}")
+        if app_state.get_setting("debug_outbound", False):
+            _log_resolved_endpoint(client_to_use)
+            if model_to_call != base_model_name:
+                print(f"🔎 [出站调试] Express 通道 凭证={cred_label} location={model_to_call}")
 
         profile = mc.get_profile(base_model_name)
         is_image_model = profile["is_image"]
-
-        # Only explicit console system instructions may add a message.
-        injected, notes = apply_console_injection(
-            request_obj.messages, system_text=_inj_settings.get("inject_system_instruction", ""))
-        for note in notes:
-            print(note)
-        if injected is not request_obj.messages:
-            request_obj = request_obj.model_copy(update={"messages": injected})
 
         gen_config_dict = create_generation_config(request_obj)
         thinking_config = _build_thinking_config(base_model_name, request_obj, is_image_model)
